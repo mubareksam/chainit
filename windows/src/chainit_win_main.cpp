@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <windowsx.h>
 #include <ws2bth.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -47,6 +48,8 @@ static const int PHONE_VFS_PORT = 49180;
 #define ID_TRAY_EXIT 4004
 #define ID_TRAY_UPDATE 4005
 #define ID_TRAY_SHORTCUT 4006
+#define ID_TRAY_MINI 4007
+#define ID_TRAY_HUB 4008
 
 // --- Native Bluetooth RFCOMM (ws2bth.h / AF_BTH) ---
 // These service UUIDs MUST match android/.../net/BluetoothRfcommTransport.kt so the phone
@@ -460,9 +463,24 @@ struct GlobalState {
 };
 
 static GlobalState gState;
+
+static std::atomic<uint64_t> gIntegrityChunksOk{0};
+static std::atomic<uint64_t> gIntegrityFailures{0};
+static const uint64_t kTransferChunkBytes = 2ull * 1024 * 1024;
+static const int kTransferWorkersLan = 4;
+
+static std::string sha256HexMemory(const void* data, size_t len);
+static std::string sha256HexFile(const std::wstring& path);
+
 static std::atomic<bool> gRunning{true};
 
+// Its own mutex: log writes happen both with gState.mtx held (snapshot/UI paths)
+// and without it (long-running transfer workers), so guarding them with gState.mtx
+// alone would either deadlock or race on gState.logs.
+static std::mutex gLogMtx;
+
 static void addLogLocked(const std::string& layer, const std::string& summary, const std::string& detail) {
+    std::lock_guard<std::mutex> logLk(gLogMtx);
     char idBuf[16];
     std::snprintf(idBuf, sizeof(idBuf), "%08x", static_cast<unsigned>(nowMs() & 0xFFFFFFFF));
     gState.logs.insert(gState.logs.begin(), {idBuf, nowMs(), layer, summary, detail});
@@ -490,21 +508,103 @@ static bool runHiddenCommand(const std::wstring& cmdLine) {
     return exitCode == 0;
 }
 
+static std::string ansiFromWide(const std::wstring& in);
+static std::wstring wideFromAnsi(const std::string& in);
+
+// Windows Explorer labels a WebDAV mount with the raw URL ("127.0.0.1\dav"). Rename it to the
+// phone's name so the Z:\ drive reads like a real device in Explorer's tree.
+static void setZDriveLabelInExplorer(const std::wstring& label) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2",
+                      0, KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS) {
+        return;
+    }
+    wchar_t name[512];
+    DWORD idx = 0;
+    DWORD renamed = 0;
+    while (RegEnumKeyW(hKey, idx, name, 512) == ERROR_SUCCESS) {
+        const std::wstring sub(name);
+        const bool hit = sub.find(L"4173") != std::wstring::npos ||
+                         (sub.find(L"dav") != std::wstring::npos && sub.find(L"127.0.0.1") != std::wstring::npos);
+        if (hit) {
+            HKEY hSub = nullptr;
+            if (RegOpenKeyExW(hKey, sub.c_str(), 0, KEY_WRITE, &hSub) == ERROR_SUCCESS) {
+                if (RegSetValueExW(hSub, L"_LabelFromReg", 0, REG_SZ,
+                                   reinterpret_cast<const BYTE*>(label.c_str()),
+                                   static_cast<DWORD>((label.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS) {
+                    ++renamed;
+                }
+                RegCloseKey(hSub);
+            }
+        }
+        ++idx;
+    }
+    RegCloseKey(hKey);
+    if (renamed > 0) SHChangeNotify(SHCNE_ASSOCCHANGED, 0, nullptr, nullptr);
+}
+
 static void mountZDriveAsync() {
     std::thread([]() {
         runHiddenCommand(L"sc start WebClient");
         runHiddenCommand(L"net use Z: /delete /y");
         bool ok = runHiddenCommand(L"net use Z: http://127.0.0.1:4173/dav /persistent:no");
-        std::lock_guard<std::mutex> lk(gState.mtx);
-        gState.zDriveMounted = ok || gState.siblingEnabled;
+        std::string peer;
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            gState.zDriveMounted = ok || gState.siblingEnabled;
+            peer = gState.peerDeviceName;
+            if (ok) {
+                addLogLocked("VFS", "Mounted Z:\\ in Windows File Explorer", "Mapped Z:\\ -> http://127.0.0.1:4173/dav (Multipath Sibling VFS).");
+            }
+        }
         if (ok) {
-            addLogLocked("VFS", "Mounted Z:\\ in Windows File Explorer", "Mapped Z:\\ -> http://127.0.0.1:4173/dav (Multipath Sibling VFS).");
+            // Show the phone's name (never the 127.0.0.1:4173 loopback URL) as the drive
+            // label in Explorer. Explorer only writes its MountPoints2 key the first time
+            // the share is browsed, so the label is re-applied on a short back-off until it
+            // sticks, and again whenever the sibling reports a different device name.
+            std::wstring label = L"ChainIt Phone";
+            if (!peer.empty() && peer.find("Scanning") == std::string::npos) {
+                label = wideFromAnsi(peer + " (ChainIt)");
+            }
+            setZDriveLabelInExplorer(label);
+            std::thread([label]() {
+                for (int attempt = 0; attempt < 4; ++attempt) {
+                    std::this_thread::sleep_for(std::chrono::seconds(attempt == 0 ? 2 : 6));
+                    if (!gRunning.load()) return;
+                    std::wstring current = label;
+                    {
+                        std::lock_guard<std::mutex> lk(gState.mtx);
+                        if (!gState.peerDeviceName.empty() &&
+                            gState.peerDeviceName.find("Scanning") == std::string::npos) {
+                            current = wideFromAnsi(gState.peerDeviceName + " (ChainIt)");
+                        }
+                    }
+                    setZDriveLabelInExplorer(current);
+                }
+            }).detach();
         }
     }).detach();
 }
 
 static void unmountZDriveSync() {
     runHiddenCommand(L"net use Z: /delete /y");
+}
+
+// Pocket-sized dashboard window (tray -> "Mini status panel").
+static void launchMiniPanelWindow() {
+    const wchar_t* edgePaths[] = {
+        L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    };
+    for (const wchar_t* edge : edgePaths) {
+        if (GetFileAttributesW(edge) != INVALID_FILE_ATTRIBUTES) {
+            std::wstring args = L"--app=http://127.0.0.1:4173/mini --window-size=440,700";
+            ShellExecuteW(nullptr, L"open", edge, args.c_str(), nullptr, SW_SHOWNORMAL);
+            return;
+        }
+    }
+    ShellExecuteW(nullptr, L"open", L"http://127.0.0.1:4173/mini", nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 static void launchDesktopUiWindow() {
@@ -1034,7 +1134,7 @@ static std::string buildStateSnapshotJson() {
         if (i > 0) oss << ",";
         oss << "\"" << jsonEscape(lanIps[i]) << "\"";
     }
-    oss << "],\"serverPort\":" << HTTP_PORT << "}";
+    oss << "],\"security\":{\"keyAuth\":\"required\",\"lockoutAfter\":5,\"lockoutWindowSec\":60,\"lockoutCooldownSec\":30,\"integrity\":\"sha256 per chunk + whole file\",\"chunkBytes\":" << kTransferChunkBytes << ",\"parallelWorkers\":" << (isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan) << ",\"chunksVerified\":" << gIntegrityChunksOk.load() << ",\"integrityFailures\":" << gIntegrityFailures.load() << "},\"serverPort\":" << HTTP_PORT << "}";
     return oss.str();
 }
 
@@ -1423,7 +1523,14 @@ static uint64_t uploadLocalPathToPhone(const fs::path& localPath, const std::str
 
     std::string fname = localPath.filename().u8string();
     std::string url = "/chainit/upload?dir=" + urlEncode(phoneDestDir) + "&filename=" + urlEncode(fname);
-    httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", url, data, {{"Content-Type", "application/octet-stream"}}, 60000);
+    const std::string fileHash = sha256HexFile(localPath.wstring());
+    std::map<std::string, std::string> hdrs = {{"Content-Type", "application/octet-stream"}};
+    if (!fileHash.empty()) hdrs["X-ChainIt-File-Sha256"] = fileHash;
+    HttpReply upRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", url, data, hdrs, 60000);
+    if (upRep.status == 409) {
+        addLogLocked("SECURITY", "Upload rejected by phone (SHA-256 mismatch)", fname);
+        return 0;
+    }
     return data.size();
 }
 
@@ -1454,9 +1561,119 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
         return sum;
     }
 
-    HttpReply rawRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "GET", "/chainit/raw?path=" + urlEncode(phoneSrcPath), "", {}, 60000);
+    const std::string rawUrl = "/chainit/raw?path=" + urlEncode(phoneSrcPath);
+    const fs::path dst = localDestDir / fs::u8path(baseName);
+
+    // --- probe size + published whole-file SHA-256 with a 1-byte range request ---
+    uint64_t total = 0;
+    std::string fileSha;
+    HttpReply probe = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "GET", rawUrl, "",
+                                         {{"Range", "bytes=0-0"}}, 8000);
+    if (probe.status == 206 && probe.headers.count("content-range")) {
+        const std::string cr = probe.headers["content-range"];
+        const size_t slash = cr.find('/');
+        if (slash != std::string::npos) total = std::strtoull(cr.c_str() + slash + 1, nullptr, 10);
+    }
+    if (probe.headers.count("x-chainit-file-sha256")) fileSha = probe.headers["x-chainit-file-sha256"];
+
+    const bool viaBt = isBtEndpoint(phoneIp);
+    const int workers = viaBt ? 1 : kTransferWorkersLan; // RFCOMM is one serialized stream
+
+    // --- parallel chunk pipeline (2 MiB chunks, per-chunk SHA-256, atomic finalize) ---
+    bool parallelOk = false;
+    if (total > kTransferChunkBytes && workers > 1) {
+        const std::wstring partPath = dst.wstring() + L".chainit-part";
+        // Hidden + temporary: the reassembly buffer is a transfer-only artefact and must
+        // never appear in Explorer, on the desktop, or in any user-facing listing.
+        SetFileAttributesW(partPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
+        HANDLE hFile = CreateFileW(partPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            LONG64 fileSize = static_cast<LONG64>(total);
+            SetFilePointer(hFile, static_cast<LONG>(fileSize & 0xFFFFFFFF), nullptr, FILE_BEGIN);
+            SetFilePointer(hFile, static_cast<LONG>(fileSize >> 32), nullptr, FILE_CURRENT);
+            SetEndOfFile(hFile);
+            SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
+
+            std::atomic<uint64_t> cursor{0};
+            std::atomic<bool> failed{false};
+            std::vector<std::thread> pool;
+            for (int w = 0; w < workers; ++w) {
+                pool.emplace_back([&]() {
+                    while (!failed.load()) {
+                        const uint64_t off = cursor.fetch_add(kTransferChunkBytes);
+                        if (off >= total) break;
+                        const uint64_t len = std::min<uint64_t>(kTransferChunkBytes, total - off);
+                        const std::string range = "bytes=" + std::to_string(off) + "-" + std::to_string(off + len - 1);
+                        HttpReply chunk = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "GET", rawUrl, "",
+                                                             {{"Range", range}}, 60000);
+                        if (chunk.status != 206 && chunk.status != 200) {
+                            failed.store(true);
+                            break;
+                        }
+                        if (chunk.body.size() != len) {
+                            failed.store(true);
+                            break;
+                        }
+                        if (chunk.headers.count("x-chainit-chunk-sha256")) {
+                            const std::string got = sha256HexMemory(chunk.body.data(), chunk.body.size());
+                            if (got != chunk.headers["x-chainit-chunk-sha256"]) {
+                                gIntegrityFailures.fetch_add(1);
+                                failed.store(true);
+                                break;
+                            }
+                            gIntegrityChunksOk.fetch_add(1);
+                        }
+                        OVERLAPPED ov{};
+                        ov.Offset = static_cast<DWORD>(off & 0xFFFFFFFF);
+                        ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+                        DWORD written = 0;
+                        if (!WriteFile(hFile, chunk.body.data(), static_cast<DWORD>(len), &written, &ov) ||
+                            written != static_cast<DWORD>(len)) {
+                            failed.store(true);
+                            break;
+                        }
+                    }
+                });
+            }
+            for (auto& t : pool) t.join();
+            FlushFileBuffers(hFile);
+            CloseHandle(hFile);
+            SetFileAttributesW(partPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY);
+            if (!failed.load()) {
+                // whole-file integrity gate before the partial ever becomes visible
+                if (fileSha.empty() || sha256HexFile(partPath) == fileSha) {
+                    if (MoveFileExW(partPath.c_str(), dst.wstring().c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                        SetFileAttributesW(dst.wstring().c_str(), FILE_ATTRIBUTE_NORMAL);
+                        parallelOk = true;
+                    }
+                } else {
+                    gIntegrityFailures.fetch_add(1);
+                    addLogLocked("SECURITY", "Transfer aborted: whole-file SHA-256 mismatch", phoneSrcPath);
+                }
+            }
+            if (!parallelOk) DeleteFileW(partPath.c_str());
+        }
+        if (parallelOk) {
+            addLogLocked("VFS", "Parallel chunked transfer completed",
+                         baseName + " (" + std::to_string(total) + " B in " + std::to_string(workers) +
+                             " simultaneous 2 MiB streams, every chunk SHA-256 verified)");
+            return total;
+        }
+        // fall through to the single-stream path on any parallel failure
+    }
+
+    HttpReply rawRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "GET", rawUrl, "", {}, 120000);
     if (rawRep.status == 200) {
-        fs::path dst = localDestDir / fs::u8path(baseName);
+        if (!fileSha.empty()) {
+            const std::string got = sha256HexMemory(rawRep.body.data(), rawRep.body.size());
+            if (got != fileSha) {
+                gIntegrityFailures.fetch_add(1);
+                addLogLocked("SECURITY", "Transfer aborted: whole-file SHA-256 mismatch", phoneSrcPath);
+                return 0;
+            }
+            gIntegrityChunksOk.fetch_add(1);
+        }
         std::ofstream ofs(dst, std::ios::binary);
         ofs.write(rawRep.body.data(), static_cast<std::streamsize>(rawRep.body.size()));
         return rawRep.body.size();
@@ -1485,6 +1702,133 @@ struct ShortcutResult {
     std::string message;
 };
 
+// ---------------------------------------------------------------------------
+// Hand-written Shell Link (.lnk) writer (MS-SHLLINK)
+//
+// The COM IShellLink path is tried first, but Explorer's shell extension host
+// can refuse it (locked-down profiles, a crashed explorer.exe, or a COM
+// apartment clash inside a detached worker thread) - which is exactly how a
+// user ends up clicking "Create desktop icon" and getting nothing. This writer
+// emits the documented binary layout directly, so a shortcut is always produced.
+// ---------------------------------------------------------------------------
+static void lnkPutU32(std::vector<uint8_t>& b, uint32_t v) {
+    b.push_back((uint8_t)(v & 0xFF)); b.push_back((uint8_t)((v >> 8) & 0xFF));
+    b.push_back((uint8_t)((v >> 16) & 0xFF)); b.push_back((uint8_t)((v >> 24) & 0xFF));
+}
+static void lnkPutU16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back((uint8_t)(v & 0xFF)); b.push_back((uint8_t)((v >> 8) & 0xFF));
+}
+static void lnkPutAnsi(std::vector<uint8_t>& b, const std::string& s) {
+    b.insert(b.end(), s.begin(), s.end());
+    b.push_back(0);
+}
+static void lnkPutStringData(std::vector<uint8_t>& b, const std::wstring& s) {
+    lnkPutU16(b, (uint16_t)s.size());
+    for (wchar_t c : s) { lnkPutU16(b, (uint16_t)c); }
+}
+
+static bool writeShellLinkFile(const std::wstring& lnkPath, const std::wstring& targetExe,
+                              const std::wstring& workDir, const std::wstring& description,
+                              int iconIndex) {
+    std::string targetAnsi(512, '\0');
+    int n = WideCharToMultiByte(CP_ACP, 0, targetExe.c_str(), -1, &targetAnsi[0], 511, nullptr, nullptr);
+    if (n <= 0) return false;
+    targetAnsi.resize(n - 1);
+
+    std::vector<uint8_t> b;
+    // --- SHELL_LINK_HEADER (76 bytes) ---
+    lnkPutU32(b, 0x0000004C);
+    const uint8_t clsid[16] = {0x00,0x02,0x14,0x01,0x00,0x00,0x00,0x00,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46};
+    b.insert(b.end(), clsid, clsid + 16);
+    // HasLinkInfo | HasName | HasWorkingDir | HasIconLocation | IsUnicode
+    lnkPutU32(b, 0x00000002 | 0x00000004 | 0x00000010 | 0x00000040 | 0x00000080);
+    lnkPutU32(b, FILE_ATTRIBUTE_NORMAL);            // FileAttributes
+    for (int i = 0; i < 3; ++i) { lnkPutU32(b, 0); lnkPutU32(b, 0); } // create/access/write FILETIMEs
+    uint64_t targetSize = 0;
+    {
+        HANDLE hf = CreateFileW(targetExe.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER sz{};
+            if (GetFileSizeEx(hf, &sz)) targetSize = (uint64_t)sz.QuadPart;
+            CloseHandle(hf);
+        }
+    }
+    lnkPutU32(b, (uint32_t)(targetSize & 0xFFFFFFFF)); // FileSize
+    lnkPutU32(b, (uint32_t)iconIndex);                 // IconIndex
+    lnkPutU32(b, 0x00000001);                          // ShowCommand = SW_SHOWNORMAL
+    lnkPutU16(b, 0); lnkPutU16(b, 0);                  // HotKey, Reserved1
+    lnkPutU32(b, 0); lnkPutU32(b, 0);                  // Reserved2, Reserved3
+
+    // --- LINKINFO ---
+    const uint32_t infoStart = (uint32_t)b.size();
+    const uint32_t headerSize = 0x1C;
+    const std::string volumeLabel = "Windows";
+    const uint32_t volumeSize = 0x10 + (uint32_t)volumeLabel.size() + 1;
+    const uint32_t volumeOffset = headerSize;
+    const uint32_t basePathOffset = volumeOffset + volumeSize;
+    const uint32_t suffixOffset = basePathOffset + (uint32_t)targetAnsi.size() + 1;
+    const uint32_t infoSize = suffixOffset + 1;
+    lnkPutU32(b, infoSize);
+    lnkPutU32(b, headerSize);
+    lnkPutU32(b, 0x00000001);       // VolumeIDAndLocalBasePath
+    lnkPutU32(b, volumeOffset);
+    lnkPutU32(b, basePathOffset);
+    lnkPutU32(b, 0);                // no CommonNetworkRelativeLink
+    lnkPutU32(b, suffixOffset);
+    // VOLUMEID
+    lnkPutU32(b, volumeSize);
+    lnkPutU32(b, DRIVE_FIXED);
+    lnkPutU32(b, 0);                // DriveSerialNumber
+    lnkPutU32(b, 0x10);             // VolumeLabelOffset -> Data
+    lnkPutAnsi(b, volumeLabel);
+    lnkPutAnsi(b, targetAnsi);      // LocalBasePath (ANSI)
+    lnkPutAnsi(b, "");              // CommonPathSuffix
+
+    // --- STRING_DATA (order fixed by the spec) ---
+    lnkPutStringData(b, description);
+    lnkPutStringData(b, workDir);
+    lnkPutStringData(b, targetExe); // IconLocation file; IconIndex came from the header
+    lnkPutU32(b, 0);                // terminal ExtraData marker
+
+    HANDLE hf = CreateFileW(lnkPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hf == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    const bool ok = WriteFile(hf, b.data(), (DWORD)b.size(), &written, nullptr) && written == b.size();
+    CloseHandle(hf);
+    (void)infoStart;
+    return ok;
+}
+
+static bool fileExistsW(const std::wstring& p) {
+    if (p.empty()) return false;
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static std::vector<std::wstring> desktopCandidates() {
+    std::vector<std::wstring> out;
+    PWSTR raw = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &raw)) && raw) {
+        out.push_back(std::wstring(raw));
+        CoTaskMemFree(raw);
+    }
+    wchar_t profile[MAX_PATH * 2] = {};
+    if (GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH * 2 - 1) > 0) {
+        out.push_back(std::wstring(profile) + L"\\Desktop");
+        out.push_back(std::wstring(profile) + L"\\OneDrive\\Desktop");
+        out.push_back(std::wstring(profile) + L"\\OneDrive\\Desktop");
+    }
+    // De-duplicate while preserving order.
+    std::vector<std::wstring> uniq;
+    for (const auto& c : out) {
+        bool dup = false;
+        for (const auto& u : uniq) if (u == c) { dup = true; break; }
+        if (!dup) uniq.push_back(c);
+    }
+    return uniq;
+}
+
 static ShortcutResult createDesktopShortcut() {
     ShortcutResult result;
     const std::wstring exe = currentExePath();
@@ -1493,54 +1837,92 @@ static ShortcutResult createDesktopShortcut() {
         return result;
     }
 
+    const std::wstring workDir = fs::path(exe).parent_path().wstring();
+    const std::wstring desc = L"ChainIt - Android/Windows Sibling link, Z:\\ drive and File Manager";
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     const bool comOwned = SUCCEEDED(hr);
 
-    PWSTR desktopRaw = nullptr;
-    hr = SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktopRaw);
-    if (FAILED(hr) || !desktopRaw) {
+    const std::vector<std::wstring> desktops = desktopCandidates();
+    std::wstring chosen;
+    for (const auto& d : desktops) {
+        DWORD a = GetFileAttributesW(d.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) { chosen = d; break; }
+    }
+    if (chosen.empty() && !desktops.empty()) chosen = desktops.front();
+    if (chosen.empty()) {
         if (comOwned) CoUninitialize();
         result.message = "Windows did not report a Desktop folder for this account.";
         return result;
     }
-    std::wstring desktop(desktopRaw);
-    CoTaskMemFree(desktopRaw);
+    const std::wstring lnk = chosen + L"\\ChainIt.lnk";
 
+    // 1) Shell COM IShellLink (the native path - keeps Explorer's own metadata)
     IShellLinkW* link = nullptr;
     hr = CoCreateInstance(kClsidShellLink, nullptr, CLSCTX_INPROC_SERVER, kIidIShellLinkW,
                           reinterpret_cast<void**>(&link));
-    if (FAILED(hr) || !link) {
-        if (comOwned) CoUninitialize();
-        result.message = "Windows refused to create a shortcut object.";
-        return result;
-    }
-
-    const std::wstring workDir = fs::path(exe).parent_path().wstring();
-    link->SetPath(exe.c_str());
-    link->SetWorkingDirectory(workDir.c_str());
-    link->SetIconLocation(exe.c_str(), 0); // the chain-link icon embedded in this exe
-    link->SetDescription(L"ChainIt - Android/Windows Sibling link, Z:\\ drive and File Manager");
-    link->SetShowCmd(SW_SHOWNORMAL);
-
-    IPersistFile* persist = nullptr;
-    hr = link->QueryInterface(kIidIPersistFile, reinterpret_cast<void**>(&persist));
-    if (SUCCEEDED(hr) && persist) {
-        const std::wstring lnk = desktop + L"\\ChainIt.lnk";
-        hr = persist->Save(lnk.c_str(), TRUE);
-        persist->Release();
-        if (SUCCEEDED(hr)) {
-            result.ok = true;
-            result.path = lnk;
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lnk.c_str(), nullptr);
+    if (SUCCEEDED(hr) && link) {
+        link->SetPath(exe.c_str());
+        link->SetWorkingDirectory(workDir.c_str());
+        link->SetIconLocation(exe.c_str(), 0); // the chain-link icon embedded in this exe
+        link->SetDescription(desc.c_str());
+        link->SetShowCmd(SW_SHOWNORMAL);
+        IPersistFile* persist = nullptr;
+        if (SUCCEEDED(link->QueryInterface(kIidIPersistFile, reinterpret_cast<void**>(&persist))) && persist) {
+            persist->Save(lnk.c_str(), TRUE);
+            persist->Release();
         }
+        link->Release();
     }
-    link->Release();
+
+    // 2) Verify - and write the documented binary layout ourselves if Explorer never produced a file.
+    if (!fileExistsW(lnk)) {
+        writeShellLinkFile(lnk, exe, workDir, desc, 0);
+    }
+
+    // 3) Start Menu entry too, so there is always a discoverable launch point.
+    PWSTR progRaw = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &progRaw)) && progRaw) {
+        const std::wstring startDir = std::wstring(progRaw) + L"\\ChainIt";
+        CreateDirectoryW(startDir.c_str(), nullptr);
+        CoTaskMemFree(progRaw);
+        const std::wstring startLnk = startDir + L"\\ChainIt.lnk";
+        IShellLinkW* l2 = nullptr;
+        if (SUCCEEDED(CoCreateInstance(kClsidShellLink, nullptr, CLSCTX_INPROC_SERVER, kIidIShellLinkW,
+                                       reinterpret_cast<void**>(&l2))) && l2) {
+            l2->SetPath(exe.c_str());
+            l2->SetWorkingDirectory(workDir.c_str());
+            l2->SetIconLocation(exe.c_str(), 0);
+            l2->SetDescription(desc.c_str());
+            IPersistFile* p2 = nullptr;
+            if (SUCCEEDED(l2->QueryInterface(kIidIPersistFile, reinterpret_cast<void**>(&p2))) && p2) {
+                p2->Save(startLnk.c_str(), TRUE);
+                p2->Release();
+            }
+            l2->Release();
+        }
+        if (!fileExistsW(startLnk)) writeShellLinkFile(startLnk, exe, workDir, desc, 0);
+    }
+
     if (comOwned) CoUninitialize();
 
+    result.ok = fileExistsW(lnk);
     if (result.ok) {
-        result.message = "Desktop icon created: ChainIt.lnk (it uses the same chain-link icon as the phone app).";
+        result.path = lnk;
+        // Force Explorer to pick the new file up immediately (SHCNF_FLUSHNOWAIT avoids
+        // blocking this worker thread on a synchronous shell notification round-trip).
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, lnk.c_str(), nullptr);
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, lnk.c_str(), nullptr);
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "Desktop icon created and verified: %s", ansiFromWide(lnk).c_str());
+        result.message = buf;
     } else {
-        result.message = "Windows could not save ChainIt.lnk on the Desktop.";
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "Windows blocked writing ChainIt.lnk into %s (check Controlled folder access / antivirus).",
+                      ansiFromWide(chosen).c_str());
+        result.message = buf;
     }
     return result;
 }
@@ -1561,7 +1943,7 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.2.0";
+static const char* const kChainItAppVersion = "1.3.0";
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -1622,6 +2004,29 @@ static std::string sha256HexFile(const std::wstring& path) {
     std::string out;
     out.reserve(len * 2);
     for (DWORD i = 0; i < len; ++i) {
+        out.push_back(kHex[digest[i] >> 4]);
+        out.push_back(kHex[digest[i] & 0x0F]);
+    }
+    return out;
+}
+
+static std::string sha256HexMemory(const void* data, size_t len) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return "";
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return "";
+    }
+    CryptHashData(hHash, reinterpret_cast<const BYTE*>(data), static_cast<DWORD>(len), 0);
+    BYTE digest[32] = {};
+    DWORD dlen = sizeof(digest);
+    CryptGetHashParam(hHash, HP_HASHVAL, digest, &dlen, 0);
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    for (DWORD i = 0; i < dlen; ++i) {
         out.push_back(kHex[digest[i] >> 4]);
         out.push_back(kHex[digest[i] & 0x0F]);
     }
@@ -2520,17 +2925,394 @@ static void httpServerLoop() {
 // --- Win32 System Tray Window Procedure ---
 
 
+// ===========================================================================
+// ChainIt native hub window
+//
+// The web File Manager opens in Edge app-mode, whose taskbar button belongs to
+// the browser process (that is where the generic globe came from). ChainIt
+// therefore owns a real top-level Win32 window with the chain-link icon compiled
+// into this exe as resource #1: the taskbar, Alt-Tab and the tray all show the
+// same artwork as the Android launcher icon, and the window doubles as the
+// "mini form" of the app - status, Z:\ mount, desktop icon, update and quit are
+// one click away even when the browser window is closed.
+// ===========================================================================
+
+static HWND gHubHwnd = nullptr;
+static HICON gHubIcon = nullptr;
+static HINSTANCE gHubInstance = nullptr;
+static int gHubPressed = -1;
+static int gHubHover = -1;
+static std::wstring gHubToast;
+static std::atomic<int64_t> gHubToastUntil{0};
+
+static const wchar_t* kHubClass = L"ChainItHubWindowClass";
+
+struct HubButton {
+    const wchar_t* keycap;
+    const wchar_t* label;
+    const wchar_t* hint;
+    int accent; // 0 = emerald, 1 = cyan, 2 = slate
+};
+
+static const HubButton kHubButtons[] = {
+    {L"F", L"Open File Manager", L"Dual-pane web UI", 0},
+    {L"Z", L"Open Z:\\ Phone Drive", L"In Windows Explorer", 1},
+    {L"M", L"Mount / Refresh Z:", L"WebDAV redirector", 1},
+    {L"D", L"Create Desktop Icon", L"ChainIt.lnk on Desktop", 0},
+    {L"U", L"Check for Updates", L"In-place exe replace", 2},
+    {L"X", L"Quit ChainIt", L"Unmount Z: and exit", 2},
+};
+static const int kHubButtonCount = 6;
+
+static void hubSetToast(const std::wstring& text, int ms = 4200) {
+    gHubToast = text;
+    gHubToastUntil.store(nowMs() + ms);
+}
+
+static void hubShow() {
+    if (!gHubHwnd) return;
+    ShowWindow(gHubHwnd, SW_SHOW);
+    SetForegroundWindow(gHubHwnd);
+    if (IsIconic(gHubHwnd)) ShowWindow(gHubHwnd, SW_RESTORE);
+}
+
+static void hubRunAction(int idx);
+
+static void hubLayout(const RECT& rc, RECT* outHeader, RECT* outStatus, RECT* outButtons, RECT* outFooter) {
+    const int pad = 16;
+    const int w = rc.right - rc.left;
+    outHeader->left = pad; outHeader->top = pad;
+    outHeader->right = w - pad; outHeader->bottom = pad + 56;
+
+    outStatus->left = pad; outStatus->top = outHeader->bottom + 12;
+    outStatus->right = w - pad; outStatus->bottom = outStatus->top + 92;
+
+    const int gridTop = outStatus->bottom + 14;
+    const int cellW = (w - pad * 2 - 10) / 2;
+    const int cellH = 56;
+    for (int i = 0; i < kHubButtonCount; ++i) {
+        const int col = i % 2, row = i / 2;
+        outButtons[i].left = pad + col * (cellW + 10);
+        outButtons[i].top = gridTop + row * (cellH + 10);
+        outButtons[i].right = outButtons[i].left + cellW;
+        outButtons[i].bottom = outButtons[i].top + cellH;
+    }
+    outFooter->left = pad;
+    outFooter->top = outButtons[kHubButtonCount - 1].bottom + 14;
+    outFooter->right = w - pad;
+    outFooter->bottom = outFooter->top + 58;
+}
+
+static int hubHitTest(int x, int y) {
+    RECT rc; GetClientRect(gHubHwnd, &rc);
+    RECT header{}, status{}, footer{}, btns[kHubButtonCount]{};
+    hubLayout(rc, &header, &status, btns, &footer);
+    for (int i = 0; i < kHubButtonCount; ++i) {
+        POINT p{x, y};
+        if (PtInRect(&btns[i], p)) return i;
+    }
+    return -1;
+}
+
+static std::wstring hubStatusLines(std::wstring* sub, std::wstring* foot) {
+    std::lock_guard<std::mutex> lk(gState.mtx);
+    const bool connected = !gState.activeTransportId.empty() && gState.siblingEnabled && gState.realPhoneConnected;
+    std::wstring main = connected
+        ? (wideFromAnsi(gState.peerDeviceName.empty() ? std::string("Sibling phone") : gState.peerDeviceName) + L" \u00b7 linked")
+        : std::wstring(L"Searching for your sibling phone\u2026");
+    std::wstring tr = wideFromAnsi(gState.activeTransportId.empty() ? std::string("none") : gState.activeTransportId);
+    if (tr == L"usb_rndis") tr = L"USB tethering";
+    else if (tr == L"wifi_lan") tr = L"Wi-Fi LAN";
+    else if (tr == L"local_hotspot") tr = L"PC hotspot";
+    else if (tr == L"bluetooth") tr = L"Bluetooth RFCOMM";
+    else if (tr == L"online_p2p") tr = L"Online relay";
+    *sub = std::wstring(L"Transport: ") + tr + (gState.zDriveMounted || connected ? L"   \u00b7   Z:\\ mounted" : L"   \u00b7   Z:\\ idle");
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "Pairing key required \u00b7 %llu chunk hashes verified \u00b7 %llu integrity failures \u00b7 %d x 2 MiB parallel streams",
+                  (unsigned long long)gIntegrityChunksOk.load(),
+                  (unsigned long long)gIntegrityFailures.load(),
+                  isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan);
+    *foot = wideFromAnsi(buf);
+    return connected ? main : std::wstring(L"ChainIt Sibling");
+}
+
+static void hubDrawGradient(HDC hdc, const RECT& r, COLORREF top, COLORREF bottom) {
+    const int h = r.bottom - r.top;
+    if (h <= 0) return;
+    const int tr = GetRValue(top), tg = GetGValue(top), tb = GetBValue(top);
+    const int br = GetRValue(bottom), bg = GetGValue(bottom), bb = GetBValue(bottom);
+    for (int y = 0; y < h; ++y) {
+        const double t = (h == 1) ? 0.0 : static_cast<double>(y) / (h - 1);
+        const COLORREF c = RGB(tr + (int)((br - tr) * t), tg + (int)((bg - tg) * t), tb + (int)((bb - tb) * t));
+        RECT row{r.left, r.top + y, r.right, r.top + y + 1};
+        HBRUSH b = CreateSolidBrush(c);
+        FillRect(hdc, &row, b);
+        DeleteObject(b);
+    }
+}
+
+static void hubRoundRect(HDC hdc, const RECT& r, int radius, COLORREF fill, COLORREF border, bool pressed) {
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HBRUSH brush = CreateSolidBrush(fill);
+    HGDIOBJ op = SelectObject(hdc, pen);
+    HGDIOBJ ob = SelectObject(hdc, brush);
+    const int d = radius * 2;
+    ::RoundRect(hdc, r.left, r.top + (pressed ? 1 : 0), r.right, r.bottom + (pressed ? 1 : 0), d, d);
+    SelectObject(hdc, ob);
+    SelectObject(hdc, op);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+static void hubText(HDC hdc, const RECT& r, const std::wstring& s, int height, COLORREF color, UINT flags, bool bold) {
+    HFONT f = CreateFontW(-height, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL, FALSE, FALSE, FALSE,
+                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HGDIOBJ of = SelectObject(hdc, f);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, color);
+    RECT box = r;
+    DrawTextW(hdc, s.c_str(), (int)s.size(), &box, flags);
+    SelectObject(hdc, of);
+    DeleteObject(f);
+}
+
+static LRESULT CALLBACK HubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            gHubHwnd = hwnd;
+            SetTimer(hwnd, 1, 1000, nullptr);
+            return 0;
+        }
+        case WM_TIMER: {
+            if (IsWindowVisible(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        case WM_SETCURSOR: {
+            POINT p; GetCursorPos(&p); ScreenToClient(hwnd, &p);
+            SetCursor(LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(hubHitTest(p.x, p.y) >= 0 ? IDC_HAND : IDC_ARROW)));
+            return TRUE;
+        }
+        case WM_MOUSEMOVE: {
+            const int h = hubHitTest(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (h != gHubHover) { gHubHover = h; InvalidateRect(hwnd, nullptr, FALSE); }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            const int h = hubHitTest(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (h >= 0) { gHubPressed = h; SetCapture(hwnd); InvalidateRect(hwnd, nullptr, FALSE); }
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            const int h = hubHitTest(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            const int pressed = gHubPressed;
+            gHubPressed = -1;
+            ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            if (pressed >= 0 && pressed == h) hubRunAction(pressed);
+            return 0;
+        }
+        case WM_CAPTURECHANGED:
+            gHubPressed = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        case WM_CLOSE:
+            ShowWindow(hwnd, SW_HIDE); // stay resident in the tray, keep the taskbar identity
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC wdc = BeginPaint(hwnd, &ps);
+            RECT rc; GetClientRect(hwnd, &rc);
+            HDC hdc = CreateCompatibleDC(wdc);
+            HBITMAP bmp = CreateCompatibleBitmap(wdc, rc.right - rc.left, rc.bottom - rc.top);
+            HGDIOBJ ob = SelectObject(hdc, bmp);
+
+            hubDrawGradient(hdc, rc, RGB(0x0B, 0x11, 0x20), RGB(0x07, 0x0B, 0x12));
+
+            RECT header{}, status{}, footer{}, btns[kHubButtonCount]{};
+            hubLayout(rc, &header, &status, btns, &footer);
+
+            // header: the chain-link mark, title and version
+            if (gHubIcon) DrawIconEx(hdc, header.left, header.top + 10, gHubIcon, 36, 36, 0, nullptr, DI_NORMAL);
+            RECT title{header.left + 48, header.top + 4, header.right, header.top + 30};
+            hubText(hdc, title, L"ChainIt Sibling", 19, RGB(0xF1, 0xF5, 0xF9), DT_LEFT | DT_VCENTER | DT_SINGLELINE, true);
+            RECT ver{header.left + 48, header.top + 30, header.right, header.top + 50};
+            hubText(hdc, ver, std::wstring(L"v") + wideFromAnsi(kChainItAppVersion) + L"  \u00b7  Android \u2194 Windows file bridge",
+                    12, RGB(0x94, 0xA3, 0xB8), DT_LEFT | DT_VCENTER | DT_SINGLELINE, false);
+
+            // status panel (recessed, skeuomorphic)
+            hubRoundRect(hdc, status, 12, RGB(0x0E, 0x14, 0x20), RGB(0x1E, 0x29, 0x3B), false);
+            std::wstring sub, foot;
+            const std::wstring mainLine = hubStatusLines(&sub, &foot);
+            const bool linked = (mainLine != L"ChainIt Sibling");
+            RECT led{status.left + 16, status.top + 18, status.left + 28, status.top + 30};
+            HBRUSH ledBrush = CreateSolidBrush(linked ? RGB(0x10, 0xB9, 0x81) : RGB(0xF5, 0x9E, 0x0B));
+            HGDIOBJ ob2 = SelectObject(hdc, ledBrush);
+            HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+            HGDIOBJ op2 = SelectObject(hdc, nullPen);
+            Ellipse(hdc, led.left, led.top, led.right, led.bottom);
+            SelectObject(hdc, op2); SelectObject(hdc, ob2); DeleteObject(ledBrush);
+            RECT mainRect{status.left + 38, status.top + 10, status.right - 14, status.top + 36};
+            hubText(hdc, mainRect, linked ? mainLine : L"Searching for your sibling phone\u2026", 15,
+                    linked ? RGB(0xEC, 0xFD, 0xF5) : RGB(0xFF, 0xFB, 0xEB), DT_LEFT | DT_VCENTER | DT_SINGLELINE, true);
+            RECT subRect{status.left + 38, status.top + 36, status.right - 14, status.top + 58};
+            hubText(hdc, subRect, sub, 12, RGB(0x94, 0xA3, 0xB8), DT_LEFT | DT_VCENTER | DT_SINGLELINE, false);
+            RECT footRect{status.left + 16, status.top + 60, status.right - 14, status.top + 84};
+            hubText(hdc, footRect, foot, 11, RGB(0x52, 0x60, 0x79), DT_LEFT | DT_VCENTER | DT_SINGLELINE, false);
+
+            // keycap buttons
+            for (int i = 0; i < kHubButtonCount; ++i) {
+                const bool pressed = (gHubPressed == i);
+                const bool hover = (gHubHover == i) && !pressed;
+                const COLORREF fill = pressed ? RGB(0x14, 0x1C, 0x2C) : (hover ? RGB(0x14, 0x1D, 0x2E) : RGB(0x0F, 0x16, 0x24));
+                const COLORREF edge = kHubButtons[i].accent == 2 ? RGB(0x2A, 0x35, 0x48)
+                                      : (hover ? RGB(0x2B, 0x4A, 0x45) : RGB(0x1E, 0x29, 0x3B));
+                hubRoundRect(hdc, btns[i], 11, fill, edge, pressed);
+
+                RECT cap{btns[i].left + 10, btns[i].top + 13, btns[i].left + 40, btns[i].top + 43};
+                const COLORREF capFill = kHubButtons[i].accent == 0 ? RGB(0x0B, 0x3D, 0x2E)
+                                       : kHubButtons[i].accent == 1 ? RGB(0x0B, 0x33, 0x44)
+                                       : RGB(0x1B, 0x24, 0x34);
+                const COLORREF capText = kHubButtons[i].accent == 0 ? RGB(0x34, 0xD3, 0x99)
+                                       : kHubButtons[i].accent == 1 ? RGB(0x22, 0xD3, 0xEE)
+                                       : RGB(0xCB, 0xD5, 0xE1);
+                hubRoundRect(hdc, cap, 8, capFill, capFill, pressed);
+                hubText(hdc, cap, kHubButtons[i].keycap, 14, capText,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE, true);
+
+                RECT lab{btns[i].left + 48, btns[i].top + 8, btns[i].right - 8, btns[i].top + 30};
+                hubText(hdc, lab, kHubButtons[i].label, 12, RGB(0xE2, 0xE8, 0xF0), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, true);
+                RECT hint{btns[i].left + 48, btns[i].top + 30, btns[i].right - 8, btns[i].top + 48};
+                hubText(hdc, hint, kHubButtons[i].hint, 11, RGB(0x64, 0x74, 0x8B), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, false);
+            }
+
+            // toast / footer
+            hubRoundRect(hdc, footer, 11, RGB(0x0C, 0x12, 0x1E), RGB(0x1A, 0x24, 0x34), false);
+            const bool toastLive = nowMs() < gHubToastUntil.load() && !gHubToast.empty();
+            const std::wstring footText = toastLive ? gHubToast
+                : std::wstring(L"Right-click the tray icon for the full menu \u00b7 closing this window keeps ChainIt running.");
+            RECT tr{footer.left + 14, footer.top + 6, footer.right - 14, footer.bottom - 6};
+            hubText(hdc, tr, footText, 11, toastLive ? RGB(0xA7, 0xF3, 0xD0) : RGB(0x52, 0x60, 0x79),
+                    DT_LEFT | DT_VCENTER | DT_WORDBREAK, false);
+
+            BitBlt(wdc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, hdc, 0, 0, SRCCOPY);
+            SelectObject(hdc, ob);
+            DeleteObject(bmp);
+            DeleteDC(hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_DESTROY:
+            KillTimer(hwnd, 1);
+            gHubHwnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void hubRunAction(int idx) {
+    switch (idx) {
+        case 0:
+            hubSetToast(L"Opening the ChainIt File Manager\u2026");
+            launchDesktopUiWindow();
+            break;
+        case 1:
+            hubSetToast(L"Opening Z:\\ in Windows Explorer\u2026");
+            ShellExecuteW(nullptr, L"open", L"Z:\\", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case 2:
+            hubSetToast(L"Mounting Z:\\ through the WebDAV redirector\u2026");
+            mountZDriveAsync();
+            break;
+        case 3: {
+            hubSetToast(L"Writing ChainIt.lnk to the Desktop\u2026");
+            std::thread([]() {
+                const ShortcutResult sc = createDesktopShortcut();
+                hubSetToast(sc.ok ? (L"Desktop icon created \u2192 " + sc.path) : wideFromAnsi(sc.message), 7000);
+                if (gHubHwnd) InvalidateRect(gHubHwnd, nullptr, FALSE);
+            }).detach();
+            break;
+        }
+        case 4: {
+            hubSetToast(L"Checking the published release for a newer build\u2026");
+            std::thread([]() {
+                const AppUpdateResult r = performAppUpdate();
+                hubSetToast(wideFromAnsi(r.message.empty() ? std::string("Update finished.") : r.message), 8000);
+                if (gHubHwnd) InvalidateRect(gHubHwnd, nullptr, FALSE);
+                if (r.restart) {
+                    Shell_NotifyIconW(NIM_DELETE, &gNid);
+                    ExitProcess(0);
+                }
+            }).detach();
+            break;
+        }
+        case 5: {
+            hubSetToast(L"Unmounting Z:\\ and quitting ChainIt\u2026");
+            std::thread([]() {
+                runHiddenCommand(L"cmd.exe /c net use Z: /delete /y");
+                gRunning.store(false);
+                Shell_NotifyIconW(NIM_DELETE, &gNid);
+                ExitProcess(0);
+            }).detach();
+            break;
+        }
+    }
+    if (gHubHwnd) InvalidateRect(gHubHwnd, nullptr, FALSE);
+}
+
+static HWND createHubWindow(HINSTANCE hInstance, HICON icon) {
+    gHubInstance = hInstance;
+    gHubIcon = icon;
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = HubWndProc;
+    wc.hInstance = hInstance;
+    wc.hIcon = icon;
+    wc.hIconSm = icon;
+    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = kHubClass;
+    RegisterClassExW(&wc);
+
+    const int w = 468, h = 520;
+    const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    HWND hwnd = CreateWindowExW(
+        0, kHubClass, L"ChainIt Sibling",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        (sw - w) / 2, (sh - h) / 2, w, h,
+        nullptr, nullptr, hInstance, nullptr);
+
+    // One taskbar identity for the whole process: the chain-link icon, not the
+    // browser's globe, and no extra grouping buttons for the app-mode window.
+    typedef HRESULT(WINAPI * SetAumidFn)(PCWSTR);
+    HMODULE shell32 = GetModuleHandleW(L"shell32.dll");
+    if (shell32) {
+        SetAumidFn fn = reinterpret_cast<SetAumidFn>(
+            GetProcAddress(shell32, "SetCurrentProcessExplicitAppUserModelID"));
+        if (fn) fn(L"ChainIt.Sibling.Hub");
+    }
+    if (hwnd) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
+    if (hwnd) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+    return hwnd;
+}
+
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
         if (lParam == WM_LBUTTONDBLCLK) {
-            launchDesktopUiWindow();
+            hubShow();
         } else if (lParam == WM_RBUTTONUP) {
             POINT pt;
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
+            AppendMenuW(hMenu, MF_STRING, ID_TRAY_HUB, L"Show ChainIt (mini panel)");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_UI, L"Open ChainIt File Manager");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_Z, L"Open Z:\\ Phone Drive in Explorer");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_REMOUNT_Z, L"Mount / Refresh Z:\\ Drive");
+            AppendMenuW(hMenu, MF_STRING, ID_TRAY_MINI, L"Mini status panel");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHORTCUT, L"Create desktop icon");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_UPDATE, L"Update ChainIt in place…");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -2551,6 +3333,12 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 break;
             case ID_TRAY_REMOUNT_Z:
                 mountZDriveAsync();
+                break;
+            case ID_TRAY_HUB:
+                hubShow();
+                break;
+            case ID_TRAY_MINI:
+                launchMiniPanelWindow();
                 break;
             case ID_TRAY_SHORTCUT: {
                 std::thread([]() {
@@ -2593,7 +3381,86 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------
+// Uninstall mode: "ChainIt-Windows.exe /uninstall"
+//
+// The setup program registers this exact command line as the Add/Remove
+// Programs uninstaller, so removing ChainIt is one entry in Apps & features.
+// A running exe cannot delete itself, so the file removal is handed to a tiny
+// detached cmd.exe that waits for this process to disappear.
+// ---------------------------------------------------------------------------
+static int runUninstallMode(bool silent) {
+    runHiddenCommand(L"cmd.exe /c net use Z: /delete /y");
+
+    const std::wstring exe = currentExePath();
+    const std::wstring dir = fs::path(exe).parent_path().wstring();
+
+    auto dropLnk = [](const std::wstring& path) {
+        if (path.empty()) return;
+        DeleteFileW(path.c_str());
+        SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, path.c_str(), nullptr);
+    };
+
+    PWSTR raw = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &raw)) && raw) {
+        dropLnk(std::wstring(raw) + L"\\ChainIt.lnk");
+        CoTaskMemFree(raw);
+    }
+    raw = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, nullptr, &raw)) && raw) {
+        const std::wstring prog = std::wstring(raw) + L"\\ChainIt";
+        dropLnk(prog + L"\\ChainIt.lnk");
+        RemoveDirectoryW(prog.c_str());
+        CoTaskMemFree(raw);
+    }
+
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ChainIt");
+
+    wchar_t appData[MAX_PATH * 2] = {};
+    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH * 2 - 1) > 0) {
+        std::error_code ec;
+        fs::remove_all(fs::path(appData) / L"ChainIt", ec); // saved settings & pairing key
+    }
+
+    if (!silent) {
+        MessageBoxW(nullptr,
+                    L"ChainIt has been removed.\n\n"
+                    L"Z:\\ was unmapped, the Desktop and Start Menu shortcuts are gone, the "
+                    L"Apps & features entry was deleted, and your saved ChainIt settings were cleared.\n\n"
+                    L"The ChainIt-Windows.exe file itself is deleted a moment after this window closes.",
+                    L"ChainIt removed", MB_OK | MB_ICONINFORMATION);
+    }
+
+    // Detached self-delete: wait ~2s for this process to exit, then wipe the folder.
+    const std::wstring cmd = L"cmd.exe /c ping -n 3 127.0.0.1 >nul & del /f /q \"" + exe +
+                             L"\" & rd /s /q \"" + dir + L"\"";
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> mutableCmd(cmd.begin(), cmd.end());
+    mutableCmd.push_back(L'\0');
+    CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                   CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (pi.hThread) CloseHandle(pi.hThread);
+
+    Shell_NotifyIconW(NIM_DELETE, &gNid);
+    gRunning.store(false);
+    ExitProcess(0);
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    {
+        const std::wstring cmdLine = GetCommandLineW();
+        const bool uninstall = cmdLine.find(L"/uninstall") != std::wstring::npos ||
+                               cmdLine.find(L"/UNINSTALL") != std::wstring::npos;
+        if (uninstall) {
+            const bool silent = cmdLine.find(L"/S") != std::wstring::npos || cmdLine.find(L"/s") != std::wstring::npos;
+            return runUninstallMode(silent);
+        }
+    }
+
     // Prevent duplicate instances; if already running, just bring up the ChainIt File Manager window!
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ChainItSiblingEngineSingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -2666,7 +3533,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wcsncpy_s(gNid.szTip, L"ChainIt Sibling — Auto-Connect & Z:\\ Drive", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &gNid);
 
-    // Give HTTP server 150ms to bind, then open the native borderless ChainIt window
+    // Native hub window first: it owns ChainIt's taskbar button and shows the
+    // chain-link icon while the app is running.
+    HWND hub = createHubWindow(hInstance, gNid.hIcon);
+    if (hub) {
+        ShowWindow(hub, SW_SHOWNORMAL);
+        UpdateWindow(hub);
+    }
+
+    // Give HTTP server 150ms to bind, then open the full web File Manager
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     launchDesktopUiWindow();
 

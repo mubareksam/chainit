@@ -13,6 +13,7 @@ import {
   Wifi,
   WifiOff,
   Zap,
+  ShieldCheck,
 } from 'lucide-react';
 import { SystemSnapshot, TransportId, TransportTelemetry } from '../../shared/types';
 import { api } from '../api/client';
@@ -239,6 +240,55 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
             </div>
           );
         })}
+      </div>
+
+      {/* Security & transfer integrity */}
+      <div className="ci-card-pad space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="ci-h2 flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-[var(--ci-accent)]" />
+              Sibling security &amp; transfer integrity
+            </h3>
+            <p className="ci-body">
+              Every request to the phone carries the Pairing Key — missing or wrong keys are refused and
+              lock the VFS port after 5 tries. Files travel as simultaneous 2 MiB chunks, each one
+              SHA-256 verified in flight, and the finished file is hash-checked against the phone's
+              whole-file digest before it replaces anything on disk. A compromised device therefore
+              cannot silently poison the other side's files.
+            </p>
+          </div>
+          <span className={`ci-pill-${(snapshot.security?.integrityFailures ?? 0) === 0 ? 'ok' : 'warn'}`}>
+            {(snapshot.security?.integrityFailures ?? 0) === 0 ? 'INTEGRITY OK' : 'HASH FAILURES'}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+          <div className="ci-tile">
+            <div className="ci-section-label">Key auth</div>
+            <div className="ci-h2 mt-1 flex items-center gap-2">
+              <span className="ci-dot ci-dot-ok" />
+              {snapshot.security?.keyAuth ?? 'required'}
+            </div>
+          </div>
+          <div className="ci-tile">
+            <div className="ci-section-label">Brute-force brake</div>
+            <div className="ci-body mt-1">
+              {snapshot.security?.lockoutAfter ?? 5} tries / {snapshot.security?.lockoutWindowSec ?? 60}s →{' '}
+              {snapshot.security?.lockoutCooldownSec ?? 30}s lock
+            </div>
+          </div>
+          <div className="ci-tile">
+            <div className="ci-section-label">Chunks verified</div>
+            <div className="ci-h2 mt-1 ci-mono">{snapshot.security?.chunksVerified ?? 0}</div>
+          </div>
+          <div className="ci-tile">
+            <div className="ci-section-label">Parallel streams</div>
+            <div className="ci-h2 mt-1 ci-mono">
+              {snapshot.security?.parallelWorkers ?? 4} × {Math.round((snapshot.security?.chunkBytes ?? 2097152) / 1048576)} MiB
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Physical Scenario Lab */}

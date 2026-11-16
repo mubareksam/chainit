@@ -30,11 +30,12 @@ import { DownloadsModal } from './components/DownloadsModal';
 import { ClipboardState, DrivePane } from './components/DrivePane';
 import { FilePreviewModal } from './components/FilePreviewModal';
 import { MobileCompanionPage } from './components/MobileCompanionPage';
+import { MiniPanel } from './components/MiniPanel';
 import { SiblingAndMountView } from './components/SiblingAndMountView';
 import { formatBytes, formatShortTime, toWindowsDisplayPath } from './utils/format';
 
 /** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
-export const APP_VERSION = '1.2.0';
+export const APP_VERSION = '1.3.0';
 
 type MainTab = 'explorer' | 'connectivity' | 'sibling';
 type ExplorerLayout = 'dual' | 'single_z';
@@ -53,6 +54,9 @@ export const App: React.FC = () => {
 
   const [isMobileRoute, setIsMobileRoute] = useState(
     () => typeof window !== 'undefined' && window.location.pathname.startsWith('/mobile')
+  );
+  const [isMiniRoute] = useState(
+    () => typeof window !== 'undefined' && window.location.pathname.startsWith('/mini')
   );
 
   const [pcDir, setPcDir] = useState('/Desktop');
@@ -249,6 +253,10 @@ export const App: React.FC = () => {
         <span>Starting ChainIt Sibling Daemon & Z:\ VFS Engine...</span>
       </div>
     );
+  }
+
+  if (isMiniRoute) {
+    return <MiniPanel />;
   }
 
   if (isMobileRoute) {

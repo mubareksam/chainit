@@ -12,6 +12,7 @@ import com.chainit.android.vfs.FileOps
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
+import java.security.MessageDigest
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -72,14 +73,88 @@ class PhoneHttpAndWebDavServer(
         serverSocket = null
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Security hardening
+    //   * the Pairing Key is REQUIRED on every request (no anonymous access, ever)
+    //   * 5 wrong/missing keys inside 60 s lock the VFS port for 30 s (brute-force brake)
+    //   * every served range carries its SHA-256 and every inbound file is verified
+    //     against the sender's SHA-256, so a tampered or torn transfer is discarded
+    // -----------------------------------------------------------------------------------------
+    private val authFailures = ArrayDeque<Long>()
+    private var lockUntilMs = 0L
+    private val shaCache = object : LinkedHashMap<String, String>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 64
+    }
+
+    private fun isLockedOut(): Boolean = synchronized(authFailures) { System.currentTimeMillis() < lockUntilMs }
+
+    private fun registerAuthFailure() {
+        synchronized(authFailures) {
+            val now = System.currentTimeMillis()
+            authFailures.addLast(now)
+            while (authFailures.isNotEmpty() && now - authFailures.first() > 60_000) authFailures.removeFirst()
+            if (authFailures.size >= 5) {
+                lockUntilMs = now + 30_000
+                authFailures.clear()
+            }
+        }
+    }
+
+    private fun sha256Hex(data: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
+
+    private fun sha256FileWhole(file: File): String {
+        val key = "${file.absolutePath}|${file.length()}|${file.lastModified()}"
+        synchronized(shaCache) { shaCache[key]?.let { return it } }
+        val md = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { fis ->
+            val buf = ByteArray(256 * 1024)
+            while (true) {
+                val r = fis.read(buf)
+                if (r <= 0) break
+                md.update(buf, 0, r)
+            }
+        }
+        val hex = md.digest().joinToString("") { "%02x".format(it) }
+        synchronized(shaCache) { shaCache[key] = hex }
+        return hex
+    }
+
+    private fun sha256FileRange(file: File, start: Long, len: Long): String {
+        if (start == 0L && len == file.length()) return sha256FileWhole(file)
+        val md = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { fis ->
+            var skip = start
+            while (skip > 0) {
+                val jumped = fis.skip(skip)
+                if (jumped <= 0) break
+                skip -= jumped
+            }
+            val buf = ByteArray(256 * 1024)
+            var remaining = len
+            while (remaining > 0) {
+                val r = fis.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                if (r <= 0) break
+                md.update(buf, 0, r)
+                remaining -= r
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /** Verify an inbound file against the sender's SHA-256; discard it on any mismatch. */
+    private fun verifyInbound(file: File, expected: String?): Boolean {
+        if (expected.isNullOrBlank()) return true
+        return runCatching { sha256FileWhole(file).equals(expected.trim(), ignoreCase = true) }.getOrDefault(false)
+    }
+
     private fun checkSiblingAuth(headers: Map<String, String>): Boolean {
         val prefs = context.getSharedPreferences("chainit_prefs", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("sibling_enabled", true)) return false
         val expected = prefs.getString("sibling_key", "CHAINIT-SIBLING") ?: "CHAINIT-SIBLING"
         val provided = headers["x-chainit-key"]
-        // Allow matching key or unauthenticated local WebDAV if default key is unchanged
-        if (provided != null && provided != expected) return false
-        return true
+        // Strict: a missing or wrong Pairing Key is refused. ChainIt-Windows.exe always sends it.
+        return provided != null && provided == expected
     }
 
     private fun handleClient(socket: Socket) {
@@ -116,9 +191,15 @@ class PhoneHttpAndWebDavServer(
             return
         }
 
+        if (isLockedOut()) {
+            val err = JSONObject().put("error", "Too many Pairing Key failures - the Sibling VFS port is cooling down for 30 s.").toString()
+            sendSimpleResponse(output, 429, "Too Many Requests", "application/json", err.toByteArray(Charsets.UTF_8))
+            return
+        }
         if (!checkSiblingAuth(headers)) {
-            val err = JSONObject().put("error", "Sibling Mode is paused or Pairing Key mismatch on Android phone.").toString()
-            sendSimpleResponse(output, 403, "Forbidden", "application/json", err.toByteArray(Charsets.UTF_8))
+            registerAuthFailure()
+            val err = JSONObject().put("error", "Pairing Key required and must match the one shown in ChainIt Sibling.").toString()
+            sendSimpleResponse(output, 401, "Unauthorized", "application/json", err.toByteArray(Charsets.UTF_8))
             return
         }
 
@@ -221,6 +302,11 @@ class PhoneHttpAndWebDavServer(
                 dirFile.mkdirs()
                 val dest = File(dirFile, safeName)
                 copyFixedBytes(input, dest, contentLength)
+                if (!verifyInbound(dest, headers["x-chainit-file-sha256"])) {
+                    runCatching { dest.delete() }
+                    sendJson(output, 409, JSONObject().put("error", "SHA-256 mismatch on upload - file discarded."))
+                    return
+                }
                 MediaScannerConnection.scanFile(context, arrayOf(dest.absolutePath), null, null)
                 lastActivitySummary = "Received ${dest.name} (${dest.length()} B)"
                 sendJson(output, 200, JSONObject().put("item", vfs.toEntry(dest).toJson()))
@@ -347,6 +433,12 @@ $responses
                 val existed = targetFile.exists()
                 targetFile.parentFile?.mkdirs()
                 copyFixedBytes(input, targetFile, contentLength)
+                if (!verifyInbound(targetFile, headers["x-chainit-file-sha256"])) {
+                    runCatching { targetFile.delete() }
+                    val err = JSONObject().put("error", "SHA-256 mismatch on upload - file discarded.").toString()
+                    sendSimpleResponse(output, 409, "Conflict", "application/json", err.toByteArray(Charsets.UTF_8), extraHeaders)
+                    return
+                }
                 MediaScannerConnection.scanFile(context, arrayOf(targetFile.absolutePath), null, null)
                 lastActivitySummary = "WebDAV Write ${targetFile.name}"
                 sendSimpleResponse(
@@ -518,6 +610,8 @@ $responses
         }
 
         val length = if (size == 0L) 0L else (end - start + 1).coerceAtLeast(0L)
+        val fileSha = runCatching { sha256FileWhole(file) }.getOrNull()
+        val chunkSha = if (length > 0L) runCatching { sha256FileRange(file, start, length) }.getOrNull() else null
         val sb = StringBuilder()
         sb.append(if (partial) "HTTP/1.1 206 Partial Content\r\n" else "HTTP/1.1 200 OK\r\n")
         sb.append("Content-Type: $mime\r\n")
@@ -528,6 +622,8 @@ $responses
         if (partial) {
             sb.append("Content-Range: bytes $start-$end/$size\r\n")
         }
+        if (fileSha != null) sb.append("X-ChainIt-File-Sha256: $fileSha\r\n")
+        if (chunkSha != null) sb.append("X-ChainIt-Chunk-Sha256: $chunkSha\r\n")
         if (download) {
             val encoded = URLEncoder.encode(file.name, "UTF-8").replace("+", "%20")
             sb.append("Content-Disposition: attachment; filename=\"$encoded\"\r\n")

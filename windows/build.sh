@@ -27,7 +27,7 @@ python3 scripts/gen_embedded_assets.py app/dist /tmp/win-build/embedded_assets.h
   windows/res/chainit.rc \
   -o "$OUT" \
   -Wl,--subsystem,windows \
-  -lws2_32 -liphlpapi -lshell32 -luser32 -ladvapi32 -lcrypt32 -lurlmon -lwininet -lole32
+  -lws2_32 -liphlpapi -lshell32 -luser32 -ladvapi32 -lcrypt32 -lurlmon -lwininet -lole32 -lgdi32
 
 # Keep the in-place update manifest in sync with the binaries we just produced.
 python3 scripts/publish_release_manifest.py
