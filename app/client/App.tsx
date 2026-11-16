@@ -8,6 +8,7 @@ import {
   Download,
   FolderTree,
   HardDrive,
+  Info,
   Link2,
   Lock,
   MonitorDown,
@@ -25,6 +26,7 @@ import { DriveTarget, SystemSnapshot, VfsItem } from '../shared/types';
 import { api } from './api/client';
 import { LogoBadge } from './components/Brand';
 import { SortState, loadSortPref, saveSortPref } from './utils/sort';
+import { AboutView } from './components/AboutView';
 import { ConnectivityView } from './components/ConnectivityView';
 import { DownloadsModal } from './components/DownloadsModal';
 import { ClipboardState, DrivePane } from './components/DrivePane';
@@ -35,9 +37,9 @@ import { SiblingAndMountView } from './components/SiblingAndMountView';
 import { formatBytes, formatShortTime, toWindowsDisplayPath } from './utils/format';
 
 /** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
-export const APP_VERSION = '1.3.0';
+export const APP_VERSION = '1.5.0';
 
-type MainTab = 'explorer' | 'connectivity' | 'sibling';
+type MainTab = 'explorer' | 'connectivity' | 'sibling' | 'about';
 type ExplorerLayout = 'dual' | 'single_z';
 
 interface ToastItem {
@@ -469,6 +471,12 @@ export const App: React.FC = () => {
               icon={<HardDrive className="w-4 h-4" />}
               label="Sibling & Z:\ Mount"
             />
+            <NavTabButton
+              active={activeTab === 'about'}
+              onClick={() => setActiveTab('about')}
+              icon={<Info className="w-4 h-4" />}
+              label="About"
+            />
           </nav>
 
           {activeTab === 'explorer' && (
@@ -550,6 +558,32 @@ export const App: React.FC = () => {
       )}
 
       {/* Main Content Workspace */}
+      {/*
+        The link can be "connected" and still serve nothing (radio napped, Sibling Mode off on the
+        phone, Pairing Key mismatch). When that happens the engine reports exactly why, and we say so
+        loudly here instead of letting the user stare at an empty Z:\ drive.
+      */}
+      {snapshot.linkProblem && (
+        <div className="max-w-[1600px] w-full mx-auto px-4 lg:px-6 pt-4">
+          <div className="ci-inset rounded-xl border border-[var(--ci-amber)]/40 bg-[var(--ci-amber)]/10 px-4 py-3 flex flex-wrap items-center gap-3">
+            <span className="ci-dot ci-dot-warn shrink-0" />
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-bold text-amber-200">Sibling link is up but not serving files</div>
+              <div className="text-[11px] text-amber-100/80 mt-0.5">{snapshot.linkProblem}</div>
+            </div>
+            <button
+              type="button"
+              className="ci-btn-ghost shrink-0"
+              onClick={() => setRefreshToken((n) => n + 1)}
+              title="Re-scan every transport now"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Re-check</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       <main className="flex-1 max-w-[1600px] w-full mx-auto px-4 lg:px-6 py-5">
         {activeTab === 'explorer' &&
           (explorerLayout === 'dual' ? (
@@ -714,6 +748,8 @@ export const App: React.FC = () => {
         {activeTab === 'sibling' && (
           <SiblingAndMountView snapshot={snapshot} onSnapshot={setSnapshot} notify={notify} />
         )}
+
+        {activeTab === 'about' && <AboutView snapshot={snapshot} />}
       </main>
 
       {/* Bottom Live Transfer & Protocol Telemetry Strip */}

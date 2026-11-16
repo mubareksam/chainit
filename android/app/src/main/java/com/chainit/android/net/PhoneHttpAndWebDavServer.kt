@@ -148,75 +148,239 @@ class PhoneHttpAndWebDavServer(
         return runCatching { sha256FileWhole(file).equals(expected.trim(), ignoreCase = true) }.getOrDefault(false)
     }
 
-    private fun checkSiblingAuth(headers: Map<String, String>): Boolean {
+    /** Why a request was refused - the PC shows this verbatim instead of a dead-looking link. */
+    private enum class AuthVerdict { OK, BAD_KEY, SIBLING_OFF }
+
+    private fun checkSiblingAuth(headers: Map<String, String>): AuthVerdict {
         val prefs = context.getSharedPreferences("chainit_prefs", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("sibling_enabled", true)) return false
         val expected = prefs.getString("sibling_key", "CHAINIT-SIBLING") ?: "CHAINIT-SIBLING"
         val provided = headers["x-chainit-key"]
         // Strict: a missing or wrong Pairing Key is refused. ChainIt-Windows.exe always sends it.
-        return provided != null && provided == expected
+        if (provided == null || provided != expected) return AuthVerdict.BAD_KEY
+        // The key is correct, so this is a switch the user flipped - say exactly that rather
+        // than answering 401 and leaving Windows staring at an empty Z:\ drive.
+        if (!prefs.getBoolean("sibling_enabled", true)) return AuthVerdict.SIBLING_OFF
+        return AuthVerdict.OK
     }
+
+    /**
+     * Keep-alive bookkeeping.
+     *
+     * Bluetooth RFCOMM is expensive to dial (SDP lookup + page, easily 1-5 s per connect), so a
+     * single RFCOMM link must be able to serve a whole Explorer session. Every response writer
+     * asks [connectionHeader] whether the socket stays open, and [CountingInputStream] lets the
+     * session loop drain any body a handler did not consume so the next request line is never
+     * mis-parsed out of leftover upload bytes.
+     */
+    private val sessionKeepAlive = ThreadLocal<Boolean>()
+
+    private fun connectionHeader(): String =
+        if (sessionKeepAlive.get() == true) "Connection: keep-alive\r\n" else "Connection: close\r\n"
+
+    private class CountingInputStream(private val src: InputStream) : InputStream() {
+        var count: Long = 0L
+            private set
+
+        override fun read(): Int {
+            val b = src.read()
+            if (b >= 0) count += 1
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val r = src.read(b, off, len)
+            if (r > 0) count += r.toLong()
+            return r
+        }
+
+        override fun skip(n: Long): Long {
+            val r = src.skip(n)
+            if (r > 0) count += r
+            return r
+        }
+
+        override fun available(): Int = src.available()
+        override fun close() = src.close()
+    }
+
+    /** Open sessions, so an idle one can be force-closed instead of pinning a thread forever. */
+    private class Session(val closeable: java.io.Closeable?) {
+        @Volatile
+        var lastActivityMs: Long = System.currentTimeMillis()
+    }
+
+    private val sessions = java.util.Collections.synchronizedList(mutableListOf<Session>())
+    private val maxIdleSessionMs = 10L * 60 * 1000
+
+    @Volatile
+    var openSessions: Int = 0
+        private set
+
+    @Volatile
+    var servedRequests: Long = 0L
+        private set
+
+    private fun startSessionSweeper() {
+        if (sweeperStarted.getAndSet(true)) return
+        Thread {
+            while (running) {
+                try {
+                    Thread.sleep(30_000L)
+                    val now = System.currentTimeMillis()
+                    val idle = mutableListOf<Session>()
+                    synchronized(sessions) {
+                        val it = sessions.iterator()
+                        while (it.hasNext()) {
+                            val s = it.next()
+                            if (now - s.lastActivityMs > maxIdleSessionMs) { idle.add(s); it.remove() }
+                        }
+                    }
+                    for (s in idle) runCatching { s.closeable?.close() }
+                    openSessions = sessions.size
+                } catch (_: InterruptedException) {
+                    return@Thread
+                } catch (_: Throwable) {
+                }
+            }
+        }.apply { isDaemon = true; name = "ChainItSessionSweeper"; start() }
+    }
+
+    private val sweeperStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private fun handleClient(socket: Socket) {
         socket.use { sock ->
-            sock.soTimeout = 30_000
-            handleStreamSession(sock.getInputStream(), sock.getOutputStream(), viaBluetooth = false)
+            // Long enough for a keep-alive link to sit between Explorer requests; the sweeper
+            // force-closes anything idle for 10 minutes.
+            sock.soTimeout = 5 * 60 * 1000
+            handleStreamSession(sock.getInputStream(), sock.getOutputStream(), viaBluetooth = false, sock)
         }
     }
 
-    fun handleStreamSession(rawInput: InputStream, rawOutput: OutputStream, viaBluetooth: Boolean) {
+    /**
+     * Serves one connection: as many requests as the peer wants to pipeline on it.
+     *
+     * `closeable` is the underlying socket, kept so the idle sweeper can break a blocked read on a
+     * link whose peer vanished (Bluetooth streams have no SO_TIMEOUT of their own).
+     */
+    fun handleStreamSession(
+        rawInput: InputStream,
+        rawOutput: OutputStream,
+        viaBluetooth: Boolean,
+        closeable: java.io.Closeable? = null
+    ) {
         val input = BufferedInputStream(rawInput)
         val output = BufferedOutputStream(rawOutput)
+        startSessionSweeper()
 
-        val reqLine = readAsciiLine(input) ?: return
-        val parts = reqLine.split(" ")
-        if (parts.size < 2) return
-        val method = parts[0].uppercase(Locale.US)
-        val rawTarget = parts[1]
-
-        val headers = mutableMapOf<String, String>()
-        while (true) {
-            val line = readAsciiLine(input) ?: break
-            if (line.isEmpty()) break
-            val colon = line.indexOf(':')
-            if (colon > 0) {
-                val k = line.substring(0, colon).trim().lowercase(Locale.US)
-                val v = line.substring(colon + 1).trim()
-                headers[k] = v
-            }
-        }
-
-        if (method == "OPTIONS" && !rawTarget.startsWith("/dav")) {
-            sendSimpleResponse(output, 204, "No Content", "text/plain", ByteArray(0))
-            return
-        }
-
-        if (isLockedOut()) {
-            val err = JSONObject().put("error", "Too many Pairing Key failures - the Sibling VFS port is cooling down for 30 s.").toString()
-            sendSimpleResponse(output, 429, "Too Many Requests", "application/json", err.toByteArray(Charsets.UTF_8))
-            return
-        }
-        if (!checkSiblingAuth(headers)) {
-            registerAuthFailure()
-            val err = JSONObject().put("error", "Pairing Key required and must match the one shown in ChainIt Sibling.").toString()
-            sendSimpleResponse(output, 401, "Unauthorized", "application/json", err.toByteArray(Charsets.UTF_8))
-            return
-        }
-
-        val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
-
+        val session = Session(closeable)
+        sessions.add(session)
+        openSessions = sessions.size
         try {
-            if (rawTarget == "/dav" || rawTarget.startsWith("/dav/") || rawTarget.startsWith("/dav?")) {
-                handleWebDav(method, rawTarget, headers, contentLength, input, output)
-            } else {
-                handleChainItApi(method, rawTarget, headers, contentLength, input, output)
+            var served = 0
+            while (running) {
+                session.lastActivityMs = System.currentTimeMillis()
+
+                val reqLine = readAsciiLine(input) ?: break
+                if (reqLine.isEmpty()) continue
+                val parts = reqLine.split(" ")
+                if (parts.size < 2) break
+                val method = parts[0].uppercase(Locale.US)
+                val rawTarget = parts[1]
+                val httpVersion = if (parts.size > 2) parts[2].uppercase(Locale.US) else "HTTP/1.1"
+
+                val headers = mutableMapOf<String, String>()
+                var malformed = false
+                while (true) {
+                    val line = readAsciiLine(input)
+                    if (line == null) { malformed = true; break }
+                    if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        headers[line.substring(0, colon).trim().lowercase(Locale.US)] =
+                            line.substring(colon + 1).trim()
+                    }
+                }
+                if (malformed) break
+
+                // Does this connection stay open after the response?
+                val connHeader = headers["connection"]?.lowercase(Locale.US) ?: ""
+                val wantsClose = connHeader.contains("close")
+                val keepAlive = !wantsClose && (httpVersion == "HTTP/1.1" || connHeader.contains("keep-alive"))
+                sessionKeepAlive.set(keepAlive)
+
+                val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
+                val counted = CountingInputStream(input)
+
+                try {
+                    when {
+                        method == "OPTIONS" && !rawTarget.startsWith("/dav") ->
+                            sendSimpleResponse(output, 204, "No Content", "text/plain", ByteArray(0))
+
+                        isLockedOut() -> {
+                            val err = JSONObject().put("error", "Too many Pairing Key failures - the Sibling VFS port is cooling down for 30 s.").toString()
+                            sendSimpleResponse(output, 429, "Too Many Requests", "application/json", err.toByteArray(Charsets.UTF_8))
+                        }
+
+                        else -> {
+                            when (checkSiblingAuth(headers)) {
+                                AuthVerdict.BAD_KEY -> {
+                                    registerAuthFailure()
+                                    val err = JSONObject().put("error", "Pairing Key required and must match the one shown in ChainIt Sibling.").toString()
+                                    sendSimpleResponse(output, 401, "Unauthorized", "application/json", err.toByteArray(Charsets.UTF_8))
+                                }
+                                AuthVerdict.SIBLING_OFF -> {
+                                    // Correct key, switch off: 403 with the exact remedy, not a silent 401.
+                                    val err = JSONObject()
+                                        .put("error", "Sibling Mode is OFF on the phone. Open ChainIt on the Android side and enable Sibling Mode - the Pairing Key already matches.")
+                                        .put("code", "sibling_disabled").toString()
+                                    sendSimpleResponse(output, 403, "Forbidden", "application/json", err.toByteArray(Charsets.UTF_8))
+                                }
+                                AuthVerdict.OK -> {
+                                    if (rawTarget == "/dav" || rawTarget.startsWith("/dav/") || rawTarget.startsWith("/dav?")) {
+                                        handleWebDav(method, rawTarget, headers, contentLength, counted, output)
+                                    } else {
+                                        handleChainItApi(method, rawTarget, headers, contentLength, counted, output)
+                                    }
+                                    if (viaBluetooth) {
+                                        lastActivitySummary = "[Bluetooth RFCOMM] $lastActivitySummary"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: java.net.SocketTimeoutException) {
+                    break // idle too long on a TCP keep-alive link
+                } catch (e: Exception) {
+                    val msg = JSONObject().put("error", e.message ?: "Phone VFS error").toString()
+                    runCatching {
+                        sendSimpleResponse(output, 400, "Bad Request", "application/json", msg.toByteArray(Charsets.UTF_8))
+                    }
+                }
+
+                // Never let an unconsumed request body desynchronise the next request line.
+                val left = contentLength - counted.count
+                if (left > 0) {
+                    var remaining = left
+                    val drain = ByteArray(64 * 1024)
+                    while (remaining > 0) {
+                        val r = counted.read(drain, 0, minOf(drain.size.toLong(), remaining).toInt())
+                        if (r <= 0) break
+                        remaining -= r.toLong()
+                    }
+                    if (remaining > 0) break
+                }
+
+                runCatching { output.flush() }
+                served += 1
+                servedRequests += 1
+                session.lastActivityMs = System.currentTimeMillis()
+                if (!keepAlive) break
+                if (served >= 100_000) break
             }
-            if (viaBluetooth) {
-                lastActivitySummary = "[Bluetooth RFCOMM] $lastActivitySummary"
-            }
-        } catch (e: Exception) {
-            val msg = JSONObject().put("error", e.message ?: "Phone VFS error").toString()
-            sendSimpleResponse(output, 400, "Bad Request", "application/json", msg.toByteArray(Charsets.UTF_8))
+        } finally {
+            sessionKeepAlive.remove()
+            sessions.remove(session)
+            openSessions = sessions.size
         }
     }
 
@@ -618,7 +782,7 @@ $responses
         sb.append("Content-Length: $length\r\n")
         sb.append("Accept-Ranges: bytes\r\n")
         sb.append("Access-Control-Allow-Origin: *\r\n")
-        sb.append("Connection: close\r\n")
+        sb.append(connectionHeader())
         if (partial) {
             sb.append("Content-Range: bytes $start-$end/$size\r\n")
         }
@@ -667,7 +831,7 @@ $responses
         sb.append("Content-Type: $contentType\r\n")
         sb.append("Content-Length: ${body.size}\r\n")
         sb.append("Access-Control-Allow-Origin: *\r\n")
-        sb.append("Connection: close\r\n")
+        sb.append(connectionHeader())
         extraHeaders.forEach { (k, v) -> sb.append("$k: $v\r\n") }
         sb.append("\r\n")
         output.write(sb.toString().toByteArray(Charsets.UTF_8))

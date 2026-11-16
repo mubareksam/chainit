@@ -159,6 +159,33 @@ class BluetoothRfcommTransport(
 
     private var serverSocket: BluetoothServerSocket? = null
 
+    /**
+     * How the listen socket was obtained, so the Windows side and the UI can explain a failure
+     * instead of showing a link that is "connected" but serves nothing.
+     */
+    @Volatile
+    var listenMode: String = "idle"
+        private set
+
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    @Volatile
+    var acceptedSessions: Long = 0L
+        private set
+
+    /**
+     * Publishes the ChainIt VFS over RFCOMM and keeps it published.
+     *
+     * Two things make Bluetooth behave like a LAN link rather than a one-shot file push:
+     *  1. the accepted socket is handed to [PhoneHttpAndWebDavServer.handleStreamSession] as a
+     *     *keep-alive* session, so Windows dials the radio once and then serves a whole Explorer
+     *     session (PROPFIND, GET ranges, PUT, MKCOL, MOVE, DELETE) over that single link;
+     *  2. the listener is re-armed forever - secure channel first, then the insecure channel that
+     *     many stacks require - and a watchdog restarts it if `accept()` ever dies, if Bluetooth is
+     *     toggled off/on, or if the phone has been locked for hours.
+     */
     @SuppressLint("MissingPermission")
     fun start() {
         if (running) return
@@ -168,22 +195,49 @@ class BluetoothRfcommTransport(
                 try {
                     if (!hasBluetoothPermission(context)) {
                         isListeningRfcomm = false
+                        listenMode = "blocked: permission"
+                        lastError = "Bluetooth permission not granted"
                         Thread.sleep(2500L)
                         continue
                     }
                     val adapter = getLocalAdapter(context)
                     if (adapter == null || !adapter.isEnabled) {
                         isListeningRfcomm = false
+                        listenMode = "blocked: radio off"
+                        lastError = "Bluetooth radio is off"
                         Thread.sleep(2500L)
                         continue
                     }
 
-                    val ss = adapter.listenUsingRfcommWithServiceRecord("ChainItSibling", CHAINIT_PHONE_UUID)
+                    // Secure (authenticated + encrypted) first; fall back to the insecure channel,
+                    // which is what a lot of desktop stacks actually negotiate against.
+                    var ss: BluetoothServerSocket? = null
+                    var mode = "secure"
+                    try {
+                        ss = adapter.listenUsingRfcommWithServiceRecord("ChainItSibling", CHAINIT_PHONE_UUID)
+                    } catch (e: Exception) {
+                        try {
+                            ss = adapter.listenUsingInsecureRfcommWithServiceRecord("ChainItSibling", CHAINIT_PHONE_UUID)
+                            mode = "insecure"
+                        } catch (e2: Exception) {
+                            lastError = "Could not open an RFCOMM channel: " + (e2.message ?: e.message ?: "unknown")
+                        }
+                    }
+                    if (ss == null) {
+                        isListeningRfcomm = false
+                        listenMode = "failed"
+                        Thread.sleep(2500L)
+                        continue
+                    }
+
                     serverSocket = ss
                     isListeningRfcomm = true
+                    listenMode = mode
+                    lastError = null
 
                     while (running) {
                         val client = ss.accept()
+                        acceptedSessions += 1
                         try {
                             lastBtPeerName = client.remoteDevice?.name ?: client.remoteDevice?.address
                         } catch (_: Exception) {
@@ -194,15 +248,22 @@ class BluetoothRfcommTransport(
                                     httpServer.handleStreamSession(
                                         btSock.inputStream,
                                         btSock.outputStream,
-                                        viaBluetooth = true
+                                        viaBluetooth = true,
+                                        closeable = btSock
                                     )
                                 } catch (_: Exception) {
                                 }
                             }
                         }
                     }
-                } catch (_: Exception) {
+                } catch (_: InterruptedException) {
+                    break
+                } catch (e: Exception) {
+                    // accept() throws when the radio is toggled, when a peer drops mid-dial, or when
+                    // Doze finally suspends us. Never give up: re-arm and keep listening.
                     isListeningRfcomm = false
+                    listenMode = "re-arming"
+                    lastError = e.message ?: e.javaClass.simpleName
                     try {
                         serverSocket?.close()
                     } catch (_: Exception) {
@@ -215,12 +276,32 @@ class BluetoothRfcommTransport(
                     }
                 }
             }
-        }.apply { isDaemon = true; start() }
+        }.apply { isDaemon = true; name = "ChainItRfcommListener"; start() }
+
+        // Watchdog: if the listener is supposed to be up but is not, force a re-arm.
+        Thread {
+            while (running) {
+                try {
+                    Thread.sleep(20_000L)
+                    if (running && !isListeningRfcomm) {
+                        try {
+                            serverSocket?.close()
+                        } catch (_: Exception) {
+                        }
+                        serverSocket = null
+                    }
+                } catch (_: InterruptedException) {
+                    return@Thread
+                } catch (_: Throwable) {
+                }
+            }
+        }.apply { isDaemon = true; name = "ChainItRfcommWatchdog"; start() }
     }
 
     fun stop() {
         running = false
         isListeningRfcomm = false
+        listenMode = "stopped"
         try {
             serverSocket?.close()
         } catch (_: Exception) {

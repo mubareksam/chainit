@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -460,6 +461,11 @@ struct GlobalState {
 
     fs::path pcRoot;
     fs::path fallbackPhoneRoot;
+
+    /** Set once a real phone answers, so Z: stops serving the "waiting" placeholder. */
+    bool everDiscoveredPhone = false;
+    /** Human-readable reason the link is not serving files - shown in the hub window and the UI. */
+    std::string phoneLinkProblem;
 };
 
 static GlobalState gState;
@@ -591,45 +597,364 @@ static void unmountZDriveSync() {
     runHiddenCommand(L"net use Z: /delete /y");
 }
 
-// Pocket-sized dashboard window (tray -> "Mini status panel").
-static void launchMiniPanelWindow() {
-    const wchar_t* edgePaths[] = {
-        L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-        L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-    };
-    for (const wchar_t* edge : edgePaths) {
-        if (GetFileAttributesW(edge) != INVALID_FILE_ATTRIBUTES) {
-            std::wstring args = L"--app=http://127.0.0.1:4173/mini --window-size=440,700";
-            ShellExecuteW(nullptr, L"open", edge, args.c_str(), nullptr, SW_SHOWNORMAL);
-            return;
-        }
-    }
-    ShellExecuteW(nullptr, L"open", L"http://127.0.0.1:4173/mini", nullptr, nullptr, SW_SHOWNORMAL);
-}
-
-static void launchDesktopUiWindow() {
-    const wchar_t* edgePaths[] = {
-        L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-        L"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-    };
-    for (const wchar_t* edge : edgePaths) {
-        if (GetFileAttributesW(edge) != INVALID_FILE_ATTRIBUTES) {
-            std::wstring args = L"--app=http://127.0.0.1:4173 --window-size=1380,860";
-            ShellExecuteW(nullptr, L"open", edge, args.c_str(), nullptr, SW_SHOWNORMAL);
-            return;
-        }
-    }
-    ShellExecuteW(nullptr, L"open", L"http://127.0.0.1:4173", nullptr, nullptr, SW_SHOWNORMAL);
-}
+// ---------------------------------------------------------------------------
+// The File Manager and the mini panel used to be opened from here by handing an
+// "--app=<local url>" argument to Microsoft Edge. That gives the window - and
+// therefore the taskbar button - to a *browser* process, so Windows drew Edge's
+// globe and no icon compiled into this exe could ever change it. Every window is
+// native now: see showNativeMainWindow() below and the GDI hub window.
+// ---------------------------------------------------------------------------
+static void showNativeMainWindow();
+static void launchDesktopUiWindow();
 
 // --- Simple Outbound HTTP Client to Talk to ChainIt-Android.apk (Port 49180) ---
+
+// --- XML / DAV helpers -----------------------------------------------------
+
+static std::string xmlEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 16);
+    for (char c : in) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default: out.push_back(c);
+        }
+    }
+    return out;
+}
+
+/** Ask both discovery loops to run their next sweep immediately instead of after their nap. */
+static std::atomic<bool> gForceRescan{false};
+static void triggerTransportRescan() { gForceRescan.store(true); }
+
+static std::string waitingDriveReadme() {
+    std::string peer;
+    std::string problem;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        peer = gState.peerDeviceName;
+        problem = gState.phoneLinkProblem;
+    }
+    std::ostringstream os;
+    os << "ChainIt Z: drive - waiting for your Android phone\r\n"
+       << "==================================================\r\n\r\n"
+       << "This drive is the live storage of your Android phone. It is empty right now only\r\n"
+       << "because no phone has answered yet - nothing is broken and nothing is disabled.\r\n\r\n"
+       << "To bring it online:\r\n"
+       << "  1. Open ChainIt on the Android phone.\r\n"
+       << "  2. Make sure Sibling Mode is ON and the Pairing Key matches this PC.\r\n"
+       << "  3. Turn on Bluetooth, or connect both devices to the same Wi-Fi / hotspot,\r\n"
+       << "     or plug in the USB cable and enable USB tethering.\r\n"
+       << "  4. Grant 'All files access' when the phone asks - that is what lets Z: see\r\n"
+       << "     DCIM, Download, Documents and the rest.\r\n\r\n"
+       << "The moment the phone answers, this drive fills with its real folders. The phone\r\n"
+       << "can stay locked and even have its screen off: ChainIt keeps serving from a\r\n"
+       << "foreground service with a Doze heartbeat.\r\n\r\n"
+       << "Current status\r\n"
+       << "--------------\r\n"
+       << "  Sibling engine : running (port 4173)\r\n"
+       << "  Peer           : " << (peer.empty() ? "not discovered yet" : peer) << "\r\n"
+       << "  Last problem   : " << (problem.empty() ? "none" : problem) << "\r\n";
+    return os.str();
+}
+
+/**
+ * WebDAV PROPFIND for the placeholder drive: a real collection holding one readme,
+ * so Explorer renders something that explains itself instead of an empty disk.
+ */
+static std::string buildWaitingDrivePropfind(const std::string& urlPath,
+                                            const std::map<std::string, std::string>& headers) {
+    std::string depth = "1";
+    auto it = headers.find("depth");
+    if (it != headers.end() && !it->second.empty()) depth = it->second;
+
+    const std::string readmeName = "READ ME FIRST - waiting for your phone.txt";
+    const std::string readmeBody = waitingDriveReadme();
+
+    std::ostringstream os;
+    os << "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+       << "<D:multistatus xmlns:D=\"DAV:\">"
+       << "<D:response><D:href>/dav/</D:href><D:propstat><D:prop>"
+       << "<D:displayname>ChainIt (waiting for phone)</D:displayname>"
+       << "<D:resourcetype><D:collection/></D:resourcetype>"
+       << "<D:getcontenttype>httpd/unix-directory</D:getcontenttype>"
+       << "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>";
+
+    if (depth != "0") {
+        os << "<D:response><D:href>/dav/" << xmlEscape(readmeName) << "</D:href><D:propstat><D:prop>"
+           << "<D:displayname>" << xmlEscape(readmeName) << "</D:displayname>"
+           << "<D:resourcetype/>"
+           << "<D:getcontentlength>" << readmeBody.size() << "</D:getcontentlength>"
+           << "<D:getcontenttype>text/plain</D:getcontenttype>"
+           << "<D:isreadonly>1</D:isreadonly>"
+           << "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>";
+    }
+    os << "</D:multistatus>";
+    (void)urlPath;
+    return os.str();
+}
 
 struct HttpReply {
     int status = 0;
     std::map<std::string, std::string> headers;
     std::string body;
     double rttMs = 0.0;
+    /** False when the peer asked to close (or sent no framing), so the channel must be dropped. */
+    bool keepAliveOk = false;
 };
+
+/** Blocking full write - a short send on RFCOMM would silently truncate an upload. */
+static bool sendAll(SOCKET s, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const int n = send(s, data.data() + sent, static_cast<int>(std::min<size_t>(65536, data.size() - sent)), 0);
+        if (n <= 0) {
+            const int err = WSAGetLastError();
+            if (err == WSAEINTR || err == WSAEWOULDBLOCK) continue;
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// ===========================================================================
+// Persistent RFCOMM channel pool (Bluetooth as a first-class transport)
+//
+// Dialling an RFCOMM link costs an SDP lookup plus a page - routinely 1-5 s on a
+// real radio. Explorer issues dozens of requests to render one folder, so a
+// connect-per-request design makes Bluetooth look "connected but dead": the link
+// is up, the queue never drains.
+//
+// These channels are therefore *kept open* and reused. The phone answers them as
+// HTTP/1.1 keep-alive sessions, so one dial serves a whole browsing session, and
+// several channels run side by side (per-channel mutex, not a global one) so a
+// slow PROPFIND never blocks a file read. The RFCOMM channel number discovered by
+// the first SDP query is cached, which removes the lookup from every later dial.
+// ===========================================================================
+
+static const size_t kBtChannelCount = 3;
+static std::atomic<ULONG> gBtCachedPort{0};
+static std::atomic<uint64_t> gBtRequestsServed{0};
+static std::atomic<uint64_t> gBtRedials{0};
+static std::atomic<int64_t> gBtLastRttUs{0};
+
+struct BtChannel {
+    SOCKET sock = INVALID_SOCKET;
+    std::mutex mtx;            // one request in flight per channel
+    std::string buf;           // bytes read ahead of the parser
+    size_t pos = 0;
+    int64_t lastUseMs = 0;
+    bool inPool = false;
+
+    bool ensure(size_t want) {
+        while (buf.size() - pos < want) {
+            char tmp[16384];
+            const int n = recv(sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) return false;
+            buf.append(tmp, static_cast<size_t>(n));
+        }
+        return true;
+    }
+    int getByte() {
+        if (!ensure(1)) return -1;
+        return static_cast<unsigned char>(buf[pos++]);
+    }
+    bool readExact(size_t want, std::string& out) {
+        if (want == 0) return true;
+        if (!ensure(want)) return false;
+        out.append(buf, pos, want);
+        pos += want;
+        return true;
+    }
+    void compact() {
+        if (pos > 0 && pos == buf.size()) { buf.clear(); pos = 0; }
+    }
+    bool readHeaderBlock(std::string& out) {
+        // Byte-at-a-time until CRLFCRLF: headers are small and this never over-reads
+        // into the body, which is what makes keep-alive framing safe.
+        out.clear();
+        int crlf = 0;
+        while (true) {
+            const int c = getByte();
+            if (c < 0) return false;
+            out.push_back(static_cast<char>(c));
+            if (c == '\n') {
+                if (crlf == 1) return true;   // saw "\r\n\r\n"
+                crlf = (out.size() >= 2 && out[out.size() - 2] == '\r') ? 1 : 0;
+                if (out.size() < 2) crlf = 0;
+            } else if (c != '\r') {
+                crlf = 0;
+            }
+            if (out.size() > 65536) return false;
+        }
+    }
+};
+
+static std::mutex gBtPoolMtx;
+static std::vector<std::shared_ptr<BtChannel>> gBtPool;
+
+static void btChannelClose(const std::shared_ptr<BtChannel>& ch) {
+    if (!ch) return;
+    if (ch->sock != INVALID_SOCKET) { closesocket(ch->sock); ch->sock = INVALID_SOCKET; }
+    ch->buf.clear();
+    ch->pos = 0;
+}
+
+static std::shared_ptr<BtChannel> btAcquireChannel(const std::string& endpoint, int timeoutMs) {
+    // 1. reuse a live channel
+    {
+        std::lock_guard<std::mutex> lk(gBtPoolMtx);
+        for (auto& ch : gBtPool) {
+            if (ch->inPool && ch->sock != INVALID_SOCKET) {
+                ch->inPool = false;
+                return ch;
+            }
+        }
+    }
+    // 2. dial a new one (SDP is skipped when we already know the RFCOMM channel)
+    SOCKET s = btRfcommConnect(endpoint, timeoutMs);
+    if (s == INVALID_SOCKET) return nullptr;
+    gBtRedials.fetch_add(1);
+
+    if (gBtCachedPort.load() == 0) {
+        SOCKADDR_BTH peer{};
+        int len = sizeof(peer);
+        if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &len) == 0 && peer.port != 0) {
+            gBtCachedPort.store(peer.port);
+        }
+    }
+
+    auto ch = std::make_shared<BtChannel>();
+    ch->sock = s;
+    ch->lastUseMs = nowMs();
+    return ch;
+}
+
+static void btReleaseChannel(const std::shared_ptr<BtChannel>& ch, bool healthy) {
+    if (!ch) return;
+    ch->lastUseMs = nowMs();
+    ch->compact();
+    if (!healthy) { btChannelClose(ch); return; }
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    if (ch->sock == INVALID_SOCKET) return;
+    for (auto& e : gBtPool) {
+        if (e == ch) { e->inPool = true; return; }
+    }
+    if (gBtPool.size() < kBtChannelCount) {
+        ch->inPool = true;
+        gBtPool.push_back(ch);
+    } else {
+        btChannelClose(ch);
+    }
+}
+
+/** How many reusable RFCOMM channels are parked and ready (0 = the next request must dial). */
+static size_t btPooledChannels() {
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    size_t n = 0;
+    for (const auto& ch : gBtPool) if (ch->inPool && ch->sock != INVALID_SOCKET) ++n;
+    return n;
+}
+
+/**
+ * Drop every *idle* pooled channel (radio went away, transport changed, peer re-paired).
+ * A channel that is mid-request is marked inPool == false and is left alone; its owner
+ * closes it when the exchange finishes.
+ */
+static void btPoolReset() {
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    for (auto& ch : gBtPool) {
+        if (ch->inPool) btChannelClose(ch);
+    }
+    gBtPool.clear();
+    gBtCachedPort.store(0);
+}
+
+/**
+ * One HTTP exchange over an already-open RFCOMM channel, framed for keep-alive:
+ * the body length comes from Content-Length or from de-chunking, never from EOF.
+ */
+static bool btHttpExchangeOnChannel(BtChannel& ch, const std::string& request,
+                                    const std::string& body, HttpReply& rep, int timeoutMs) {
+    if (ch.sock == INVALID_SOCKET) return false;
+    DWORD to = static_cast<DWORD>(timeoutMs);
+    setsockopt(ch.sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+    setsockopt(ch.sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+
+    if (!sendAll(ch.sock, request)) return false;
+    if (!body.empty() && !sendAll(ch.sock, body)) return false;
+
+    std::string headers;
+    if (!ch.readHeaderBlock(headers)) return false;
+
+    size_t sp1 = headers.find(' ');
+    if (sp1 != std::string::npos) {
+        size_t sp2 = headers.find(' ', sp1 + 1);
+        const std::string code = headers.substr(sp1 + 1, (sp2 == std::string::npos ? headers.size() : sp2) - sp1 - 1);
+        rep.status = std::atoi(code.c_str());
+    }
+
+    long long contentLength = -1;
+    bool chunked = false;
+    bool closes = false;
+    {
+        std::istringstream iss(headers);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t c = line.find(':');
+            if (c == std::string::npos) continue;
+            std::string k = line.substr(0, c);
+            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+            std::string v = line.substr(c + 1);
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            if (k == "content-length") contentLength = std::atoll(v.c_str());
+            else if (k == "transfer-encoding" && v.find("chunked") != std::string::npos) chunked = true;
+            else if (k == "connection" && v.find("close") != std::string::npos) closes = true;
+            rep.headers[k] = v;
+        }
+    }
+    if (rep.status == 204 || rep.status == 304) { rep.keepAliveOk = !closes; return true; }
+
+    if (chunked) {
+        while (true) {
+            std::string sizeLine;
+            int c;
+            while ((c = ch.getByte()) >= 0) {
+                if (c == '\n') break;
+                if (c != '\r') sizeLine.push_back(static_cast<char>(c));
+            }
+            if (c < 0) return false;
+            const size_t n = static_cast<size_t>(std::strtoull(sizeLine.c_str(), nullptr, 16));
+            if (n == 0) {
+                // trailer + final CRLF
+                std::string tail;
+                ch.readHeaderBlock(tail);
+                break;
+            }
+            if (!ch.readExact(n, rep.body)) return false;
+            ch.getByte(); ch.getByte(); // CRLF after the chunk
+        }
+    } else if (contentLength >= 0) {
+        if (!ch.readExact(static_cast<size_t>(contentLength), rep.body)) return false;
+    } else {
+        // No framing information: the peer will close, so this channel cannot be reused.
+        char tmp[16384];
+        while (true) {
+            const int n = recv(ch.sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) break;
+            rep.body.append(tmp, static_cast<size_t>(n));
+        }
+        closes = true;
+    }
+    rep.keepAliveOk = !closes;
+    return true;
+}
 
 static HttpReply httpRequestToPhone(
     const std::string& ip,
@@ -647,16 +972,56 @@ static HttpReply httpRequestToPhone(
     // exactly the same HTTP/WebDAV protocol as the TCP transports, so Z:\ and the File Manager work
     // with Wi-Fi / Hotspot / USB all switched OFF.
     const bool viaBluetooth = isBtEndpoint(ip);
-    std::unique_lock<std::mutex> btLk(gBtRfcommClientMtx, std::defer_lock);
-    SOCKET s = INVALID_SOCKET;
+
+    std::string keyCopy;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        keyCopy = gState.siblingKey;
+    }
 
     if (viaBluetooth) {
-        btLk.lock(); // one serialized RFCOMM stream at a time
-        s = btRfcommConnect(ip, timeoutMs);
-        if (s == INVALID_SOCKET) return rep;
-    } else {
-        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) return rep;
+        // --- persistent RFCOMM channel: dial once, then reuse for the whole session ---
+        std::ostringstream req;
+        req << method << " " << targetPath << " HTTP/1.1\r\n";
+        req << "Host: chainit-bluetooth\r\n";
+        req << "X-ChainIt-Transport: bluetooth-rfcomm\r\n";
+        req << "X-ChainIt-Key: " << keyCopy << "\r\n";
+        req << "Content-Length: " << body.size() << "\r\n";
+        req << "Connection: keep-alive\r\n";
+        for (const auto& kv : extraHeaders) req << kv.first << ": " << kv.second << "\r\n";
+        req << "\r\n";
+        const std::string headStr = req.str();
+
+        const int dialTimeout = std::max(timeoutMs, 12000);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            std::shared_ptr<BtChannel> ch = btAcquireChannel(ip, dialTimeout);
+            if (!ch) break;
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lk(ch->mtx); // per channel, so channels run in parallel
+                HttpReply attemptRep;
+                ok = btHttpExchangeOnChannel(*ch, headStr, body, attemptRep, timeoutMs);
+                if (ok) rep = std::move(attemptRep);
+                const bool reusable = ok && rep.keepAliveOk;
+                btReleaseChannel(ch, reusable);
+            }
+            if (ok && rep.status > 0) {
+                auto t1 = std::chrono::steady_clock::now();
+                rep.rttMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                gBtLastRttUs.store(static_cast<int64_t>(rep.rttMs * 1000.0));
+                gBtRequestsServed.fetch_add(1);
+                return rep;
+            }
+            // The link died (radio napped, peer closed, Doze suspended it): drop the stale
+            // channels and re-dial rather than reporting a dead transport.
+            rep = HttpReply{};
+            btPoolReset();
+        }
+        return rep;
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return rep;
 
         u_long nonBlock = 1;
         ioctlsocket(s, FIONBIO, &nonBlock);
@@ -685,23 +1050,11 @@ static HttpReply httpRequestToPhone(
         ioctlsocket(s, FIONBIO, &nonBlock);
         DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
-    }
-
-    std::string keyCopy;
-    {
-        std::lock_guard<std::mutex> lk(gState.mtx);
-        keyCopy = gState.siblingKey;
-    }
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
 
     std::ostringstream req;
     req << method << " " << targetPath << " HTTP/1.1\r\n";
-    if (viaBluetooth) {
-        req << "Host: chainit-bluetooth\r\n";
-        req << "X-ChainIt-Transport: bluetooth-rfcomm\r\n";
-    } else {
-        req << "Host: " << ip << ":" << port << "\r\n";
-    }
+    req << "Host: " << ip << ":" << port << "\r\n";
     req << "X-ChainIt-Key: " << keyCopy << "\r\n";
     req << "Content-Length: " << body.size() << "\r\n";
     req << "Connection: close\r\n";
@@ -1066,6 +1419,13 @@ static std::string buildStateSnapshotJson() {
         << "\"phoneServerUuid\":\"" << kChainItPhoneUuidStr << "\","
         << "\"pcReceiverUuid\":\"" << kChainItPcUuidStr << "\","
         << "\"activeLink\":\"" << jsonEscape(isBtEndpoint(gState.activePhoneIp) ? gState.activePhoneIp : std::string("")) << "\","
+        << "\"pooledChannels\":" << btPooledChannels() << ","
+        << "\"maxChannels\":" << kBtChannelCount << ","
+        << "\"cachedRfcommChannel\":" << gBtCachedPort.load() << ","
+        << "\"requestsServed\":" << gBtRequestsServed.load() << ","
+        << "\"redials\":" << gBtRedials.load() << ","
+        << "\"lastRttMs\":" << (static_cast<double>(gBtLastRttUs.load()) / 1000.0) << ","
+        << "\"keepAlive\":true,"
         << "\"pairedDevices\":[";
     for (size_t i = 0; i < gState.btPairedDevices.size(); ++i) {
         if (i > 0) oss << ",";
@@ -1134,7 +1494,7 @@ static std::string buildStateSnapshotJson() {
         if (i > 0) oss << ",";
         oss << "\"" << jsonEscape(lanIps[i]) << "\"";
     }
-    oss << "],\"security\":{\"keyAuth\":\"required\",\"lockoutAfter\":5,\"lockoutWindowSec\":60,\"lockoutCooldownSec\":30,\"integrity\":\"sha256 per chunk + whole file\",\"chunkBytes\":" << kTransferChunkBytes << ",\"parallelWorkers\":" << (isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan) << ",\"chunksVerified\":" << gIntegrityChunksOk.load() << ",\"integrityFailures\":" << gIntegrityFailures.load() << "},\"serverPort\":" << HTTP_PORT << "}";
+    oss << "],\"linkProblem\":\"" << jsonEscape(gState.phoneLinkProblem) << "\",\"security\":{\"keyAuth\":\"required\",\"lockoutAfter\":5,\"lockoutWindowSec\":60,\"lockoutCooldownSec\":30,\"integrity\":\"sha256 per chunk + whole file\",\"chunkBytes\":" << kTransferChunkBytes << ",\"parallelWorkers\":" << (isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan) << ",\"chunksVerified\":" << gIntegrityChunksOk.load() << ",\"integrityFailures\":" << gIntegrityFailures.load() << "},\"serverPort\":" << HTTP_PORT << "}";
     return oss.str();
 }
 
@@ -1271,7 +1631,8 @@ static void discoveryLoop() {
         }
 
         tick++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+        if (gForceRescan.exchange(false)) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+        else { std::this_thread::sleep_for(std::chrono::milliseconds(900)); }
     }
 
     closesocket(sock);
@@ -1407,7 +1768,8 @@ static void bluetoothServerLoop() {
         SOCKET srv = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
         if (srv == INVALID_SOCKET) {
             gBtServerListening.store(false);
-            std::this_thread::sleep_for(std::chrono::seconds(20));
+            for (int i = 0; i < 200 && gRunning.load() && !gForceRescan.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
@@ -1420,7 +1782,8 @@ static void bluetoothServerLoop() {
         if (bind(srv, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR || listen(srv, 4) == SOCKET_ERROR) {
             closesocket(srv);
             gBtServerListening.store(false);
-            std::this_thread::sleep_for(std::chrono::seconds(20));
+            for (int i = 0; i < 200 && gRunning.load() && !gForceRescan.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
@@ -1943,7 +2306,7 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.3.0";
+static const char* const kChainItAppVersion = "1.5.0";
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -2463,34 +2826,107 @@ static void handleHttpClient(SOCKET client) {
     // 2. Multipath RFC 4918 WebDAV Gateway (/dav & /dav/*) -> forwards to active Android phone!
     if (urlPath == "/dav" || urlPath.rfind("/dav/", 0) == 0) {
         std::string phoneIp;
+        bool everSawPhone = false;
         {
             std::lock_guard<std::mutex> lk(gState.mtx);
             phoneIp = gState.activePhoneIp;
+            everSawPhone = gState.everDiscoveredPhone || !phoneIp.empty();
+            if (!phoneIp.empty()) gState.everDiscoveredPhone = true;
         }
+
         if (!phoneIp.empty()) {
             std::map<std::string, std::string> fwdHeaders;
             if (headers.count("depth")) fwdHeaders["Depth"] = headers["depth"];
             if (headers.count("destination")) fwdHeaders["Destination"] = headers["destination"];
             if (headers.count("overwrite")) fwdHeaders["Overwrite"] = headers["overwrite"];
             if (headers.count("range")) fwdHeaders["Range"] = headers["range"];
+            if (headers.count("if")) fwdHeaders["If"] = headers["if"];
+            if (headers.count("if-match")) fwdHeaders["If-Match"] = headers["if-match"];
+            if (headers.count("if-none-match")) fwdHeaders["If-None-Match"] = headers["if-none-match"];
+            if (headers.count("content-type")) fwdHeaders["Content-Type"] = headers["content-type"];
+            if (headers.count("x-chainit-file-sha256")) fwdHeaders["X-ChainIt-File-Sha256"] = headers["x-chainit-file-sha256"];
 
-            HttpReply rep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, method, fullUrl, body, fwdHeaders, 60000);
+            const int timeout = isBtEndpoint(phoneIp) ? 90000 : 60000;
+            HttpReply rep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, method, fullUrl, body, fwdHeaders, timeout);
+
             if (rep.status > 0) {
+                // Surface an actionable reason instead of letting Explorer show a dead drive.
+                if (rep.status == 401 || rep.status == 403 || rep.status == 429) {
+                    std::string why = jsonExtractString(rep.body, "error", "");
+                    if (why.empty()) why = (rep.status == 429)
+                        ? "Phone VFS is cooling down after repeated Pairing Key failures (30 s)."
+                        : "Phone rejected the Pairing Key.";
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    gState.phoneLinkProblem = why;
+                } else if (!gState.phoneLinkProblem.empty()) {
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    gState.phoneLinkProblem.clear();
+                }
+
                 std::string ct = rep.headers.count("content-type") ? rep.headers["content-type"] : "application/xml; charset=\"utf-8\"";
                 std::map<std::string, std::string> outHdrs = {
                     {"DAV", "1, 2"},
                     {"MS-Author-Via", "DAV"},
                     {"Accept-Ranges", "bytes"},
                 };
-                if (rep.headers.count("lock-token")) outHdrs["Lock-Token"] = rep.headers["lock-token"];
-                if (rep.headers.count("content-range")) outHdrs["Content-Range"] = rep.headers["content-range"];
-                sendHttpResponse(client, rep.status, rep.status == 207 ? "Multi-Status" : "OK", ct, rep.body.data(), rep.body.size(), outHdrs);
+                for (const char* hk : {"lock-token", "content-range", "x-chainit-file-sha256",
+                                       "x-chainit-chunk-sha256", "last-modified", "etag", "content-disposition"}) {
+                    if (rep.headers.count(hk)) {
+                        std::string canon = hk;
+                        bool up = true;
+                        for (auto& c : canon) { if (up) { c = (char)toupper((unsigned char)c); up = false; } else { up = (c == '-'); } }
+                        outHdrs[canon] = rep.headers[hk];
+                    }
+                }
+                const char* reason = rep.status == 207 ? "Multi-Status"
+                                   : rep.status == 201 ? "Created"
+                                   : rep.status == 204 ? "No Content"
+                                   : rep.status == 206 ? "Partial Content"
+                                   : rep.status == 401 ? "Unauthorized"
+                                   : rep.status == 403 ? "Forbidden"
+                                   : rep.status == 404 ? "Not Found"
+                                   : rep.status == 409 ? "Conflict"
+                                   : rep.status == 429 ? "Too Many Requests"
+                                   : rep.status >= 500 ? "Server Error" : "OK";
+                sendHttpResponse(client, rep.status, reason, ct, rep.body.data(), rep.body.size(), outHdrs);
                 closesocket(client);
                 return;
             }
+
+            // The sibling endpoint is known but the request never completed. Do NOT hand Explorer
+            // an empty fake drive - that is exactly the "connected but does nothing" failure. Say
+            // why, so the user and the UI can act on it.
+            std::string why;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                if (!gState.phoneLinkProblem.empty()) why = gState.phoneLinkProblem;
+            }
+            if (why.empty()) {
+                why = isBtEndpoint(phoneIp)
+                    ? "Bluetooth RFCOMM link to the phone did not answer. Keep the phone in range and Bluetooth on; ChainIt re-dials automatically."
+                    : "The phone did not answer on " + phoneIp + ". ChainIt is re-scanning every transport now.";
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                gState.phoneLinkProblem = why;
+            }
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("VFS", "Z:\\ request failed - phone unreachable", why);
+            }
+            triggerTransportRescan();
+
+            std::map<std::string, std::string> davHdr = {{"DAV", "1, 2"}, {"MS-Author-Via", "DAV"},
+                                                         {"Retry-After", "5"}};
+            const std::string errXml =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                "<D:error xmlns:D=\"DAV:\">" + xmlEscape(why) + "</D:error>";
+            sendHttpResponse(client, 503, "Service Unavailable", "application/xml; charset=\"utf-8\"",
+                             errXml.data(), errXml.size(), davHdr);
+            closesocket(client);
+            return;
         }
 
-        // Local WebDAV fallback when phone isn't on LAN yet so Z:\ still mounts cleanly!
+        // No phone has ever paired. Serve an honest, labelled placeholder drive with one readme so
+        // Z:\\ explains itself instead of looking like an empty disk that silently does nothing.
         std::map<std::string, std::string> davHdr = {{"DAV", "1, 2"}, {"MS-Author-Via", "DAV"}};
         if (method == "OPTIONS") {
             sendHttpResponse(client, 200, "OK", "text/plain", "", 0, davHdr);
@@ -2498,17 +2934,24 @@ static void handleHttpClient(SOCKET client) {
             return;
         }
         if (method == "PROPFIND") {
-            std::string xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">"
-                              "<D:response><D:href>/dav/</D:href><D:propstat><D:prop>"
-                              "<D:displayname>ChainIt Sibling (Z:)</D:displayname>"
-                              "<D:resourcetype><D:collection/></D:resourcetype>"
-                              "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
-                              "</D:multistatus>";
-            sendHttpResponse(client, 207, "Multi-Status", "application/xml; charset=\"utf-8\"", xml.data(), xml.size(), davHdr);
+            const std::string xml = buildWaitingDrivePropfind(urlPath, headers);
+            sendHttpResponse(client, 207, "Multi-Status", "application/xml; charset=\"utf-8\"",
+                             xml.data(), xml.size(), davHdr);
             closesocket(client);
             return;
         }
-        sendHttpResponse(client, 200, "OK", "text/plain", "", 0, davHdr);
+        if (method == "GET" && urlPath.find("READ ME FIRST") != std::string::npos) {
+            const std::string txt = waitingDriveReadme();
+            sendHttpResponse(client, 200, "OK", "text/plain; charset=\"utf-8\"",
+                             txt.data(), txt.size(), davHdr);
+            closesocket(client);
+            return;
+        }
+        const std::string msg = "ChainIt has not found your Android phone yet. Open ChainIt on the phone, "
+                                "enable Sibling Mode, and make sure Bluetooth or Wi-Fi is on. "
+                                "Z:\\ fills itself in the moment the phone answers.";
+        sendHttpResponse(client, 503, "Service Unavailable", "text/plain; charset=\"utf-8\"",
+                         msg.data(), msg.size(), davHdr);
         closesocket(client);
         return;
     }
@@ -3027,13 +3470,26 @@ static std::wstring hubStatusLines(std::wstring* sub, std::wstring* foot) {
     else if (tr == L"bluetooth") tr = L"Bluetooth RFCOMM";
     else if (tr == L"online_p2p") tr = L"Online relay";
     *sub = std::wstring(L"Transport: ") + tr + (gState.zDriveMounted || connected ? L"   \u00b7   Z:\\ mounted" : L"   \u00b7   Z:\\ idle");
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "Pairing key required \u00b7 %llu chunk hashes verified \u00b7 %llu integrity failures \u00b7 %d x 2 MiB parallel streams",
-                  (unsigned long long)gIntegrityChunksOk.load(),
-                  (unsigned long long)gIntegrityFailures.load(),
-                  isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan);
+
+    // A link that is up but not serving must say so here, not silently show an empty Z:\ drive.
+    std::wstring problem = wideFromAnsi(gState.phoneLinkProblem);
+
+    char buf[320];
+    if (isBtEndpoint(gState.activePhoneIp)) {
+        std::snprintf(buf, sizeof(buf),
+                      "Bluetooth RFCOMM keep-alive \u00b7 %llu/%llu channels parked \u00b7 %llu requests served \u00b7 %llu dials \u00b7 %.0f ms",
+                      (unsigned long long)btPooledChannels(), (unsigned long long)kBtChannelCount,
+                      (unsigned long long)gBtRequestsServed.load(), (unsigned long long)gBtRedials.load(),
+                      static_cast<double>(gBtLastRttUs.load()) / 1000.0);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "Pairing key required \u00b7 %llu chunk hashes verified \u00b7 %llu integrity failures \u00b7 %d x 2 MiB parallel streams",
+                      (unsigned long long)gIntegrityChunksOk.load(),
+                      (unsigned long long)gIntegrityFailures.load(),
+                      isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan);
+    }
     *foot = wideFromAnsi(buf);
+    if (!problem.empty()) return problem;
     return connected ? main : std::wstring(L"ChainIt Sibling");
 }
 
@@ -3140,14 +3596,20 @@ static LRESULT CALLBACK HubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             RECT title{header.left + 48, header.top + 4, header.right, header.top + 30};
             hubText(hdc, title, L"ChainIt Sibling", 19, RGB(0xF1, 0xF5, 0xF9), DT_LEFT | DT_VCENTER | DT_SINGLELINE, true);
             RECT ver{header.left + 48, header.top + 30, header.right, header.top + 50};
-            hubText(hdc, ver, std::wstring(L"v") + wideFromAnsi(kChainItAppVersion) + L"  \u00b7  Android \u2194 Windows file bridge",
+            hubText(hdc, ver, std::wstring(L"v") + wideFromAnsi(kChainItAppVersion) +
+                            L"  \u00b7  Android \u2194 Windows file bridge  \u00b7  Built by Qmer",
                     12, RGB(0x94, 0xA3, 0xB8), DT_LEFT | DT_VCENTER | DT_SINGLELINE, false);
 
             // status panel (recessed, skeuomorphic)
             hubRoundRect(hdc, status, 12, RGB(0x0E, 0x14, 0x20), RGB(0x1E, 0x29, 0x3B), false);
             std::wstring sub, foot;
             const std::wstring mainLine = hubStatusLines(&sub, &foot);
-            const bool linked = (mainLine != L"ChainIt Sibling");
+            std::wstring problemNow;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                problemNow = wideFromAnsi(gState.phoneLinkProblem);
+            }
+            const bool linked = (mainLine != L"ChainIt Sibling") && problemNow.empty();
             RECT led{status.left + 16, status.top + 18, status.left + 28, status.top + 30};
             HBRUSH ledBrush = CreateSolidBrush(linked ? RGB(0x10, 0xB9, 0x81) : RGB(0xF5, 0x9E, 0x0B));
             HGDIOBJ ob2 = SelectObject(hdc, ledBrush);
@@ -3193,7 +3655,7 @@ static LRESULT CALLBACK HubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hubRoundRect(hdc, footer, 11, RGB(0x0C, 0x12, 0x1E), RGB(0x1A, 0x24, 0x34), false);
             const bool toastLive = nowMs() < gHubToastUntil.load() && !gHubToast.empty();
             const std::wstring footText = toastLive ? gHubToast
-                : std::wstring(L"Right-click the tray icon for the full menu \u00b7 closing this window keeps ChainIt running.");
+                : std::wstring(L"Built by Qmer \u00b7 right-click the tray icon for the full menu \u00b7 closing this window keeps ChainIt running.");
             RECT tr{footer.left + 14, footer.top + 6, footer.right - 14, footer.bottom - 6};
             hubText(hdc, tr, footText, 11, toastLive ? RGB(0xA7, 0xF3, 0xD0) : RGB(0x52, 0x60, 0x79),
                     DT_LEFT | DT_VCENTER | DT_WORDBREAK, false);
@@ -3262,6 +3724,2328 @@ static void hubRunAction(int idx) {
     }
     if (gHubHwnd) InvalidateRect(gHubHwnd, nullptr, FALSE);
 }
+
+
+// ===========================================================================
+// Fully native Win32 File Manager
+//
+// ChainIt used to open its UI in Edge app-mode. That means a *browser* process
+// owned a taskbar button, and no icon this exe carries could ever change it -
+// Windows drew Edge's globe for Edge's window. So the browser is gone: the whole
+// File Manager is drawn here, in this process, with GDI. One window, one taskbar
+// button, the chain-link icon from resource #1, and no dependency on Edge,
+// WebView2 or any runtime.
+//
+// The lists are hand-drawn rather than SysListView32 on purpose: full control of
+// the dark skeuomorphic theme, no header/layout theming quirks, and identical
+// behaviour on every Windows 10/11 build.
+// ===========================================================================
+
+static const wchar_t* kMainClass = L"ChainItMainWindowClass";
+
+static const int kRowH = 28;
+static const int kColHeaderH = 27;
+static const int kColSizeW = 96;
+static const int kColTypeW = 92;
+static const int kColModW = 138;
+
+enum UiSortKey { SORT_NAME = 0, SORT_SIZE = 1, SORT_TYPE = 2, SORT_MODIFIED = 3 };
+enum UiTab { TAB_FILES = 0, TAB_LINK = 1, TAB_ABOUT = 2 };
+enum UiPaneId { PANE_PC = 0, PANE_PHONE = 1 };
+
+struct UiItem {
+    std::wstring name;
+    std::wstring path;   // virtual POSIX path within the drive root
+    std::wstring ext;
+    bool isDir = false;
+    uint64_t size = 0;
+    int64_t modifiedMs = 0;
+};
+
+struct UiList {
+    /** Everything the last listing returned; `items` is the filtered + sorted view of it. */
+    std::vector<UiItem> allItems;
+    std::vector<UiItem> items;
+    std::vector<char> selected;   // parallel to items
+    std::wstring filter;          // live type-ahead, matched case-insensitively
+    int sortKey = SORT_NAME;
+    bool sortDesc = false;
+    bool foldersFirst = true;
+    int focused = -1;
+    int hover = -1;
+    int anchor = -1;
+    int scroll = 0;
+    bool loading = false;
+    std::wstring dir = L"/";
+    std::wstring error;
+    RECT rc{};        // full pane area (header strip + rows)
+    RECT listRc{};    // rows area only
+};
+
+struct ListPayload {
+    int pane = 0;
+    std::wstring dir;
+    std::vector<UiItem> items;
+    std::wstring error;
+};
+
+static HWND gMainHwnd = nullptr;
+static HICON gMainIcon = nullptr;    // 32 px - class icon, tab strip
+static HICON gMainIconSm = nullptr;  // 16 px - caption / alt-tab
+static HICON gMainIconLg = nullptr;  // 64 px - About tab
+static HINSTANCE gMainInstance = nullptr;
+static UiList gPane[2];
+static int gActivePane = PANE_PHONE;
+static int gTab = TAB_FILES;
+static int gToolHover = -1;
+static int gLinkHover = -1;
+static bool gDualPane = true;
+static std::wstring gMainToast;
+static std::atomic<int64_t> gMainToastUntil{0};
+static std::wstring gClipboardOp;
+static std::vector<std::wstring> gClipboardPaths;
+static int gClipboardPane = -1;
+
+#define WM_UI_LISTDONE   (WM_APP + 21)
+#define WM_UI_TOAST      (WM_APP + 22)
+#define WM_UI_REFRESH    (WM_APP + 23)
+/** Posted across processes by a second launch so the live window reloads. */
+#define WM_UI_REFRESH_ALL (WM_APP + 24)
+
+/** Worker threads report progress through this, so the string is only ever
+ *  written on the UI thread - no lock needed and no torn wstring in the painter. */
+struct ToastMsg { std::wstring text; int ms; };
+
+static void uiToast(const std::wstring& text, int ms = 5000) {
+    if (!gMainHwnd) return;
+    ToastMsg* t = new ToastMsg{text, ms};
+    if (!PostMessageW(gMainHwnd, WM_UI_TOAST, 0, reinterpret_cast<LPARAM>(t))) delete t;
+}
+
+// --- UTF-8 conversions ------------------------------------------------------
+// Listings from both sides are UTF-8 (Android emits UTF-8 JSON, the PC side builds
+// paths with fs::u8path). wideFromAnsi/ansiFromWide use the ANSI code page, which
+// would mangle accents, Cyrillic, CJK or emoji in filenames, so the UI converts
+// explicitly through CP_UTF8.
+
+static std::wstring uiUtf8ToWide(const std::string& in) {
+    if (in.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), out.data(), n);
+    return out;
+}
+
+static std::string uiWideToUtf8(const std::wstring& in) {
+    if (in.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    if (n > 0) WideCharToMultiByte(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+// --- minimal JSON reader for the identical listing both sides emit ----------
+// {"currentPath":"/x","items":[{"name":..,"path":..,"kind":"file","sizeBytes":N,
+//                               "modifiedMs":N,"mimeType":..,"ext":..}, ...]}
+
+static std::string jsonRawString(const std::string& obj, const std::string& key) {
+    const std::string needle = "\"" + key + "\":\"";
+    size_t i = obj.find(needle);
+    if (i == std::string::npos) return "";
+    i += needle.size();
+    std::string out;
+    while (i < obj.size()) {
+        char c = obj[i];
+        if (c == '\\' && i + 1 < obj.size()) {
+            char n = obj[i + 1];
+            switch (n) {
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                case 'r': out.push_back('\r'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'u': {
+                    if (i + 5 < obj.size()) {
+                        unsigned cp = 0;
+                        for (int k = 0; k < 4; ++k) {
+                            char h = obj[i + 2 + k];
+                            cp <<= 4;
+                            if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                            else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                        }
+                        // Encode as UTF-8; the wide conversion below decodes it.
+                        if (cp < 0x80) out.push_back((char)cp);
+                        else if (cp < 0x800) { out.push_back((char)(0xC0 | (cp >> 6))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+                        else { out.push_back((char)(0xE0 | (cp >> 12))); out.push_back((char)(0x80 | ((cp >> 6) & 0x3F))); out.push_back((char)(0x80 | (cp & 0x3F))); }
+                        i += 4;
+                    }
+                    break;
+                }
+                default: out.push_back(n);
+            }
+            i += 2;
+            continue;
+        }
+        if (c == '"') break;
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
+static long long jsonRawInt(const std::string& obj, const std::string& key) {
+    const std::string needle = "\"" + key + "\":";
+    size_t i = obj.find(needle);
+    if (i == std::string::npos) return 0;
+    i += needle.size();
+    while (i < obj.size() && obj[i] == ' ') ++i;
+    return std::atoll(obj.c_str() + i);
+}
+
+static std::vector<UiItem> parseVfsListing(const std::string& json) {
+    std::vector<UiItem> out;
+    const size_t start = json.find("\"items\":[");
+    if (start == std::string::npos) return out;
+    size_t i = start + 9;
+    while (i < json.size()) {
+        while (i < json.size() && json[i] != '{' && json[i] != ']') ++i;
+        if (i >= json.size() || json[i] == ']') break;
+        // brace-match this object (values contain no nested braces)
+        size_t depth = 0, j = i;
+        bool inStr = false;
+        for (; j < json.size(); ++j) {
+            char c = json[j];
+            if (inStr) {
+                if (c == '\\') { ++j; continue; }
+                if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{') ++depth;
+            else if (c == '}') { --depth; if (depth == 0) { ++j; break; } }
+        }
+        const std::string obj = json.substr(i, j - i);
+        UiItem it;
+        it.name = uiUtf8ToWide(jsonRawString(obj, "name"));
+        it.path = uiUtf8ToWide(jsonRawString(obj, "path"));
+        it.ext = uiUtf8ToWide(jsonRawString(obj, "ext"));
+        it.isDir = (jsonRawString(obj, "kind") == "directory");
+        it.size = static_cast<uint64_t>(jsonRawInt(obj, "sizeBytes"));
+        it.modifiedMs = jsonRawInt(obj, "modifiedMs");
+        if (!it.name.empty()) out.push_back(it);
+        i = j;
+    }
+    return out;
+}
+
+static void uiSortList(UiList& l) {
+    std::stable_sort(l.items.begin(), l.items.end(), [&](const UiItem& a, const UiItem& b) {
+        if (l.foldersFirst && a.isDir != b.isDir) return a.isDir;
+        int cmp = 0;
+        switch (l.sortKey) {
+            case SORT_SIZE:
+                cmp = (a.size < b.size) ? -1 : (a.size > b.size ? 1 : 0);
+                break;
+            case SORT_TYPE:
+                cmp = a.ext.compare(b.ext);
+                break;
+            case SORT_MODIFIED:
+                cmp = (a.modifiedMs < b.modifiedMs) ? -1 : (a.modifiedMs > b.modifiedMs ? 1 : 0);
+                break;
+            default:
+                cmp = a.name.compare(b.name);
+        }
+        if (cmp == 0) cmp = a.name.compare(b.name);
+        return l.sortDesc ? (cmp > 0) : (cmp < 0);
+    });
+}
+
+static std::wstring uiFormatBytes(uint64_t b) {
+    wchar_t buf[64];
+    const double d = static_cast<double>(b);
+    if (d < 1024) { swprintf(buf, 64, L"%llu B", (unsigned long long)b); return buf; }
+    if (d < 1024.0 * 1024) { swprintf(buf, 64, L"%.1f KB", d / 1024); return buf; }
+    if (d < 1024.0 * 1024 * 1024) { swprintf(buf, 64, L"%.1f MB", d / (1024.0 * 1024)); return buf; }
+    swprintf(buf, 64, L"%.2f GB", d / (1024.0 * 1024 * 1024));
+    return buf;
+}
+
+static std::wstring uiFormatTime(int64_t ms) {
+    if (ms <= 0) return L"\u2014";
+    time_t t = static_cast<time_t>(ms / 1000);
+    struct tm tmv {};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    wchar_t buf[40];
+    swprintf(buf, 40, L"%04d-%02d-%02d %02d:%02d", tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min);
+    return buf;
+}
+
+static std::wstring uiTypeLabel(const UiItem& it) {
+    if (it.isDir) return L"Folder";
+    std::wstring e = it.ext;
+    if (e.empty()) {
+        const size_t dot = it.name.find_last_of(L'.');
+        if (dot != std::wstring::npos) e = it.name.substr(dot);
+    }
+    if (e.empty()) return L"File";
+    for (auto& c : e) c = (wchar_t)toupper(c);
+    return e + L" file";
+}
+
+static std::string uiCurrentPhoneIp() {
+    std::lock_guard<std::mutex> lk(gState.mtx);
+    return gState.activePhoneIp;
+}
+
+// --- asynchronous pane loading ---------------------------------------------
+// Listing the phone can take seconds over Bluetooth, so it never happens on the
+// UI thread. The worker hands the parsed result back with WM_UI_LISTDONE.
+
+static void uiLoadPaneAsync(int pane, const std::wstring& dir) {
+    UiList& l = gPane[pane];
+    l.loading = true;
+    l.error.clear();
+    l.dir = dir;
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+
+    std::thread([pane, dir]() {
+        ListPayload* pay = new ListPayload();
+        pay->pane = pane;
+        pay->dir = dir;
+        try {
+            if (pane == PANE_PC) {
+                fs::path root;
+                { std::lock_guard<std::mutex> lk(gState.mtx); root = gState.pcRoot; }
+                pay->items = parseVfsListing(listLocalDirJson(root, uiWideToUtf8(dir)));
+            } else {
+                const std::string ip = uiCurrentPhoneIp();
+                if (ip.empty()) {
+                    pay->error = L"No phone linked yet. Turn on Bluetooth or join the same Wi-Fi, "
+                                 L"then open ChainIt on the phone and switch Sibling Mode on.";
+                } else {
+                    const std::string url = "/chainit/list?path=" + urlEncode(uiWideToUtf8(dir));
+                    HttpReply rep = httpRequestToPhone(ip, PHONE_VFS_PORT, "GET", url, "", {}, 60000);
+                    if (rep.status == 200) {
+                        pay->items = parseVfsListing(rep.body);
+                    } else if (rep.status == 401 || rep.status == 403 || rep.status == 429) {
+                        pay->error = uiUtf8ToWide(jsonExtractString(rep.body, "error", "The phone refused this request."));
+                    } else if (rep.status > 0) {
+                        pay->error = L"The phone answered HTTP " + std::to_wstring(rep.status) + L".";
+                    } else {
+                        pay->error = isBtEndpoint(ip)
+                            ? L"The Bluetooth RFCOMM link did not answer. Keep the phone in range; ChainIt re-dials on its own."
+                            : L"The phone did not answer on " + uiUtf8ToWide(ip) + L". Every transport is being re-scanned now.";
+                        {
+                            std::lock_guard<std::mutex> lk(gState.mtx);
+                            gState.phoneLinkProblem = uiWideToUtf8(pay->error);
+                        }
+                        triggerTransportRescan();
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            pay->error = uiUtf8ToWide(std::string("Listing failed: ") + e.what());
+        } catch (...) {
+            pay->error = L"Listing failed.";
+        }
+        if (gMainHwnd) PostMessageW(gMainHwnd, WM_UI_LISTDONE, 0, reinterpret_cast<LPARAM>(pay));
+    }).detach();
+}
+
+static bool uiNameMatches(const std::wstring& name, const std::wstring& needle) {
+    if (needle.empty()) return true;
+    auto lower = [](std::wstring v) { for (auto& c : v) c = static_cast<wchar_t>(towlower(c)); return v; };
+    return lower(name).find(lower(needle)) != std::wstring::npos;
+}
+
+/** Rebuilds the visible view from allItems. Keeps the focused name when it still
+ *  matches, so typing a filter does not throw the cursor back to the top. */
+static void uiApplyFilter(UiList& l) {
+    const std::wstring keep = (l.focused >= 0 && l.focused < (int)l.items.size())
+                                  ? l.items[l.focused].name : std::wstring();
+    l.items.clear();
+    for (const auto& it : l.allItems) {
+        if (uiNameMatches(it.name, l.filter)) l.items.push_back(it);
+    }
+    uiSortList(l);
+    l.selected.assign(l.items.size(), 0);
+    l.focused = -1;
+    l.anchor = -1;
+    l.hover = -1;
+    l.scroll = 0;
+    if (!keep.empty()) {
+        for (size_t i = 0; i < l.items.size(); ++i) {
+            if (l.items[i].name == keep) {
+                l.focused = static_cast<int>(i);
+                l.selected[i] = 1;
+                break;
+            }
+        }
+    }
+    if (l.focused < 0 && !l.items.empty()) { l.focused = 0; l.selected[0] = 1; l.anchor = 0; }
+}
+
+static void uiApplyListPayload(ListPayload* pay) {
+    if (!pay) return;
+    const int pane = pay->pane;
+    if (pane < 0 || pane > 1) { delete pay; return; }
+    UiList& l = gPane[pane];
+    l.loading = false;
+    l.dir = pay->dir;
+    l.error = pay->error;
+    l.allItems.swap(pay->items);
+    uiApplyFilter(l);
+    delete pay;
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
+static void uiReload(int pane) { uiLoadPaneAsync(pane, gPane[pane].dir); }
+static void uiReloadBoth() { uiReload(PANE_PC); uiReload(PANE_PHONE); }
+
+static void uiNavigate(int pane, const std::wstring& dir) {
+    gActivePane = pane;
+    gPane[pane].filter.clear();   // a stale filter must never make a new folder look empty
+    uiLoadPaneAsync(pane, dir.empty() ? std::wstring(L"/") : dir);
+}
+
+static void uiGoUp(int pane) {
+    const std::wstring d = gPane[pane].dir;
+    if (d.empty() || d == L"/") return;
+    std::vector<std::wstring> parts;
+    size_t i = 0;
+    while (i < d.size()) {
+        size_t j = d.find(L'/', i);
+        if (j == std::wstring::npos) j = d.size();
+        if (j > i) parts.push_back(d.substr(i, j - i));
+        i = j + 1;
+    }
+    if (parts.empty()) return;
+    parts.pop_back();
+    std::wstring up = L"/";
+    for (size_t k = 0; k < parts.size(); ++k) {
+        up += parts[k];
+        if (k + 1 < parts.size()) up += L"/";
+    }
+    uiNavigate(pane, up);
+}
+
+static std::wstring uiJoinPath(const std::wstring& dir, const std::wstring& name) {
+    if (dir.empty() || dir == L"/") return L"/" + name;
+    return dir + L"/" + name;
+}
+
+static std::vector<int> uiSelectedIndices(const UiList& l) {
+    std::vector<int> out;
+    for (size_t i = 0; i < l.selected.size(); ++i) if (l.selected[i]) out.push_back(static_cast<int>(i));
+    return out;
+}
+
+static uint64_t uiSelectedBytes(const UiList& l) {
+    uint64_t total = 0;
+    for (const int i : uiSelectedIndices(l)) total += l.items[i].size;
+    return total;
+}
+
+// --- native modal text prompt ----------------------------------------------
+// Win32 has no built-in input box and this app must not open a browser prompt(),
+// so the dialog template is assembled in memory - no .rc entry, no resource file.
+
+struct PromptCtx {
+    std::wstring title, label, value;
+    bool ok = false;
+};
+
+static PromptCtx* gPromptCtx = nullptr;
+
+static INT_PTR CALLBACK PromptDlgProc(HWND h, UINT m, WPARAM w, LPARAM) {
+    switch (m) {
+        case WM_INITDIALOG: {
+            SetWindowTextW(h, gPromptCtx->title.c_str());
+            SetDlgItemTextW(h, 20, gPromptCtx->label.c_str());
+            HWND edit = GetDlgItem(h, 21);
+            SetWindowTextW(edit, gPromptCtx->value.c_str());
+            Edit_SetSel(edit, 0, -1);
+            SetFocus(edit);
+            return FALSE;   // focus already set
+        }
+        case WM_COMMAND:
+            if (LOWORD(w) == IDOK) {
+                wchar_t buf[1024] = {};
+                GetWindowTextW(GetDlgItem(h, 21), buf, 1023);
+                gPromptCtx->value = buf;
+                gPromptCtx->ok = !gPromptCtx->value.empty();
+                EndDialog(h, gPromptCtx->ok ? IDOK : IDCANCEL);
+                return TRUE;
+            }
+            if (LOWORD(w) == IDCANCEL) { EndDialog(h, IDCANCEL); return TRUE; }
+            break;
+        case WM_CLOSE:
+            EndDialog(h, IDCANCEL);
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/** Byte writer for an in-memory DLGTEMPLATE (version 1 layout). */
+struct TmplWriter {
+    std::vector<BYTE> b;
+    TmplWriter() { b.reserve(1024); }
+    void u16(WORD v) { b.push_back(static_cast<BYTE>(v & 0xFF)); b.push_back(static_cast<BYTE>(v >> 8)); }
+    void u32(DWORD v) { u16(static_cast<WORD>(v & 0xFFFF)); u16(static_cast<WORD>(v >> 16)); }
+    void i16(short v) { u16(static_cast<WORD>(v)); }
+    void str(const wchar_t* s) {
+        for (const wchar_t* p = s; *p; ++p) u16(static_cast<WORD>(*p));
+        u16(0);
+    }
+    void align4() { while (b.size() % 4) b.push_back(0); }
+    const BYTE* data() const { return b.data(); }
+};
+
+static bool uiPrompt(HWND owner, const std::wstring& title, const std::wstring& label, std::wstring& value) {
+    PromptCtx ctx;
+    ctx.title = title;
+    ctx.label = label;
+    ctx.value = value;
+    gPromptCtx = &ctx;
+
+    TmplWriter t;
+    t.u32(WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_SETFONT);
+    t.u32(0);                 // dwExtendedStyle
+    t.u16(4);                 // cdit: label, edit, OK, Cancel
+    t.i16(0); t.i16(0);       // x, y
+    t.i16(260); t.i16(92);    // cx, cy  (dialog units)
+    t.u16(0);                 // menu
+    t.u16(0);                 // windowClass
+    t.str(title.c_str());     // title
+    t.u16(9);                 // pointsize (DS_SETFONT)
+    t.str(L"Segoe UI");       // typeface
+
+    auto item = [&](DWORD style, short x, short y, short cx, short cy, WORD id,
+                    const wchar_t* cls, const wchar_t* text) {
+        t.align4();
+        t.u32(style);
+        t.u32(0);             // dwExtendedStyle
+        t.i16(x); t.i16(y); t.i16(cx); t.i16(cy);
+        t.u16(id);
+        t.str(cls);
+        t.str(text);
+        t.u16(0);             // no creation data
+    };
+
+    item(WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 7, 244, 12, 20, L"STATIC", label.c_str());
+    item(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, 8, 23, 244, 15, 21,
+         L"EDIT", value.c_str());
+    item(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 112, 66, 66, 18, IDOK, L"BUTTON", L"OK");
+    item(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 186, 66, 66, 18, IDCANCEL, L"BUTTON", L"Cancel");
+    t.align4();
+
+    const INT_PTR res = DialogBoxIndirectParamW(gMainInstance,
+                                                reinterpret_cast<LPCDLGTEMPLATE>(t.data()),
+                                                owner, PromptDlgProc, 0);
+    gPromptCtx = nullptr;
+    if (res == IDOK && ctx.ok) { value = ctx.value; return true; }
+    return false;
+}
+
+// --- file operations --------------------------------------------------------
+// Everything that can block runs on a worker thread and reports through a toast,
+// so the window never freezes mid-copy and never fails silently.
+
+static fs::path uiRealPcPath(const std::wstring& virtualPath) {
+    std::lock_guard<std::mutex> lk(gState.mtx);
+    const fs::path root = gState.pcRoot;
+    return resolveLocalSafe(root, uiWideToUtf8(virtualPath));
+}
+
+static void uiOpNewFolder(int pane) {
+    std::wstring name = L"New Folder";
+    if (!uiPrompt(gMainHwnd, L"New folder", L"Folder name:", name)) return;
+    const std::wstring dir = gPane[pane].dir;
+    uiToast(L"Creating folder\u2026", 2000);
+    std::thread([pane, dir, name]() {
+        std::wstring msg;
+        if (pane == PANE_PC) {
+            std::error_code ec;
+            fs::create_directories(uiRealPcPath(uiJoinPath(dir, name)), ec);
+            msg = ec ? (L"Could not create the folder: " + uiUtf8ToWide(ec.message()))
+                     : (L"Created folder " + name);
+        } else {
+            const std::string ip = uiCurrentPhoneIp();
+            if (ip.empty()) { msg = L"No phone linked yet."; }
+            else {
+                std::ostringstream b;
+                b << "{\"parentDir\":\"" << jsonEscape(uiWideToUtf8(dir))
+                  << "\",\"name\":\"" << jsonEscape(uiWideToUtf8(name)) << "\"}";
+                HttpReply r = httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/mkdir", b.str(),
+                                                 {{"Content-Type", "application/json"}}, 30000);
+                msg = (r.status == 200) ? (L"Created folder " + name + L" on the phone")
+                                        : L"The phone refused to create the folder.";
+            }
+        }
+        uiToast(msg);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, pane, 0);
+    }).detach();
+}
+
+static void uiOpRename(int pane) {
+    const std::vector<int> sel = uiSelectedIndices(gPane[pane]);
+    if (sel.size() != 1) { uiToast(L"Select exactly one item to rename."); return; }
+    const UiItem it = gPane[pane].items[sel[0]];
+    std::wstring name = it.name;
+    if (!uiPrompt(gMainHwnd, L"Rename", L"New name:", name)) return;
+    if (name == it.name) return;
+    uiToast(L"Renaming\u2026", 2000);
+    std::thread([pane, it, name]() {
+        std::wstring msg;
+        if (pane == PANE_PC) {
+            std::error_code ec;
+            const fs::path src = uiRealPcPath(it.path);
+            fs::rename(src, src.parent_path() / fs::u8path(uiWideToUtf8(name)), ec);
+            msg = ec ? (L"Rename failed: " + uiUtf8ToWide(ec.message())) : (L"Renamed to " + name);
+        } else {
+            const std::string ip = uiCurrentPhoneIp();
+            if (ip.empty()) { msg = L"No phone linked yet."; }
+            else {
+                std::ostringstream b;
+                b << "{\"path\":\"" << jsonEscape(uiWideToUtf8(it.path))
+                  << "\",\"newName\":\"" << jsonEscape(uiWideToUtf8(name)) << "\"}";
+                HttpReply r = httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/rename", b.str(),
+                                                 {{"Content-Type", "application/json"}}, 30000);
+                msg = (r.status == 200) ? (L"Renamed to " + name + L" on the phone") : L"The phone refused the rename.";
+            }
+        }
+        uiToast(msg);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, pane, 0);
+    }).detach();
+}
+
+static void uiOpDelete(int pane) {
+    std::vector<UiItem> targets;
+    for (const int i : uiSelectedIndices(gPane[pane])) targets.push_back(gPane[pane].items[i]);
+    if (targets.empty()) { uiToast(L"Nothing selected."); return; }
+
+    std::wstring q = L"Delete ";
+    q += std::to_wstring(targets.size());
+    q += (targets.size() == 1 ? L" item (" : L" items (");
+    q += targets[0].name;
+    if (targets.size() > 1) q += L", \u2026";
+    q += L") permanently?";
+    if (MessageBoxW(gMainHwnd, q.c_str(), L"ChainIt \u2014 delete", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+        return;
+
+    uiToast(L"Deleting\u2026", 2000);
+    std::thread([pane, targets]() {
+        std::wstring msg;
+        if (pane == PANE_PC) {
+            int n = 0;
+            std::error_code ec;
+            for (const auto& t : targets) {
+                const fs::path real = uiRealPcPath(t.path);
+                if (fs::exists(real, ec) && fs::remove_all(real, ec) > 0) ++n;
+            }
+            msg = L"Deleted " + std::to_wstring(n) + L" item(s) from this PC";
+        } else {
+            const std::string ip = uiCurrentPhoneIp();
+            if (ip.empty()) { msg = L"No phone linked yet."; }
+            else {
+                std::ostringstream b;
+                b << "{\"paths\":[";
+                for (size_t i = 0; i < targets.size(); ++i) {
+                    if (i) b << ",";
+                    b << "\"" << jsonEscape(uiWideToUtf8(targets[i].path)) << "\"";
+                }
+                b << "]}";
+                HttpReply r = httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/delete", b.str(),
+                                                 {{"Content-Type", "application/json"}}, 30000);
+                msg = (r.status == 200) ? (L"Deleted " + std::to_wstring(targets.size()) + L" item(s) from the phone")
+                                        : L"The phone refused the delete.";
+            }
+        }
+        uiToast(msg);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, pane, 0);
+    }).detach();
+}
+
+/** Copy (or move) the selection of one pane into the other pane's current folder. */
+static void uiOpTransfer(int fromPane, bool move) {
+    const int toPane = (fromPane == PANE_PC) ? PANE_PHONE : PANE_PC;
+    std::vector<UiItem> targets;
+    for (const int i : uiSelectedIndices(gPane[fromPane])) targets.push_back(gPane[fromPane].items[i]);
+    if (targets.empty()) { uiToast(L"Select items to transfer first."); return; }
+    if (fromPane == toPane) { uiToast(L"Pick the other pane first."); return; }
+
+    const std::wstring toDir = gPane[toPane].dir;
+    const uint64_t bytes = uiSelectedBytes(gPane[fromPane]);
+    uiToast(L"Starting " + std::to_wstring(targets.size()) + L" transfer(s)\u2026", 2500);
+
+    std::thread([fromPane, toPane, targets, toDir, move, bytes]() {
+        uint64_t done = 0;
+        std::wstring fail;
+        for (const auto& t : targets) {
+            if (fromPane == PANE_PC) {
+                // PC -> phone
+                const std::string ip = uiCurrentPhoneIp();
+                if (ip.empty()) { fail = L"No phone linked yet."; break; }
+                const fs::path real = uiRealPcPath(t.path);
+                const uint64_t n = uploadLocalPathToPhone(real, ip, uiWideToUtf8(toDir));
+                if (n == 0 && !t.isDir) { fail = L"Upload refused for " + t.name; }
+                done += n;
+                if (move && n > 0) { std::error_code ec; fs::remove_all(real, ec); }
+            } else {
+                // phone -> PC
+                const std::string ip = uiCurrentPhoneIp();
+                if (ip.empty()) { fail = L"No phone linked yet."; break; }
+                const fs::path destDir = uiRealPcPath(toDir);
+                std::error_code ec;
+                fs::create_directories(destDir, ec);
+                const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
+                if (n == 0) {
+                    if (fail.empty()) {
+                        std::lock_guard<std::mutex> lk(gState.mtx);
+                        fail = uiUtf8ToWide(gState.phoneLinkProblem);
+                    }
+                    if (fail.empty()) fail = L"Transfer failed for " + t.name + L" (integrity gate or link loss)";
+                } else {
+                    done += n;
+                    if (move) {
+                        std::ostringstream b;
+                        b << "{\"paths\":[\"" << jsonEscape(uiWideToUtf8(t.path)) << "\"]}";
+                        httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/delete", b.str(),
+                                           {{"Content-Type", "application/json"}}, 30000);
+                    }
+                }
+            }
+        }
+
+        std::wstring msg;
+        if (!fail.empty()) {
+            msg = fail + L" (" + uiFormatBytes(done) + L" transferred before it stopped)";
+        } else {
+            msg = (move ? L"Moved " : L"Copied ") + std::to_wstring(targets.size()) + L" item(s), " +
+                  uiFormatBytes(bytes) + L" \u2014 every chunk SHA-256 verified";
+        }
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            gState.transfers.insert(gState.transfers.begin(),
+                                    {std::string("ui"), uiWideToUtf8(targets[0].name), move ? "move" : "copy",
+                                     fromPane == PANE_PC ? "pc_to_phone" : "phone_to_pc",
+                                     gState.activeTransportId, static_cast<int64_t>(done), 0.0, nowMs()});
+            if (fail.empty()) gState.phoneLinkProblem.clear();
+        }
+        addLogLocked("VFS", (move ? "Moved " : "Copied ") + uiWideToUtf8(targets[0].name),
+                     uiWideToUtf8(msg));
+        uiToast(msg, 7000);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, toPane, 0);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, fromPane, 0);
+    }).detach();
+}
+
+static void uiOpOpen(int pane, int idx) {
+    if (idx < 0 || idx >= (int)gPane[pane].items.size()) return;
+    const UiItem it = gPane[pane].items[idx];
+    if (it.isDir) { uiNavigate(pane, it.path); return; }
+
+    if (pane == PANE_PC) {
+        const fs::path real = uiRealPcPath(it.path);
+        ShellExecuteW(gMainHwnd, L"open", real.c_str(), nullptr, real.parent_path().c_str(), SW_SHOWNORMAL);
+        return;
+    }
+
+    // Phone file: pull it down (chunked + verified) then open it with the right app.
+    uiToast(L"Fetching " + it.name + L" from the phone\u2026", 3000);
+    std::thread([it]() {
+        const std::string ip = uiCurrentPhoneIp();
+        if (ip.empty()) { uiToast(L"No phone linked yet."); return; }
+        const fs::path dir = fs::path(chainItTempDir()) / L"ChainIt-Open";
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(it.path), dir);
+        if (n == 0) {
+            std::wstring why;
+            { std::lock_guard<std::mutex> lk(gState.mtx); why = uiUtf8ToWide(gState.phoneLinkProblem); }
+            uiToast(why.empty() ? (L"Could not fetch " + it.name) : why, 7000);
+            return;
+        }
+        const fs::path local = dir / fs::u8path(uiWideToUtf8(it.name));
+        ShellExecuteW(gMainHwnd, L"open", local.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
+        uiToast(L"Opened " + it.name + L" (" + uiFormatBytes(n) + L", SHA-256 verified)");
+    }).detach();
+}
+
+static void uiOpDownloadToPc(int pane) {
+    if (pane != PANE_PHONE) { uiToast(L"That file is already on this PC."); return; }
+    std::vector<UiItem> targets;
+    for (const int i : uiSelectedIndices(gPane[pane])) targets.push_back(gPane[pane].items[i]);
+    if (targets.empty()) { uiToast(L"Nothing selected."); return; }
+    uiToast(L"Downloading to your Downloads folder\u2026", 2500);
+    std::thread([targets]() {
+        const std::string ip = uiCurrentPhoneIp();
+        if (ip.empty()) { uiToast(L"No phone linked yet."); return; }
+        wchar_t prof[MAX_PATH * 2] = {};
+        GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH * 2 - 1);
+        const fs::path dir = fs::path(prof) / L"Downloads";
+        uint64_t total = 0;
+        for (const auto& t : targets) total += downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), dir);
+        uiToast(total > 0 ? (L"Saved " + uiFormatBytes(total) + L" to Downloads")
+                          : L"Download failed - see the link status", 7000);
+    }).detach();
+}
+
+static void uiOpSetClipboard(int pane, const std::wstring& op) {
+    gClipboardPaths.clear();
+    for (const int i : uiSelectedIndices(gPane[pane])) gClipboardPaths.push_back(gPane[pane].items[i].path);
+    if (gClipboardPaths.empty()) { uiToast(L"Nothing selected."); return; }
+    gClipboardOp = op;
+    gClipboardPane = pane;
+    uiToast((op == L"move" ? L"Cut " : L"Copied ") + std::to_wstring(gClipboardPaths.size()) +
+            L" item(s) \u2014 switch pane and press Ctrl+V");
+}
+
+static void uiOpPaste(int pane) {
+    if (gClipboardPaths.empty()) { uiToast(L"The ChainIt clipboard is empty."); return; }
+    if (gClipboardPane == pane) { uiToast(L"Paste into the other pane to copy between PC and phone."); return; }
+
+    const bool move = (gClipboardOp == L"move");
+    const int from = gClipboardPane;
+    std::vector<UiItem> targets;
+    for (const auto& p : gClipboardPaths) {
+        for (const auto& it : gPane[from].items) if (it.path == p) { targets.push_back(it); break; }
+    }
+    if (targets.empty()) { uiToast(L"The copied items are no longer listed - refresh and copy again."); return; }
+
+    const std::wstring toDir = gPane[pane].dir;
+    gClipboardPaths.clear();
+    gClipboardPane = -1;
+    uiToast(L"Pasting " + std::to_wstring(targets.size()) + L" item(s)\u2026", 2500);
+
+    std::thread([from, pane, targets, toDir, move]() {
+        uint64_t done = 0;
+        const std::string ip = uiCurrentPhoneIp();
+        for (const auto& t : targets) {
+            if (from == PANE_PC) {
+                if (ip.empty()) break;
+                const uint64_t n = uploadLocalPathToPhone(uiRealPcPath(t.path), ip, uiWideToUtf8(toDir));
+                done += n;
+                if (move && n > 0) { std::error_code ec; fs::remove_all(uiRealPcPath(t.path), ec); }
+            } else {
+                if (ip.empty()) break;
+                const fs::path destDir = uiRealPcPath(toDir);
+                std::error_code ec;
+                fs::create_directories(destDir, ec);
+                const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
+                done += n;
+                if (move && n > 0) {
+                    std::ostringstream b;
+                    b << "{\"paths\":[\"" << jsonEscape(uiWideToUtf8(t.path)) << "\"]}";
+                    httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/delete", b.str(),
+                                       {{"Content-Type", "application/json"}}, 30000);
+                }
+            }
+        }
+        uiToast(ip.empty() ? L"No phone linked yet."
+                           : ((move ? L"Moved " : L"Copied ") + std::to_wstring(targets.size()) +
+                              L" item(s), " + uiFormatBytes(done)), 7000);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, pane, 0);
+        PostMessageW(gMainHwnd, WM_UI_REFRESH, from, 0);
+    }).detach();
+}
+
+// --- theme ------------------------------------------------------------------
+
+static const COLORREF kColBg       = RGB(11, 15, 21);
+static const COLORREF kColChrome   = RGB(16, 21, 28);
+static const COLORREF kColChrome2  = RGB(21, 27, 36);
+static const COLORREF kColList     = RGB(13, 17, 24);
+static const COLORREF kColHover    = RGB(24, 32, 42);
+static const COLORREF kColSel      = RGB(15, 52, 47);
+static const COLORREF kColSelIdle  = RGB(22, 30, 40);
+static const COLORREF kColLine     = RGB(33, 42, 54);
+static const COLORREF kColLineSoft = RGB(23, 30, 39);
+static const COLORREF kColText     = RGB(226, 232, 240);
+static const COLORREF kColDim      = RGB(148, 163, 184);
+static const COLORREF kColFaint    = RGB(100, 116, 139);
+static const COLORREF kColEmerald  = RGB(16, 185, 129);
+static const COLORREF kColCyan     = RGB(34, 211, 238);
+static const COLORREF kColAmber    = RGB(245, 158, 11);
+static const COLORREF kColDanger   = RGB(248, 113, 113);
+static const COLORREF kColBtn      = RGB(26, 34, 45);
+static const COLORREF kColBtnHover = RGB(37, 48, 62);
+
+static const int kTabH    = 38;
+static const int kToolH   = 42;
+static const int kPathH   = 26;
+static const int kStatusH = 28;
+
+static HFONT gFontUi = nullptr, gFontBold = nullptr, gFontTitle = nullptr;
+static HFONT gFontSmall = nullptr, gFontMono = nullptr;
+static std::map<std::wstring, HICON> gIconCache;
+static bool gUiFontsReady = false;
+
+static HFONT uiMakeFont(const wchar_t* face, int pt, int weight) {
+    HDC dc = GetDC(nullptr);
+    int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(nullptr, dc);
+    return CreateFontW(-MulDiv(pt, dpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+static void uiFontsInit() {
+    if (gUiFontsReady) return;
+    gFontUi    = uiMakeFont(L"Segoe UI", 9, FW_NORMAL);
+    gFontBold  = uiMakeFont(L"Segoe UI Semibold", 9, FW_SEMIBOLD);
+    gFontTitle = uiMakeFont(L"Segoe UI Semibold", 12, FW_SEMIBOLD);
+    gFontSmall = uiMakeFont(L"Segoe UI", 8, FW_NORMAL);
+    gFontMono  = uiMakeFont(L"Consolas", 9, FW_NORMAL);
+    gUiFontsReady = true;
+}
+
+static void uiFill(HDC dc, const RECT& r, COLORREF c) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    SetDCBrushColor(dc, c);
+    FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+
+static void uiRound(HDC dc, const RECT& r, COLORREF fill, COLORREF line, int rad) {
+    SetDCBrushColor(dc, fill);
+    SetDCPenColor(dc, line);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(DC_PEN));
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(DC_BRUSH));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, rad, rad);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+}
+
+static void uiLine(HDC dc, int x1, int y1, int x2, int y2, COLORREF c) {
+    SetDCPenColor(dc, c);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(DC_PEN));
+    MoveToEx(dc, x1, y1, nullptr);
+    LineTo(dc, x2, y2);
+    SelectObject(dc, op);
+}
+
+static void uiText(HDC dc, const RECT& r, const std::wstring& s, COLORREF c, HFONT f,
+                   UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS) {
+    SetTextColor(dc, c);
+    HGDIOBJ of = SelectObject(dc, f);
+    RECT copy = r;
+    DrawTextW(dc, s.c_str(), -1, &copy, fmt);
+    SelectObject(dc, of);
+}
+
+static int uiTextW(HDC dc, const std::wstring& s, HFONT f) {
+    HGDIOBJ of = SelectObject(dc, f);
+    SIZE sz{};
+    GetTextExtentPoint32W(dc, s.c_str(), static_cast<int>(s.size()), &sz);
+    SelectObject(dc, of);
+    return sz.cx;
+}
+
+/** Shell icon for a name/extension. USEFILEATTRIBUTES means no disk access, so it
+ *  works for phone files that do not exist on this PC. */
+static HICON uiIconFor(bool isDir, const std::wstring& ext) {
+    std::wstring key = isDir ? std::wstring(L"<dir>") : ext;
+    auto found = gIconCache.find(key);
+    if (found != gIconCache.end()) return found->second;
+    SHFILEINFOW sfi{};
+    const std::wstring probe = isDir ? L"folder" : (L"file" + (ext.empty() ? L"" : ext));
+    // USEFILEATTRIBUTES: the shell resolves the icon from the name alone, so this
+    // works for phone files that do not exist anywhere on this PC.
+    const DWORD flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+    HICON icon = nullptr;
+    if (SHGetFileInfoW(probe.c_str(), isDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,
+                       &sfi, sizeof(sfi), flags)) {
+        icon = sfi.hIcon;
+    }
+    gIconCache[key] = icon;
+    return icon;
+}
+
+static void uiDrawIcon(HDC dc, int x, int y, HICON icon, int size) {
+    if (!icon) return;
+    DrawIconEx(dc, x, y, icon, size, size, 0, nullptr, DI_NORMAL);
+}
+
+// --- layout -----------------------------------------------------------------
+
+struct ToolBtn {
+    int id;
+    std::wstring label;
+    RECT rc{};
+    bool enabled = true;
+    bool active = false;
+    bool separator = false;
+};
+
+enum UiHitKind { HIT_NONE = 0, HIT_TAB, HIT_TOOL, HIT_PANE, HIT_HEAD, HIT_ROW, HIT_LINK, HIT_ABOUT };
+struct UiHit {
+    int kind = HIT_NONE;
+    int id = 0;
+    int pane = -1;
+    int row = -1;
+    int col = -1;
+};
+
+struct UiLayout {
+    int cx = 0, cy = 0;
+    bool dual = false;
+    int panes = 0;
+    int paneId[2] = {PANE_PC, PANE_PHONE};
+    RECT pane[2]{};      // whole pane block
+    RECT path[2]{};      // breadcrumb strip
+    RECT head[2]{};      // column header
+    RECT list[2]{};      // rows
+    RECT tabs{};
+    RECT tab[3]{};
+    RECT toolbar{};
+    RECT status{};
+    std::vector<ToolBtn> tools;
+    RECT linkBtns[8]{};
+    int linkBtnCount = 0;
+};
+
+static const wchar_t* kToolLabels[] = {
+    L"Up", L"Refresh", L"New folder", L"Cut", L"Copy", L"Paste", L"Rename", L"Delete",
+    L"Send to phone", L"Save to PC", L"PC", L"Phone", L"Split view",
+};
+static const int kToolIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+static const int kToolCount = 13;
+
+static UiLayout uiComputeLayout(HWND hwnd) {
+    UiLayout L;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    L.cx = rc.right - rc.left;
+    L.cy = rc.bottom - rc.top;
+
+    L.tabs = RECT{0, 0, L.cx, kTabH};
+    const wchar_t* tabNames[3] = {L"Files", L"Link", L"About"};
+    HDC dc = GetDC(hwnd);
+    int tx = 12;
+    for (int i = 0; i < 3; ++i) {
+        int w = uiTextW(dc, tabNames[i], gFontBold) + 34;
+        L.tab[i] = RECT{tx, 6, tx + w, kTabH - 4};
+        tx += w + 4;
+    }
+    L.toolbar = RECT{0, kTabH, L.cx, kTabH + kToolH};
+    L.status = RECT{0, L.cy - kStatusH, L.cx, L.cy};
+
+    // toolbar buttons
+    int bx = 12;
+    const int by = kTabH + (kToolH - 28) / 2;
+    L.tools.clear();
+    for (int i = 0; i < kToolCount; ++i) {
+        ToolBtn b;
+        b.id = kToolIds[i];
+        b.label = kToolLabels[i];
+        if (i == 3 || i == 8 || i == 10) { bx += 10; }   // group gaps
+        int w = uiTextW(dc, b.label, gFontUi) + 24;
+        b.rc = RECT{bx, by, bx + w, by + 28};
+        bx += w + 6;
+        L.tools.push_back(b);
+    }
+    ReleaseDC(hwnd, dc);
+
+    L.dual = (gDualPane && gTab == TAB_FILES && L.cx >= 900);
+    const int top = kTabH + kToolH;
+    const int bot = L.cy - kStatusH;
+    if (gTab != TAB_FILES) {
+        L.panes = 0;
+        // Action column on the right of the Link tab only. Buttons that would fall
+        // below the status bar are dropped, so a short window cannot leave an
+        // invisible-but-clickable region behind.
+        if (gTab == TAB_LINK) {
+            const int bw = 232, bh = 30;
+            const int xx = L.cx - bw - 24;
+            int yy = top + 20;
+            for (int i = 0; i < 7 && yy + bh <= bot - 8; ++i) {
+                L.linkBtns[L.linkBtnCount++] = RECT{xx, yy, xx + bw, yy + bh};
+                yy += bh + 8;
+            }
+        }
+        return L;
+    }
+
+    if (L.dual) {
+        L.panes = 2;
+        L.paneId[0] = PANE_PC;
+        L.paneId[1] = PANE_PHONE;
+        L.pane[0] = RECT{0, top, L.cx / 2 - 1, bot};
+        L.pane[1] = RECT{L.cx / 2 + 1, top, L.cx, bot};
+    } else {
+        L.panes = 1;
+        L.paneId[0] = gActivePane;
+        L.pane[0] = RECT{0, top, L.cx, bot};
+    }
+    for (int i = 0; i < L.panes; ++i) {
+        const RECT& p = L.pane[i];
+        L.path[i] = RECT{p.left, p.top, p.right, p.top + kPathH};
+        L.head[i] = RECT{p.left, p.top + kPathH, p.right, p.top + kPathH + kColHeaderH};
+        L.list[i] = RECT{p.left, p.top + kPathH + kColHeaderH, p.right, p.bottom};
+    }
+    return L;
+}
+
+static UiLayout gLayout;
+
+static int uiPaneSlot(const UiLayout& L, int paneId) {
+    for (int i = 0; i < L.panes; ++i) if (L.paneId[i] == paneId) return i;
+    return -1;
+}
+
+static std::wstring uiPathCrumb(const std::wstring& dir) {
+    if (dir.empty() || dir == L"/") return L"Root";
+    std::wstring out;
+    size_t i = 0;
+    while (i < dir.size()) {
+        size_t j = dir.find(L'/', i);
+        if (j == std::wstring::npos) j = dir.size();
+        if (j > i) { if (!out.empty()) out += L"  \u203A  "; out += dir.substr(i, j - i); }
+        i = j + 1;
+    }
+    return out.empty() ? L"Root" : out;
+}
+
+/** Short drive caption for a pane's breadcrumb strip. The verbose scanning
+ *  placeholder is collapsed to "Phone" so the crumb keeps its room. */
+static std::wstring uiDriveLabel(int pane) {
+    if (pane == PANE_PC) return L"This PC";
+    std::wstring name;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        name = uiUtf8ToWide(gState.peerDeviceName);
+    }
+    if (name.empty() || name.find(L"Scanning") != std::wstring::npos) return L"Phone  \u00B7  Z:\\";
+    return name + L"  \u00B7  Z:\\";
+}
+
+/** Live link telemetry for the Link tab and the status bar. */
+struct UiLinkInfo {
+    std::wstring transport, peer, endpoint, problem;
+    bool siblingOn = false, zMounted = false, btRadio = false, btListening = false;
+    int pooled = 0, maxCh = 0, cachedCh = 0;
+    uint64_t served = 0, redials = 0;
+    double rttMs = 0.0;
+    std::vector<std::wstring> paired;
+    std::vector<std::wstring> lan;
+    uint64_t phoneTotal = 0, phoneUsed = 0;
+};
+
+static UiLinkInfo uiLinkInfo() {
+    UiLinkInfo s;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        s.transport = uiUtf8ToWide(gState.activeTransportId);
+        s.peer = uiUtf8ToWide(gState.peerDeviceName);
+        s.endpoint = uiUtf8ToWide(gState.activePhoneIp);
+        s.problem = uiUtf8ToWide(gState.phoneLinkProblem);
+        s.siblingOn = gState.siblingEnabled;
+        s.zMounted = gState.zDriveMounted;
+        s.btRadio = gState.btRadioPresent;
+        s.btListening = gState.btReceiverListening;
+        s.phoneTotal = gState.phoneTotalBytes;
+        s.phoneUsed = gState.phoneUsedBytes;
+        for (const auto& d : gState.btPairedDevices) s.paired.push_back(uiUtf8ToWide(d));
+        for (const auto& kv : gState.phoneEndpoints) s.lan.push_back(uiUtf8ToWide(kv.second.kind) + L"  " + uiUtf8ToWide(kv.first));
+    }
+    s.pooled = static_cast<int>(btPooledChannels());
+    s.maxCh = static_cast<int>(kBtChannelCount);
+    s.cachedCh = static_cast<int>(gBtCachedPort.load());
+    s.served = gBtRequestsServed.load();
+    s.redials = gBtRedials.load();
+    s.rttMs = static_cast<double>(gBtLastRttUs.load()) / 1000.0;
+    return s;
+}
+
+static std::wstring uiTransportPretty(const std::wstring& t) {
+    if (t == L"usb_rndis") return L"USB tethering (RNDIS)";
+    if (t == L"wifi_lan") return L"Wi-Fi / LAN";
+    if (t == L"local_hotspot") return L"Hotspot (offline)";
+    if (t == L"bluetooth") return L"Bluetooth RFCOMM";
+    if (t == L"online_p2p") return L"Online P2P relay";
+    return t.empty() ? std::wstring(L"none yet") : t;
+}
+
+// --- painting ---------------------------------------------------------------
+
+static const wchar_t* kLinkBtnLabels[] = {
+    L"Rescan all transports", L"Mount / refresh Z:", L"Open Z: in Explorer",
+    L"Create desktop shortcut", L"Show mini hub panel", L"Update ChainIt in place",
+    L"Copy pairing key",
+};
+
+static void uiPaintTabs(HDC dc, const UiLayout& L) {
+    uiFill(dc, L.tabs, kColChrome);
+    uiLine(dc, 0, kTabH - 1, L.cx, kTabH - 1, kColLine);
+    const wchar_t* names[3] = {L"Files", L"Link", L"About"};
+    for (int i = 0; i < 3; ++i) {
+        const RECT r = L.tab[i];
+        const bool on = (gTab == i);
+        if (on) {
+            uiFill(dc, r, kColChrome2);
+            uiLine(dc, r.left, r.bottom, r.right, r.bottom, kColEmerald);
+            uiLine(dc, r.left, r.bottom - 1, r.right, r.bottom - 1, kColEmerald);
+        }
+        uiText(dc, r, names[i], on ? kColText : kColDim, on ? gFontBold : gFontUi);
+    }
+    // right-hand brand
+    RECT brand{L.cx - 420, 0, L.cx - 16, kTabH};
+    std::wstring ver = L"ChainIt " + uiUtf8ToWide(kChainItAppVersion) + L"   \u00B7   Built by Qmer";
+    uiText(dc, brand, ver, kColFaint, gFontSmall,
+           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const HICON tabIcon = gMainIconSm ? gMainIconSm : gMainIcon;
+    if (tabIcon) uiDrawIcon(dc, L.cx - 420 - 26, (kTabH - 16) / 2, tabIcon, 16);
+}
+
+static void uiPaintToolbar(HDC dc, UiLayout& L) {
+    uiFill(dc, L.toolbar, kColChrome);
+    uiLine(dc, 0, L.toolbar.bottom - 1, L.cx, L.toolbar.bottom - 1, kColLine);
+
+    UiList& ap = gPane[gActivePane];
+    const bool sel = !uiSelectedIndices(ap).empty();
+    const bool pcSel = !uiSelectedIndices(gPane[PANE_PC]).empty();
+    const bool phSel = !uiSelectedIndices(gPane[PANE_PHONE]).empty();
+
+    for (size_t i = 0; i < L.tools.size(); ++i) {
+        ToolBtn b = L.tools[i];
+        switch (b.id) {
+            case 0: b.enabled = (ap.dir != L"/" && !ap.dir.empty() && gTab == TAB_FILES); break;
+            case 1: b.enabled = (gTab == TAB_FILES); break;
+            case 2: b.enabled = (gTab == TAB_FILES); break;
+            case 3: b.enabled = sel && gTab == TAB_FILES; break;
+            case 4: b.enabled = sel && gTab == TAB_FILES; break;
+            case 5: b.enabled = !gClipboardPaths.empty() && gTab == TAB_FILES; break;
+            case 6: b.enabled = (uiSelectedIndices(ap).size() == 1 && gTab == TAB_FILES); break;
+            case 7: b.enabled = sel && gTab == TAB_FILES; break;
+            case 8: b.enabled = pcSel && gTab == TAB_FILES; break;
+            case 9: b.enabled = phSel && gTab == TAB_FILES; break;
+            case 10: case 11: b.enabled = (gTab == TAB_FILES); b.active = (!gDualPane && gActivePane == (b.id - 10)); break;
+            case 12: b.enabled = (gTab == TAB_FILES && L.cx >= 900); b.active = gDualPane; break;
+            default: break;
+        }
+        L.tools[i].enabled = b.enabled;
+        L.tools[i].active = b.active;
+
+        const bool hov = (gToolHover == static_cast<int>(i));
+        COLORREF fill = b.active ? RGB(13, 60, 52) : (hov && b.enabled ? kColBtnHover : kColBtn);
+        COLORREF line = b.active ? kColEmerald : kColLine;
+        if (!b.enabled) { fill = kColChrome; line = kColLineSoft; }
+        uiRound(dc, b.rc, fill, line, 6);
+        uiText(dc, RECT{b.rc.left + 2, b.rc.top, b.rc.right - 2, b.rc.bottom}, b.label,
+               !b.enabled ? kColFaint : (b.active ? kColEmerald : kColText), gFontUi,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+}
+
+static void uiPaintPaneChrome(HDC dc, const UiLayout& L, int slot, int paneId) {
+    UiList& l = gPane[paneId];
+    l.rc = L.pane[slot];
+    l.listRc = L.list[slot];
+
+    const bool active = (gActivePane == paneId);
+
+    uiFill(dc, L.pane[slot], kColList);
+    // path / breadcrumb strip
+    uiFill(dc, L.path[slot], active ? kColChrome2 : kColChrome);
+    uiLine(dc, L.path[slot].left, L.path[slot].bottom - 1, L.path[slot].right, L.path[slot].bottom - 1, kColLine);
+    RECT pr{L.path[slot].left + 12, L.path[slot].top, L.path[slot].right - 12, L.path[slot].bottom};
+    const std::wstring crumb = uiPathCrumb(l.dir);
+    uiText(dc, pr, uiDriveLabel(paneId) + L"   \u203A   " + crumb,
+           active ? kColText : kColDim, gFontUi);
+    if (!l.filter.empty()) {
+        const std::wstring chip = L"filter  \"" + l.filter + L"\"   " +
+                                  std::to_wstring(l.items.size()) + L"/" +
+                                  std::to_wstring(l.allItems.size()) + L"   Esc";
+        const int cw = uiTextW(dc, chip, gFontSmall) + 22;
+        RECT cr{L.path[slot].right - cw - 10, L.path[slot].top + 3,
+                L.path[slot].right - 10, L.path[slot].bottom - 3};
+        uiRound(dc, cr, RGB(13, 44, 40), kColEmerald, 6);
+        uiText(dc, RECT{cr.left + 10, cr.top, cr.right - 10, cr.bottom}, chip, RGB(167, 243, 208), gFontSmall,
+               DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    } else if (l.loading) {
+        RECT sp{L.path[slot].right - 110, L.path[slot].top, L.path[slot].right - 12, L.path[slot].bottom};
+        uiText(dc, sp, L"reading\u2026", kColCyan, gFontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    // column header
+    const RECT h = L.head[slot];
+    uiFill(dc, h, kColChrome);
+    uiLine(dc, h.left, h.bottom - 1, h.right, h.bottom - 1, kColLine);
+    const int w = h.right - h.left;
+    const bool wide = w >= 560;
+    const bool mid = w >= 400;
+    int sizeR = h.right - 14;
+    int modL = 0, typeL = 0;
+    if (wide) { modL = sizeR - kColModW; typeL = modL - kColTypeW; sizeR = typeL; }
+    else if (mid) { sizeR = sizeR - kColSizeW; }
+    else { sizeR = h.right - 14; }
+    const int nameR = (wide ? typeL : (mid ? sizeR : sizeR)) - 10;
+
+    auto headCell = [&](RECT r, const std::wstring& label, int key, UINT fmt) {
+        const bool on = (l.sortKey == key);
+        std::wstring t = label;
+        if (on) t += l.sortDesc ? L"  \u25BE" : L"  \u25B4";
+        uiText(dc, r, t, on ? kColEmerald : kColDim, on ? gFontBold : gFontSmall, fmt);
+    };
+    headCell(RECT{h.left + 40, h.top, nameR, h.bottom}, L"Name", SORT_NAME,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (mid) headCell(RECT{sizeR, h.top, sizeR + kColSizeW - 8, h.bottom}, L"Size", SORT_SIZE,
+                      DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (wide) {
+        headCell(RECT{typeL + 8, h.top, modL - 6, h.bottom}, L"Type", SORT_TYPE,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        headCell(RECT{modL + 8, h.top, h.right - 12, h.bottom}, L"Modified", SORT_MODIFIED,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    uiLine(dc, h.left + 34, h.top + 6, h.left + 34, h.bottom - 6, kColLineSoft);
+    if (mid) uiLine(dc, sizeR - 6, h.top + 6, sizeR - 6, h.bottom - 6, kColLineSoft);
+    if (wide) {
+        uiLine(dc, typeL, h.top + 6, typeL, h.bottom - 6, kColLineSoft);
+        uiLine(dc, modL, h.top + 6, modL, h.bottom - 6, kColLineSoft);
+    }
+}
+
+static void uiPaintPaneRows(HDC dc, const UiLayout& L, int slot, int paneId) {
+    UiList& l = gPane[paneId];
+    const RECT lr = L.list[slot];
+    const int h = lr.bottom - lr.top;
+    const int w = lr.right - lr.left;
+    if (h <= 0) return;
+
+    const bool active = (gActivePane == paneId);
+    const bool wide = w >= 560;
+    const bool mid = w >= 400;
+
+    // clip to the row area
+    HRGN clip = CreateRectRgnIndirect(&lr);
+    SelectClipRgn(dc, clip);
+
+    if (!l.error.empty()) {
+        RECT box{lr.left + 24, lr.top + 26, lr.right - 24, lr.top + 26 + 96};
+        uiRound(dc, box, RGB(38, 24, 14), kColAmber, 8);
+        RECT t{box.left + 16, box.top + 12, box.right - 16, box.top + 40};
+        uiText(dc, t, L"The link is not answering", kColAmber, gFontBold);
+        RECT d{box.left + 16, box.top + 40, box.right - 16, box.bottom - 12};
+        uiText(dc, d, l.error, kColDim, gFontSmall, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        RECT hint{lr.left + 24, box.bottom + 14, lr.right - 24, box.bottom + 40};
+        uiText(dc, hint, L"Press F5 to retry \u00B7 every transport is re-scanned automatically.",
+               kColFaint, gFontSmall);
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(clip);
+        return;
+    }
+
+    if (l.items.empty() && !l.loading) {
+        RECT t{lr.left, lr.top + h / 2 - 30, lr.right, lr.top + h / 2 + 30};
+        const std::wstring msg = (!l.filter.empty() && !l.allItems.empty())
+                                     ? (L"Nothing here matches \"" + l.filter + L"\"  \u00B7  Esc clears the filter")
+                                     : std::wstring(L"This folder is empty");
+        uiText(dc, t, msg, kColDim, gFontUi,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectClipRgn(dc, nullptr);
+        DeleteObject(clip);
+        return;
+    }
+
+    const int maxScroll = (std::max)(0, static_cast<int>(l.items.size()) * kRowH - h);
+    if (l.scroll > maxScroll) l.scroll = maxScroll;
+    if (l.scroll < 0) l.scroll = 0;
+
+    int sizeR = lr.right - 14;
+    int modL = 0, typeL = 0;
+    if (wide) { modL = sizeR - kColModW; typeL = modL - kColTypeW; sizeR = typeL; }
+    else if (mid) { sizeR = sizeR - kColSizeW; }
+    const int nameL = lr.left + 40;
+    const int nameR = (wide ? typeL : sizeR) - 10;
+
+    const int first = l.scroll / kRowH;
+    const int last = (std::min)(static_cast<int>(l.items.size()) - 1, (l.scroll + h) / kRowH + 1);
+    for (int i = first; i <= last; ++i) {
+        const int y = lr.top - l.scroll + i * kRowH;
+        if (y + kRowH < lr.top || y > lr.bottom) continue;
+        const RECT row{lr.left, y, lr.right, y + kRowH};
+        const UiItem& it = l.items[i];
+        const bool isSel = (i < (int)l.selected.size() && l.selected[i]);
+        const bool isHov = (l.hover == i);
+        COLORREF bg = kColList;
+        if (isSel) bg = active ? kColSel : kColSelIdle;
+        else if (isHov) bg = kColHover;
+        if (bg != kColList) uiFill(dc, row, bg);
+        if (i == l.focused) {
+            RECT f{lr.left + 2, y + 1, lr.right - 2, y + kRowH - 1};
+            SetDCPenColor(dc, active ? kColEmerald : kColLine);
+            HGDIOBJ op = SelectObject(dc, GetStockObject(DC_PEN));
+            HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, f.left, f.top, f.right, f.bottom);
+            SelectObject(dc, ob);
+            SelectObject(dc, op);
+        }
+        uiLine(dc, lr.left, y + kRowH - 1, lr.right, y + kRowH - 1, kColLineSoft);
+
+        uiDrawIcon(dc, lr.left + 12, y + (kRowH - 16) / 2, uiIconFor(it.isDir, it.ext), 16);
+        uiText(dc, RECT{nameL, y, nameR, y + kRowH}, it.name,
+               isSel ? kColText : (it.isDir ? RGB(190, 226, 255) : kColText), gFontUi);
+        if (mid) {
+            std::wstring sz = it.isDir ? L"" : uiFormatBytes(it.size);
+            uiText(dc, RECT{sizeR, y, sizeR + kColSizeW - 8, y + kRowH}, sz, kColDim, gFontUi,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+        if (wide) {
+            uiText(dc, RECT{typeL + 8, y, modL - 6, y + kRowH}, uiTypeLabel(it), kColFaint, gFontUi);
+            uiText(dc, RECT{modL + 8, y, lr.right - 12, y + kRowH}, uiFormatTime(it.modifiedMs), kColFaint, gFontUi);
+        }
+    }
+
+    // slim scrollbar
+    const int total = static_cast<int>(l.items.size()) * kRowH;
+    if (total > h) {
+        RECT track{lr.right - 9, lr.top, lr.right - 2, lr.bottom};
+        uiFill(dc, track, kColChrome);
+        int th = (std::max)(24, h * h / total);
+        int ty = lr.top + (h - th) * l.scroll / (std::max)(1, total - h);
+        uiRound(dc, RECT{track.left + 1, ty, track.right - 1, ty + th}, RGB(58, 71, 88), RGB(58, 71, 88), 6);
+    }
+
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(clip);
+}
+
+static void uiPaintStatus(HDC dc, const UiLayout& L) {
+    uiFill(dc, L.status, kColChrome);
+    uiLine(dc, 0, L.status.top, L.cx, L.status.top, kColLine);
+
+    UiList& l = gPane[gActivePane];
+    std::vector<int> sel = uiSelectedIndices(l);
+    std::wstring left = std::to_wstring(l.items.size()) +
+                        (!l.filter.empty() && l.allItems.size() != l.items.size()
+                             ? (L" of " + std::to_wstring(l.allItems.size()) + L" matching")
+                             : L"") +
+                        L" items";
+    if (l.loading) left += L"  \u00B7  reading\u2026";
+    if (!sel.empty()) {
+        left += L"  \u00B7  " + std::to_wstring(sel.size()) + L" selected";
+        if (sel.size() > 1 || !l.items[sel[0]].isDir) left += L"  \u00B7  " + uiFormatBytes(uiSelectedBytes(l));
+    }
+    uiText(dc, RECT{14, L.status.top, L.cx / 2, L.status.bottom}, left, kColDim, gFontSmall);
+
+    const UiLinkInfo li = uiLinkInfo();
+    std::wstring mid = uiTransportPretty(li.transport);
+    if (!li.endpoint.empty()) mid += L"  \u00B7  " + li.endpoint;
+    if (li.rttMs > 0) {
+        wchar_t b[32]; swprintf(b, 32, L"%.0f ms", li.rttMs);
+        mid += L"  \u00B7  " + std::wstring(b);
+    }
+    uiText(dc, RECT{L.cx / 2 - 200, L.status.top, L.cx / 2 + 200, L.status.bottom}, mid,
+           li.problem.empty() ? kColEmerald : kColAmber, gFontSmall,
+           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    uiText(dc, RECT{L.cx - 320, L.status.top, L.cx - 14, L.status.bottom},
+           std::wstring(L"v") + uiUtf8ToWide(kChainItAppVersion) + L"  \u00B7  Built by Qmer",
+           kColFaint, gFontSmall, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+static void uiPaintToast(HDC dc, const UiLayout& L) {
+    if (gMainToast.empty()) return;
+    if (nowMs() > gMainToastUntil.load()) { gMainToast.clear(); return; }
+    const int w = (std::min)(L.cx - 80, uiTextW(dc, gMainToast, gFontUi) + 56);
+    const int h = 34;
+    RECT r{(L.cx - w) / 2, L.status.top - h - 14, (L.cx + w) / 2, L.status.top - 14};
+    const bool bad = gMainToast.find(L"fail") != std::wstring::npos ||
+                     gMainToast.find(L"refused") != std::wstring::npos ||
+                     gMainToast.find(L"Could not") != std::wstring::npos ||
+                     gMainToast.find(L"No phone") != std::wstring::npos;
+    uiRound(dc, r, bad ? RGB(46, 22, 22) : RGB(14, 44, 38), bad ? kColDanger : kColEmerald, 8);
+    uiText(dc, RECT{r.left + 16, r.top, r.right - 16, r.bottom}, gMainToast,
+           bad ? RGB(254, 202, 202) : RGB(167, 243, 208), gFontUi,
+           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+}
+
+// --- Link tab ---------------------------------------------------------------
+
+static void uiCard(HDC dc, const RECT& r, const std::wstring& title) {
+    uiRound(dc, r, kColChrome, kColLine, 10);
+    uiLine(dc, r.left + 2, r.top + 34, r.right - 2, r.top + 34, kColLine);
+    uiText(dc, RECT{r.left + 16, r.top, r.right - 16, r.top + 34}, title, kColText, gFontBold);
+}
+
+static void uiKv(HDC dc, int x, int y, int w, const std::wstring& k, const std::wstring& v, COLORREF vc) {
+    uiText(dc, RECT{x, y, x + 170, y + 20}, k, kColFaint, gFontSmall);
+    uiText(dc, RECT{x + 176, y, x + w, y + 20}, v.empty() ? L"\u2014" : v, vc, gFontUi);
+}
+
+static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
+    const int top = kTabH + kToolH;
+    const int bot = L.status.top;
+    uiFill(dc, RECT{0, top, L.cx, bot}, kColBg);
+
+    const UiLinkInfo s = uiLinkInfo();
+    const int colW = (std::min)(520, L.cx - 300);
+    int y = top + 20;
+
+    // headline
+    const bool ok = !s.endpoint.empty() && s.problem.empty();
+    RECT hl{24, y, 24 + colW, y + 62};
+    uiRound(dc, hl, ok ? RGB(12, 42, 36) : RGB(40, 27, 14), ok ? kColEmerald : kColAmber, 10);
+    uiText(dc, RECT{hl.left + 18, hl.top + 10, hl.right - 18, hl.top + 32},
+           ok ? L"Linked and serving files" : (s.endpoint.empty() ? L"Searching for your phone" : L"Linked, but the phone is not answering"),
+           ok ? kColEmerald : kColAmber, gFontBold);
+    uiText(dc, RECT{hl.left + 18, hl.top + 34, hl.right - 18, hl.bottom - 8},
+           s.problem.empty()
+               ? (s.peer.empty() ? std::wstring(L"No device name reported yet") : s.peer)
+               : s.problem,
+           kColDim, gFontSmall);
+    y += 78;
+
+    RECT c1{24, y, 24 + colW, y + 214};
+    uiCard(dc, c1, L"Transport");
+    int yy = c1.top + 46;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Active transport", uiTransportPretty(s.transport), kColCyan); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone endpoint", s.endpoint, kColText); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Peer device", s.peer, kColText); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Sibling Mode", s.siblingOn ? L"on" : L"off", s.siblingOn ? kColEmerald : kColAmber); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Z: drive", s.zMounted ? L"mounted" : L"not mounted", s.zMounted ? kColEmerald : kColAmber); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone storage",
+         s.phoneTotal ? (uiFormatBytes(s.phoneUsed) + L" used of " + uiFormatBytes(s.phoneTotal)) : L"", kColText); yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Discovered endpoints",
+         s.lan.empty() ? L"none yet" : std::to_wstring(s.lan.size()) + L" candidate(s)", kColDim);
+
+    y += 230;
+    RECT c2{24, y, 24 + colW, y + 176};
+    uiCard(dc, c2, L"Bluetooth RFCOMM link");
+    yy = c2.top + 46;
+    wchar_t pool[96];
+    swprintf(pool, 96, L"%d of %d keep-alive channels open", s.pooled, s.maxCh);
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Channel pool", pool, s.pooled > 0 ? kColEmerald : kColDim); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Cached SDP channel",
+         s.cachedCh > 0 ? (std::to_wstring(s.cachedCh) + L" (no re-lookup)") : L"", kColText); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Requests served", std::to_wstring(s.served), kColText); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Re-dials", std::to_wstring(s.redials), s.redials > 8 ? kColAmber : kColDim); yy += 24;
+    wchar_t rtt[48]; swprintf(rtt, 48, L"%.0f ms", s.rttMs);
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Last round trip", s.rttMs > 0 ? rtt : L"", kColText); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Radio / receiver",
+         std::wstring(s.btRadio ? L"present" : L"absent") + L"  \u00B7  " + (s.btListening ? L"listening" : L"idle"),
+         s.btRadio ? kColEmerald : kColAmber);
+
+    y += 192;
+    RECT c3{24, y, 24 + colW, (std::min)(bot - 16, y + 150)};
+    uiCard(dc, c3, L"Paired Bluetooth devices");
+    yy = c3.top + 44;
+    if (s.paired.empty()) {
+        uiText(dc, RECT{c3.left + 18, yy, c3.right - 18, yy + 20},
+               L"Pair the phone once in Windows Bluetooth settings and ChainIt dials it directly.",
+               kColDim, gFontSmall);
+    } else {
+        for (size_t i = 0; i < s.paired.size() && yy < c3.bottom - 24; ++i) {
+            uiText(dc, RECT{c3.left + 18, yy, c3.right - 18, yy + 20}, L"\u2022  " + s.paired[i], kColText, gFontMono);
+            yy += 22;
+        }
+    }
+
+    // action column
+    for (int i = 0; i < L.linkBtnCount; ++i) {
+        const RECT r = L.linkBtns[i];
+        if (r.top > bot - 8) break;
+        const bool hov = (gLinkHover == i);
+        uiRound(dc, r, hov ? kColBtnHover : kColBtn, hov ? kColEmerald : kColLine, 7);
+        uiText(dc, RECT{r.left + 14, r.top, r.right - 14, r.bottom}, kLinkBtnLabels[i], kColText, gFontUi);
+    }
+}
+
+// --- About tab --------------------------------------------------------------
+
+static void uiPaintAboutTab(HDC dc, const UiLayout& L) {
+    const int top = kTabH + kToolH;
+    const int bot = L.status.top;
+    uiFill(dc, RECT{0, top, L.cx, bot}, kColBg);
+
+    const int w = (std::min)(760, L.cx - 48);
+    int y = top + 26;
+
+    if (gMainIconLg) uiDrawIcon(dc, 24, y - 6, gMainIconLg, 64);
+    else if (gMainIcon) uiDrawIcon(dc, 28, y + 2, gMainIcon, 48);
+    uiText(dc, RECT{24 + 76, y, 24 + w, y + 30}, L"ChainIt", kColText, gFontTitle);
+    uiText(dc, RECT{24 + 76, y + 30, 24 + w, y + 52},
+           std::wstring(L"Version ") + uiUtf8ToWide(kChainItAppVersion) +
+           L"  \u00B7  native Win32 build  \u00B7  no browser, no runtime",
+           kColDim, gFontUi);
+    y += 74;
+
+    RECT credit{24, y, 24 + w, y + 48};
+    uiRound(dc, credit, RGB(12, 42, 36), kColEmerald, 10);
+    uiText(dc, RECT{credit.left + 18, credit.top, credit.right - 18, credit.bottom},
+           L"Built by Qmer", RGB(167, 243, 208), gFontBold);
+    y += 64;
+
+    struct Tile { const wchar_t* t; const wchar_t* d; };
+    const Tile tiles[] = {
+        {L"Fully native window",
+         L"This File Manager is drawn by ChainIt itself with GDI. It never launches Edge, "
+         L"Chrome or WebView2, so the taskbar button is ChainIt's own chain-link icon."},
+        {L"One process, one identity",
+         L"The engine, the tray icon, the mini hub and this window all live in ChainIt-Windows.exe. "
+         L"The AppUserModelID ChainIt.Sibling.Hub groups every window under one taskbar button."},
+        {L"Bluetooth is a real drive",
+         L"Three pooled RFCOMM keep-alive channels carry Z:\\ with no Wi-Fi, hotspot or cable. "
+         L"A cached SDP channel avoids re-lookup, and framing is by Content-Length, never EOF."},
+        {L"Integrity gate on every byte",
+         L"2 MiB chunks with 4 parallel workers (1 over Bluetooth), SHA-256 per chunk and per file. "
+         L"Partial data lands in a hidden .chainit-part file and only replaces the target when verified."},
+        {L"Phone survives the night",
+         L"A connectedDevice foreground service, a 9-minute Doze heartbeat, wake-lock renewal and a "
+         L"recents-swipe restart keep Z:\\ alive with the screen locked."},
+        {L"Pairing key required",
+         L"Every request needs CHAINIT-SIBLING. Five failures in 60 seconds lock the caller out for "
+         L"30 seconds; a wrong key is a 401, a disabled Sibling is a 403."},
+    };
+    const int tileH = 76;
+    for (size_t i = 0; i < sizeof(tiles) / sizeof(tiles[0]); ++i) {
+        RECT r{24, y, 24 + w, y + tileH};
+        if (r.bottom > bot - 12) break;
+        uiRound(dc, r, kColChrome, kColLine, 10);
+        uiText(dc, RECT{r.left + 18, r.top + 10, r.right - 18, r.top + 30}, tiles[i].t, kColCyan, gFontBold);
+        uiText(dc, RECT{r.left + 18, r.top + 32, r.right - 18, r.bottom - 10}, tiles[i].d,
+               kColDim, gFontSmall, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        y += tileH + 10;
+    }
+
+    RECT foot{24, (std::max)(y, bot - 46), 24 + w, bot - 16};
+    uiText(dc, foot, L"ChainIt links an Android phone and a Windows PC into one file space: "
+                     L"LAN, hotspot, USB tethering, online relay and Bluetooth RFCOMM.",
+           kColFaint, gFontSmall, DT_LEFT | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+}
+
+// --- hit testing ------------------------------------------------------------
+
+static int uiRowAt(const UiList& l, const RECT& listRc, int y) {
+    if (y < listRc.top || y >= listRc.bottom) return -1;
+    const int idx = (y - listRc.top + l.scroll) / kRowH;
+    if (idx < 0 || idx >= static_cast<int>(l.items.size())) return -1;
+    return idx;
+}
+
+static int uiColumnAt(const UiLayout& L, int slot, int x) {
+    const RECT h = L.head[slot];
+    const int w = h.right - h.left;
+    const bool wide = w >= 560;
+    const bool mid = w >= 400;
+    int sizeR = h.right - 14;
+    int modL = 0, typeL = 0;
+    if (wide) { modL = sizeR - kColModW; typeL = modL - kColTypeW; sizeR = typeL; }
+    else if (mid) { sizeR = sizeR - kColSizeW; }
+    if (wide) {
+        if (x >= modL) return SORT_MODIFIED;
+        if (x >= typeL) return SORT_TYPE;
+        if (x >= sizeR) return SORT_SIZE;
+        return SORT_NAME;
+    }
+    if (mid) {
+        if (x >= sizeR) return SORT_SIZE;
+        return SORT_NAME;
+    }
+    return SORT_NAME;
+}
+
+static UiHit uiHitTest(const UiLayout& L, int x, int y) {
+    UiHit h;
+    for (int i = 0; i < 3; ++i) {
+        if (PtInRect(&L.tab[i], POINT{x, y})) { h.kind = HIT_TAB; h.id = i; return h; }
+    }
+    for (size_t i = 0; i < L.tools.size(); ++i) {
+        if (PtInRect(&L.tools[i].rc, POINT{x, y})) { h.kind = HIT_TOOL; h.id = static_cast<int>(i); return h; }
+    }
+    for (int i = 0; i < L.linkBtnCount; ++i) {
+        if (PtInRect(&L.linkBtns[i], POINT{x, y})) { h.kind = HIT_LINK; h.id = i; return h; }
+    }
+    for (int slot = 0; slot < L.panes; ++slot) {
+        const int paneId = L.paneId[slot];
+        if (PtInRect(&L.pane[slot], POINT{x, y})) {
+            h.pane = paneId;
+            if (PtInRect(&L.head[slot], POINT{x, y})) { h.kind = HIT_HEAD; h.col = uiColumnAt(L, slot, x); return h; }
+            if (PtInRect(&L.list[slot], POINT{x, y})) {
+                const int row = uiRowAt(gPane[paneId], L.list[slot], y);
+                h.kind = (row >= 0) ? HIT_ROW : HIT_PANE;
+                h.row = row;
+                return h;
+            }
+            h.kind = HIT_PANE;
+            return h;
+        }
+    }
+    return h;
+}
+
+// --- toolbar + link actions -------------------------------------------------
+
+static void uiRunTool(int id) {
+    const int pane = gActivePane;
+    switch (id) {
+        case 0:  uiGoUp(pane); break;
+        case 1:  uiReloadBoth(); uiToast(L"Refreshing both panes\u2026", 1600); break;
+        case 2:  uiOpNewFolder(pane); break;
+        case 3:  uiOpSetClipboard(pane, L"move"); break;
+        case 4:  uiOpSetClipboard(pane, L"copy"); break;
+        case 5:  uiOpPaste(pane); break;
+        case 6:  uiOpRename(pane); break;
+        case 7:  uiOpDelete(pane); break;
+        case 8:  uiOpTransfer(PANE_PC, false); break;
+        case 9:  uiOpTransfer(PANE_PHONE, false); break;
+        case 10: gDualPane = false; gActivePane = PANE_PC;
+                 if (gPane[PANE_PC].allItems.empty()) uiReload(PANE_PC);
+                 break;
+        case 11: gDualPane = false; gActivePane = PANE_PHONE;
+                 if (gPane[PANE_PHONE].allItems.empty()) uiReload(PANE_PHONE);
+                 break;
+        case 12:
+            gDualPane = !gDualPane;
+            if (gDualPane && gPane[PANE_PC].items.empty()) uiReload(PANE_PC);
+            if (gDualPane && gPane[PANE_PHONE].items.empty()) uiReload(PANE_PHONE);
+            break;
+        default: break;
+    }
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
+static void uiRunLink(int id) {
+    switch (id) {
+        case 0:
+            triggerTransportRescan();
+            uiToast(L"Re-scanning USB, Wi-Fi, hotspot, online relay and Bluetooth\u2026", 3500);
+            break;
+        case 1:
+            mountZDriveAsync();
+            uiToast(L"Mounting Z: \u2192 http://127.0.0.1:4173/dav");
+            break;
+        case 2:
+            ShellExecuteW(gMainHwnd, L"open", L"Z:\\", nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case 3:
+            std::thread([]() {
+                ShortcutResult sc = createDesktopShortcut();
+                uiToast(uiUtf8ToWide(sc.message), 6000);
+            }).detach();
+            break;
+        case 4:
+            hubShow();
+            break;
+        case 5:
+            std::thread([]() {
+                uiToast(L"Checking for a newer ChainIt-Windows.exe\u2026", 2500);
+                AppUpdateResult r = performAppUpdate();
+                uiToast(uiUtf8ToWide(r.message.empty() ? "Update finished." : r.message), 8000);
+                if (r.restart) {
+                    MessageBoxW(gMainHwnd, uiUtf8ToWide(r.message).c_str(), L"ChainIt update", MB_OK | MB_ICONINFORMATION);
+                    gRunning.store(false);
+                    Shell_NotifyIconW(NIM_DELETE, &gNid);
+                    ExitProcess(0);
+                }
+            }).detach();
+            break;
+        case 6: {
+            std::string key;
+            { std::lock_guard<std::mutex> lk(gState.mtx); key = gState.siblingKey; }
+            if (OpenClipboard(gMainHwnd)) {
+                EmptyClipboard();
+                const std::wstring w = uiUtf8ToWide(key);
+                HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
+                if (g) {
+                    wchar_t* p = static_cast<wchar_t*>(GlobalLock(g));
+                    if (p) { memcpy(p, w.c_str(), (w.size() + 1) * sizeof(wchar_t)); GlobalUnlock(g); }
+                    SetClipboardData(CF_UNICODETEXT, g);
+                }
+                CloseClipboard();
+            }
+            uiToast(L"Pairing key copied \u2014 paste the same value into ChainIt on the phone.");
+            break;
+        }
+        default: break;
+    }
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
+// --- context menu -----------------------------------------------------------
+// A real right-click menu: TrackPopupMenu with TPM_RETURNCMD returns the chosen
+// id straight back, so nothing has to be routed through WM_COMMAND.
+
+/** screenPt anchors the menu for a keyboard invocation (Shift+F10 / menu key),
+ *  where the cursor may be nowhere near the focused row. */
+static void uiShowContextMenu(HWND hwnd, int pane, int row, const POINT* screenPt = nullptr) {
+    if (row >= 0 && pane >= 0) {
+        UiList& l = gPane[pane];
+        if (row < (int)l.items.size() && !l.selected[row]) {
+            l.selected.assign(l.items.size(), 0);
+            l.selected[row] = 1;
+            l.anchor = row;
+            l.focused = row;
+        }
+    }
+    gActivePane = pane;
+
+    const std::vector<int> sel = uiSelectedIndices(gPane[pane]);
+    const bool one = (sel.size() == 1);
+    const bool any = !sel.empty();
+
+    HMENU m = CreatePopupMenu();
+    auto add = [&](UINT id, const wchar_t* text, bool enable, bool check = false) {
+        UINT f = MF_STRING | (enable ? MF_ENABLED : MF_GRAYED);
+        if (check) f |= MF_CHECKED;
+        AppendMenuW(m, f, id, text);
+    };
+    if (row >= 0) {
+        add(1, L"Open", one);
+        if (pane == PANE_PC) {
+            add(12, L"Open in Explorer", one);
+            add(2, L"Send to phone  \u2192", any);
+        } else {
+            add(3, L"\u2190  Save to PC", any);
+            add(4, L"Save to Downloads folder", any);
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        add(8, L"Rename\tF2", one);
+        add(9, L"Delete\tDel", any);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    add(5, L"Cut\tCtrl+X", any);
+    add(6, L"Copy\tCtrl+C", any);
+    add(7, L"Paste\tCtrl+V", !gClipboardPaths.empty());
+    add(10, L"New folder\tCtrl+Shift+N", true);
+    add(11, L"Refresh\tF5", true);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    add(13, L"Split view", true, gDualPane);
+
+    POINT pt{};
+    if (screenPt) pt = *screenPt;
+    else GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    const UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    InvalidateRect(hwnd, nullptr, FALSE);
+
+    switch (cmd) {
+        case 1:  uiOpOpen(pane, row); break;
+        case 2:  uiOpTransfer(PANE_PC, false); break;
+        case 3:  uiOpTransfer(PANE_PHONE, false); break;
+        case 4:  uiOpDownloadToPc(pane); break;
+        case 5:  uiOpSetClipboard(pane, L"move"); break;
+        case 6:  uiOpSetClipboard(pane, L"copy"); break;
+        case 7:  uiOpPaste(pane); break;
+        case 8:  uiOpRename(pane); break;
+        case 9:  uiOpDelete(pane); break;
+        case 10: uiOpNewFolder(pane); break;
+        case 11: uiReloadBoth(); break;
+        case 12: {
+            const std::vector<int> s2 = uiSelectedIndices(gPane[pane]);
+            if (s2.size() == 1) {
+                const fs::path real = uiRealPcPath(gPane[pane].items[s2[0]].path);
+                if (gPane[pane].items[s2[0]].isDir) {
+                    ShellExecuteW(hwnd, L"open", real.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                } else {
+                    std::wstring args = L"/select,\"" + real.wstring() + L"\"";
+                    ShellExecuteW(hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+                }
+            }
+            break;
+        }
+        case 13: uiRunTool(12); break;
+        default: break;
+    }
+}
+
+// --- keyboard ---------------------------------------------------------------
+
+static void uiMoveFocus(int pane, int delta, bool shift, bool ctrl) {
+    UiList& l = gPane[pane];
+    if (l.items.empty()) return;
+    int next = l.focused < 0 ? 0 : l.focused + delta;
+    if (next < 0) next = 0;
+    if (next >= static_cast<int>(l.items.size())) next = static_cast<int>(l.items.size()) - 1;
+    l.focused = next;
+    if (!ctrl) {
+        if (!shift) l.selected.assign(l.items.size(), 0);
+        if (shift && l.anchor >= 0) {
+            l.selected.assign(l.items.size(), 0);
+            const int a = (std::min)(l.anchor, next), b = (std::max)(l.anchor, next);
+            for (int i = a; i <= b; ++i) l.selected[i] = 1;
+        } else {
+            l.selected[next] = 1;
+            l.anchor = next;
+        }
+    }
+    // keep the focus row visible
+    const int slot = uiPaneSlot(gLayout, pane);
+    if (slot >= 0) {
+        const RECT lr = gLayout.list[slot];
+        const int h = lr.bottom - lr.top;
+        const int top = next * kRowH;
+        if (top < l.scroll) l.scroll = top;
+        else if (top + kRowH > l.scroll + h) l.scroll = top + kRowH - h;
+    }
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
+static void uiSelectAll(int pane) {
+    UiList& l = gPane[pane];
+    l.selected.assign(l.items.size(), 1);
+    if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
+static bool uiOnKey(HWND hwnd, UINT vk, bool ctrl, bool shift, bool alt) {
+    const int pane = gActivePane;
+    if (gTab != TAB_FILES) {
+        if (vk == VK_F5) { triggerTransportRescan(); uiReloadBoth(); return true; }
+        if (vk == '1') { gTab = TAB_FILES; InvalidateRect(hwnd, nullptr, FALSE); return true; }
+        if (vk == '2') { gTab = TAB_LINK; InvalidateRect(hwnd, nullptr, FALSE); return true; }
+        if (vk == '3') { gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true; }
+        return false;
+    }
+    switch (vk) {
+        case VK_UP:    uiMoveFocus(pane, -1, shift, ctrl); return true;
+        case VK_DOWN:  uiMoveFocus(pane, +1, shift, ctrl); return true;
+        case VK_PRIOR: uiMoveFocus(pane, -14, shift, ctrl); return true;
+        case VK_NEXT:  uiMoveFocus(pane, +14, shift, ctrl); return true;
+        case VK_HOME:  uiMoveFocus(pane, -(int)gPane[pane].items.size(), shift, ctrl); return true;
+        case VK_END:   uiMoveFocus(pane, (int)gPane[pane].items.size(), shift, ctrl); return true;
+        case VK_RETURN:
+            if (alt) { uiOpRename(pane); return true; }
+            uiOpOpen(pane, gPane[pane].focused);
+            return true;
+        case VK_BACK:
+            // While a filter is active Backspace edits it; otherwise it goes up a
+            // level, which is what Explorer does.
+            if (!gPane[pane].filter.empty()) {
+                gPane[pane].filter.pop_back();
+                uiApplyFilter(gPane[pane]);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return true;
+            }
+            if (alt) { uiGoUp(pane); return true; }
+            uiGoUp(pane);
+            return true;
+        case VK_F2:    uiOpRename(pane); return true;
+        case VK_F5:    uiReloadBoth(); uiToast(L"Refreshing both panes\u2026", 1600); return true;
+        case VK_F6:    gActivePane = (pane == PANE_PC) ? PANE_PHONE : PANE_PC;
+                       if (gPane[gActivePane].items.empty()) uiReload(gActivePane);
+                       InvalidateRect(hwnd, nullptr, FALSE); return true;
+        case VK_DELETE: uiOpDelete(pane); return true;
+        case VK_ESCAPE:
+            if (!gPane[pane].filter.empty()) {
+                gPane[pane].filter.clear();
+                uiApplyFilter(gPane[pane]);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return true;
+            }
+            gPane[pane].selected.assign(gPane[pane].items.size(), 0);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return true;
+        case 'A': if (ctrl) { uiSelectAll(pane); return true; } break;
+        case 'C': if (ctrl) { uiOpSetClipboard(pane, L"copy"); return true; } break;
+        case 'X': if (ctrl) { uiOpSetClipboard(pane, L"move"); return true; } break;
+        case 'V': if (ctrl) { uiOpPaste(pane); return true; } break;
+        case 'N': if (ctrl && shift) { uiOpNewFolder(pane); return true; } break;
+        case 'F': if (ctrl) {
+                      gPane[pane].filter.clear();
+                      uiApplyFilter(gPane[pane]);
+                      uiToast(L"Type to filter this pane \u00B7 Esc clears it");
+                      return true;
+                  }
+                  break;
+        case 'T': if (ctrl) { gTab = (gTab + 1) % 3; InvalidateRect(hwnd, nullptr, FALSE); return true; } break;
+        case '1': gTab = TAB_FILES; InvalidateRect(hwnd, nullptr, FALSE); return true;
+        case '2': gTab = TAB_LINK; InvalidateRect(hwnd, nullptr, FALSE); return true;
+        case '3': gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true;
+        default: break;
+    }
+    return false;
+}
+
+// --- window proc ------------------------------------------------------------
+
+static std::wstring gLastSeenPhoneIp;
+
+static void uiTickAutoLink(HWND hwnd) {
+    std::string ip = uiCurrentPhoneIp();
+    const std::wstring w = uiUtf8ToWide(ip);
+    if (w != gLastSeenPhoneIp) {
+        const bool appeared = gLastSeenPhoneIp.empty() && !w.empty();
+        gLastSeenPhoneIp = w;
+        if (appeared && gTab == TAB_FILES) {
+            UiLinkInfo s = uiLinkInfo();
+            uiToast(L"Phone linked over " + uiTransportPretty(s.transport) + L" \u2014 reading Z:\\", 5000);
+            uiLoadPaneAsync(PANE_PHONE, gPane[PANE_PHONE].dir);
+        }
+    }
+    if (nowMs() > gMainToastUntil.load() && !gMainToast.empty()) {
+        gMainToast.clear();
+    }
+    if (gTab != TAB_FILES || !gMainToast.empty()) InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE:
+            gMainHwnd = hwnd;
+            uiFontsInit();
+            SetTimer(hwnd, 1, 1000, nullptr);
+            return 0;
+
+        case WM_ERASEBKGND:
+            return 1;   // fully double-buffered below
+
+        case WM_SIZE:
+            gLayout = uiComputeLayout(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == 1) { uiTickAutoLink(hwnd); return 0; }
+            if (wParam == 2) {
+                // toast lifetime expired
+                gMainToast.clear();
+                KillTimer(hwnd, 2);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+
+        case WM_UI_LISTDONE:
+            uiApplyListPayload(reinterpret_cast<ListPayload*>(lParam));
+            return 0;
+
+        case WM_UI_REFRESH:
+            uiReload(static_cast<int>(wParam));
+            return 0;
+
+        case WM_UI_REFRESH_ALL:
+            uiReloadBoth();
+            return 0;
+
+        case WM_UI_TOAST: {
+            ToastMsg* t = reinterpret_cast<ToastMsg*>(lParam);
+            if (!t) return 0;
+            gMainToast = t->text;
+            const int ms = (t->ms > 0) ? t->ms : 60;
+            delete t;
+            gMainToastUntil.store(nowMs() + ms);
+            SetTimer(hwnd, 2, static_cast<UINT>(ms), nullptr);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC wdc = BeginPaint(hwnd, &ps);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            const int cx = rc.right, cy = rc.bottom;
+            HDC dc = CreateCompatibleDC(wdc);
+            HBITMAP bmp = CreateCompatibleBitmap(wdc, (std::max)(1, cx), (std::max)(1, cy));
+            HGDIOBJ oldBmp = SelectObject(dc, bmp);
+            SetBkMode(dc, TRANSPARENT);
+
+            gLayout = uiComputeLayout(hwnd);
+            uiFill(dc, rc, kColBg);
+            uiPaintTabs(dc, gLayout);
+            uiPaintToolbar(dc, gLayout);
+            if (gTab == TAB_FILES) {
+                for (int slot = 0; slot < gLayout.panes; ++slot) {
+                    const int paneId = gLayout.paneId[slot];
+                    uiPaintPaneChrome(dc, gLayout, slot, paneId);
+                    uiPaintPaneRows(dc, gLayout, slot, paneId);
+                }
+                if (gLayout.dual) uiLine(dc, cx / 2, gLayout.pane[0].top, cx / 2, gLayout.pane[0].bottom, kColLine);
+            } else if (gTab == TAB_LINK) {
+                uiPaintLinkTab(dc, gLayout);
+            } else {
+                uiPaintAboutTab(dc, gLayout);
+            }
+            uiPaintStatus(dc, gLayout);
+            uiPaintToast(dc, gLayout);
+
+            BitBlt(wdc, 0, 0, cx, cy, dc, 0, 0, SRCCOPY);
+            SelectObject(dc, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE: {
+            const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+            const UiHit h = uiHitTest(gLayout, x, y);
+            int tool = -1, link = -1;
+            if (h.kind == HIT_TOOL) tool = h.id;
+            if (h.kind == HIT_LINK) link = h.id;
+            bool changed = (tool != gToolHover) || (link != gLinkHover);
+            gToolHover = tool;
+            gLinkHover = link;
+
+            HCURSOR cur = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+            if (h.kind == HIT_TAB || h.kind == HIT_TOOL || h.kind == HIT_LINK || h.kind == HIT_HEAD || h.kind == HIT_ROW)
+                cur = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_HAND));
+            SetCursor(cur);
+
+            for (int slot = 0; slot < gLayout.panes; ++slot) {
+                UiList& l = gPane[gLayout.paneId[slot]];
+                const int row = (h.kind == HIT_ROW && h.pane == gLayout.paneId[slot]) ? h.row : -1;
+                if (l.hover != row) { l.hover = row; changed = true; }
+            }
+            if (changed) InvalidateRect(hwnd, nullptr, FALSE);
+
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            gToolHover = -1;
+            gLinkHover = -1;
+            for (int i = 0; i < 2; ++i) gPane[i].hover = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+
+        case WM_LBUTTONDOWN: {
+            const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+            const UiHit h = uiHitTest(gLayout, x, y);
+            SetFocus(hwnd);
+            if (h.kind == HIT_TAB) {
+                if (gTab != h.id) { gTab = h.id; InvalidateRect(hwnd, nullptr, FALSE); }
+                return 0;
+            }
+            if (h.kind == HIT_TOOL) {
+                if (gLayout.tools[h.id].enabled) uiRunTool(gLayout.tools[h.id].id);
+                return 0;
+            }
+            if (h.kind == HIT_LINK) { uiRunLink(h.id); return 0; }
+            if (h.pane >= 0 && h.pane != gActivePane) {
+                gActivePane = h.pane;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (h.kind == HIT_HEAD) {
+                UiList& l = gPane[h.pane];
+                if (l.sortKey == h.col) l.sortDesc = !l.sortDesc;
+                else { l.sortKey = h.col; l.sortDesc = false; }
+                uiSortList(l);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (h.kind == HIT_ROW) {
+                UiList& l = gPane[h.pane];
+                const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+                const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                if (ctrl) {
+                    l.selected[h.row] = l.selected[h.row] ? 0 : 1;
+                    l.anchor = h.row;
+                    l.focused = h.row;
+                } else if (shift && l.anchor >= 0) {
+                    l.selected.assign(l.items.size(), 0);
+                    const int a = (std::min)(l.anchor, h.row), b = (std::max)(l.anchor, h.row);
+                    for (int i = a; i <= b; ++i) l.selected[i] = 1;
+                    l.focused = h.row;
+                } else {
+                    l.selected.assign(l.items.size(), 0);
+                    l.selected[h.row] = 1;
+                    l.anchor = h.row;
+                    l.focused = h.row;
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (h.kind == HIT_PANE) {
+                UiList& l = gPane[h.pane];
+                l.selected.assign(l.items.size(), 0);
+                l.focused = -1;
+                l.anchor = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONDBLCLK: {
+            const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+            const UiHit h = uiHitTest(gLayout, x, y);
+            if (h.kind == HIT_ROW) uiOpOpen(h.pane, h.row);
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ScreenToClient(hwnd, &p);
+            const UiHit h = uiHitTest(gLayout, p.x, p.y);
+            const int pane = (h.pane >= 0) ? h.pane : gActivePane;
+            UiList& l = gPane[pane];
+            const int slot = uiPaneSlot(gLayout, pane);
+            const int height = (slot >= 0) ? (gLayout.list[slot].bottom - gLayout.list[slot].top) : 400;
+            const int maxScroll = (std::max)(0, static_cast<int>(l.items.size()) * kRowH - height);
+            l.scroll += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? -3 * kRowH : 3 * kRowH;
+            if (l.scroll < 0) l.scroll = 0;
+            if (l.scroll > maxScroll) l.scroll = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_CONTEXTMENU: {
+            // Shift+F10 and the menu key arrive with lParam == -1; anchor the menu
+            // on the focused row instead of on an unusable screen coordinate.
+            if (lParam == static_cast<LPARAM>(-1)) {
+                const int slot = uiPaneSlot(gLayout, gActivePane);
+                if (slot < 0) return 0;
+                const UiList& l = gPane[gActivePane];
+                const int row = l.focused;
+                int y = gLayout.list[slot].top + 12;
+                if (row >= 0) y = gLayout.list[slot].top - l.scroll + row * kRowH + kRowH / 2;
+                POINT sp{gLayout.list[slot].left + 60, y};
+                ClientToScreen(hwnd, &sp);
+                uiShowContextMenu(hwnd, gActivePane, row, &sp);
+                return 0;
+            }
+            POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+            ScreenToClient(hwnd, &p);
+            const UiHit h = uiHitTest(gLayout, p.x, p.y);
+            if (h.pane >= 0) uiShowContextMenu(hwnd, h.pane, h.row);
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+            const UiHit h = uiHitTest(gLayout, x, y);
+            if (h.pane >= 0) uiShowContextMenu(hwnd, h.pane, h.row);
+            return 0;
+        }
+
+        case WM_CHAR: {
+            // Type-ahead filter, exactly like Explorer: printable characters narrow
+            // the active pane's list until Esc clears it.
+            if (gTab != TAB_FILES) return 0;
+            const wchar_t ch = static_cast<wchar_t>(wParam);
+            if (ch < 32) return 0;   // handled as keys (Enter, Backspace, Esc, Tab)
+            if (GetKeyState(VK_CONTROL) & 0x8000) return 0;
+            UiList& l = gPane[gActivePane];
+            if (l.filter.size() < 64) l.filter.push_back(ch);
+            uiApplyFilter(l);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        case WM_KEYDOWN:
+        case WM_SYSKEYDOWN: {
+            const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            if (uiOnKey(hwnd, static_cast<UINT>(wParam), ctrl, shift, alt)) return 0;
+            break;
+        }
+
+        case WM_GETMINMAXINFO: {
+            MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize.x = 720;
+            mmi->ptMinTrackSize.y = 480;
+            return 0;
+        }
+
+        case WM_CLOSE:
+            // ChainIt is a resident service: closing the window keeps the engine,
+            // the tray icon and Z:\ alive, exactly like the hub window does.
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+
+        case WM_DESTROY:
+            KillTimer(hwnd, 1);
+            KillTimer(hwnd, 2);
+            if (gMainHwnd == hwnd) gMainHwnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// --- window creation --------------------------------------------------------
+
+/** Creates (or re-shows) ChainIt's own native File Manager window. Nothing here
+ *  touches a browser: this window is the app, and its taskbar button is ours. */
+static void showNativeMainWindow() {
+    if (gMainHwnd && IsWindow(gMainHwnd)) {
+        if (IsIconic(gMainHwnd)) ShowWindow(gMainHwnd, SW_RESTORE);
+        ShowWindow(gMainHwnd, SW_SHOW);
+        SetForegroundWindow(gMainHwnd);
+        uiReloadBoth();
+        return;
+    }
+
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    gMainInstance = inst;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // The .ico carries 16..256 px, so load the exact sizes the shell wants rather
+    // than stretching the 32 px default: crisp caption glyph, crisp taskbar button.
+    if (!gMainIcon)   gMainIcon   = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
+    if (!gMainIconSm) gMainIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+    if (!gMainIconLg) gMainIconLg = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 64, 64, LR_DEFAULTCOLOR));
+    if (!gMainIcon)   gMainIcon   = LoadIconW(inst, MAKEINTRESOURCEW(1));
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = MainWndProc;
+    wc.hInstance = inst;
+    wc.hIcon = gMainIcon;
+    wc.hIconSm = gMainIconSm ? gMainIconSm : gMainIcon;
+    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
+    wc.hbrBackground = nullptr;
+    wc.lpszClassName = kMainClass;
+    if (!GetClassInfoExW(inst, kMainClass, &wc)) RegisterClassExW(&wc);
+
+    // One taskbar identity for the whole process, so every ChainIt window groups
+    // under a single button wearing the chain-link icon.
+    typedef HRESULT(WINAPI * SetAumidFn)(PCWSTR);
+    if (HMODULE shell32 = GetModuleHandleW(L"shell32.dll")) {
+        if (auto fn = reinterpret_cast<SetAumidFn>(GetProcAddress(shell32, "SetCurrentProcessExplicitAppUserModelID")))
+            fn(L"ChainIt.Sibling.Hub");
+    }
+
+    const int sw = GetSystemMetrics(SM_CXSCREEN);
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    const int w = (std::min)(1380, sw - 80);
+    const int hgt = (std::min)(860, sh - 100);
+
+    HWND hwnd = CreateWindowExW(
+        0, kMainClass, L"ChainIt \u2014 File Manager",
+        WS_OVERLAPPEDWINDOW,
+        (sw - w) / 2, (sh - hgt) / 2, w, hgt,
+        nullptr, nullptr, inst, nullptr);
+
+    if (!hwnd) {
+        // Absolute last resort: never fall back to a browser window.
+        MessageBoxW(nullptr, L"ChainIt could not create its window.", L"ChainIt", MB_ICONERROR);
+        return;
+    }
+
+    gMainHwnd = hwnd;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(gMainIcon));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(gMainIconSm ? gMainIconSm : gMainIcon));
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, reinterpret_cast<LPARAM>(gMainIconSm ? gMainIconSm : gMainIcon));
+
+    ShowWindow(hwnd, SW_SHOWNORMAL);
+    UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd);
+
+    uiFontsInit();
+    gLayout = uiComputeLayout(hwnd);
+    if (gPane[PANE_PC].items.empty() && gPane[PANE_PC].dir.empty()) gPane[PANE_PC].dir = L"/";
+    if (gPane[PANE_PHONE].dir.empty()) gPane[PANE_PHONE].dir = L"/";
+    uiReloadBoth();
+}
+
+/** Kept as the single entry point the tray menu, the hub window and the
+ *  single-instance hand-off already call. It used to launch Edge in app mode;
+ *  that is exactly what put a browser globe on the taskbar, so it now opens the
+ *  native window instead. */
+static void launchDesktopUiWindow() { showNativeMainWindow(); }
 
 static HWND createHubWindow(HINSTANCE hInstance, HICON icon) {
     gHubInstance = hInstance;
@@ -3338,7 +6122,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 hubShow();
                 break;
             case ID_TRAY_MINI:
-                launchMiniPanelWindow();
+                hubShow();
                 break;
             case ID_TRAY_SHORTCUT: {
                 std::thread([]() {
@@ -3464,7 +6248,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Prevent duplicate instances; if already running, just bring up the ChainIt File Manager window!
     HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ChainItSiblingEngineSingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        launchDesktopUiWindow();
+        // ChainIt is already running in another process. Creating a window here
+        // would give the user a File Manager with no engine behind it, so hand
+        // off to the live window and exit.
+        HWND live = FindWindowW(kMainClass, nullptr);
+        if (live) {
+            if (IsIconic(live)) ShowWindow(live, SW_RESTORE);
+            ShowWindow(live, SW_SHOW);
+            SetForegroundWindow(live);
+            PostMessageW(live, WM_UI_REFRESH_ALL, 0, 0);
+        } else if (HWND hubLive = FindWindowW(kHubClass, nullptr)) {
+            ShowWindow(hubLive, SW_SHOW);
+            SetForegroundWindow(hubLive);
+        }
+        if (hMutex) CloseHandle(hMutex);
         return 0;
     }
 
@@ -3533,17 +6330,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wcsncpy_s(gNid.szTip, L"ChainIt Sibling — Auto-Connect & Z:\\ Drive", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &gNid);
 
-    // Native hub window first: it owns ChainIt's taskbar button and shows the
-    // chain-link icon while the app is running.
+    // The mini hub is created up front (it registers its class and pins the
+    // process AppUserModelID) but stays hidden: the native File Manager is now
+    // the window that owns ChainIt's taskbar button, so showing both at startup
+    // would just stack two ChainIt windows on top of each other. The hub remains
+    // one tray double-click away, and the Link tab has a button for it too.
     HWND hub = createHubWindow(hInstance, gNid.hIcon);
-    if (hub) {
-        ShowWindow(hub, SW_SHOWNORMAL);
-        UpdateWindow(hub);
-    }
+    (void)hub;
 
-    // Give HTTP server 150ms to bind, then open the full web File Manager
+    // The HTTP server keeps running for Z:\, the phone and the WebSocket clients,
+    // but the File Manager the user sees is this process's own native window.
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    launchDesktopUiWindow();
+    showNativeMainWindow();
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

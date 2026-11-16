@@ -23,6 +23,7 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import com.chainit.android.BuildConfig
 import com.chainit.android.ChainItApp
 import com.chainit.android.R
 import com.chainit.android.net.BluetoothRfcommTransport
@@ -65,6 +66,7 @@ class MainActivity : Activity() {
     private lateinit var rowBluetooth: SetupRow
     private lateinit var endpointsText: TextView
     private lateinit var pcStatusText: TextView
+    private var btStatusText: TextView? = null
     private lateinit var pcIpInput: android.widget.EditText
     private lateinit var keyInput: android.widget.EditText
     private lateinit var updateTitle: TextView
@@ -429,9 +431,35 @@ class MainActivity : Activity() {
 
     private fun buildFooter(): View {
         val col = Ds.col(this)
-        col.addView(Ds.text(this, "ChainIt Sibling • offline-first by design", 11f, Ds.textMuted, medium = true).apply {
+
+        // Attribution - the same credit the Windows app shows on its About tab.
+        col.addView(
+            Ds.text(this, "Built by Qmer", 13f, Ds.accentSoft, bold = true).apply {
+                gravity = Gravity.CENTER
+                letterSpacing = 0.04f
+            }
+        )
+        col.addView(
+            Ds.text(
+                this,
+                "ChainIt Sibling v" + BuildConfig.VERSION_LABEL + " (build " + BuildConfig.VERSION_CODE +
+                    ")  •  offline-first by design",
+                11f,
+                Ds.textMuted,
+                medium = true
+            ).apply {
+                gravity = Gravity.CENTER
+                layoutParams = Ds.lp(this@MainActivity, topDp = 3f)
+            }
+        )
+
+        // Live Bluetooth readout: proves RFCOMM is serving Z:\ rather than merely "connected".
+        btStatusText = Ds.text(this, "Bluetooth RFCOMM: starting…", 10.5f, Ds.textSecondary, mono = true).apply {
             gravity = Gravity.CENTER
-        })
+            layoutParams = Ds.lp(this@MainActivity, topDp = 7f)
+            setLineSpacing(0f, 1.25f)
+        }
+        col.addView(btStatusText)
         col.addView(
             Ds.text(
                 this,
@@ -569,6 +597,42 @@ class MainActivity : Activity() {
         metricStorage.setTextColor(if (storageOk) Ds.textPrimary else Ds.amber)
         val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
         metricScreen.text = if (!pm.isInteractive || keyguard.isKeyguardLocked) "Locked • served" else "On"
+
+        // Bluetooth is a full Z:\ transport, not a one-shot file push - show that it is really serving.
+        btStatusText?.let { tv ->
+            val listening = SiblingDaemonService.isBluetoothListening()
+            val mode = SiblingDaemonService.bluetoothListenMode()
+            val sessions = SiblingDaemonService.bluetoothSessions()
+            val served = SiblingDaemonService.servedRequests()
+            val open = SiblingDaemonService.openVfsSessions()
+            val beats = SiblingDaemonService.heartbeatsSurvived()
+            val err = SiblingDaemonService.bluetoothLastError()
+            val text = when {
+                listening -> buildString {
+                    append("Bluetooth RFCOMM: LIVE (")
+                    append(mode)
+                    append(" channel)  •  ")
+                    append(sessions)
+                    append(" session(s) accepted  •  ")
+                    append(open)
+                    append(" keep-alive open now")
+                    append("\nVFS requests served: ")
+                    append(served)
+                    append("  •  Doze heartbeats survived: ")
+                    append(beats)
+                }
+                err != null -> "Bluetooth RFCOMM: re-arming — $err"
+                else -> "Bluetooth RFCOMM: $mode"
+            }
+            tv.text = text
+            tv.setTextColor(
+                when {
+                    listening -> Ds.accentSoft
+                    err != null -> Ds.amber
+                    else -> Ds.textMuted
+                }
+            )
+        }
     }
 
     private fun tintBg(fg: Int): Int {

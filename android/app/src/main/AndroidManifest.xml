@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.chainit.android"
-    android:versionCode="4"
-    android:versionName="1.3.0">
+    android:versionCode="6"
+    android:versionName="1.5.0">
 
     <uses-sdk
         android:minSdkVersion="26"
@@ -34,6 +34,11 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- connectedDevice is the un-capped foreground type: a dataSync service is stopped by
+         Android 14 after ~6 h, which is why a phone locked overnight used to drop the link. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Doze heartbeat that keeps the VFS + RFCOMM listeners armed while the screen is off -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- In-place self update: the new APK replaces the installed build (same package + same key) -->
@@ -65,7 +70,7 @@
             android:name=".service.SiblingDaemonService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="connectedDevice|dataSync" />
 
         <receiver
             android:name=".receiver.BootAndBleWakeReceiver"
