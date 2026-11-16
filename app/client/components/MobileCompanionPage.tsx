@@ -66,7 +66,7 @@ export const MobileCompanionPage: React.FC<Props> = ({
         <div className="flex items-center justify-between">
           <button
             onClick={onBackToDesktop}
-            className="inline-flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200"
+            className="inline-flex items-center gap-1.5 ci-body hover:text-slate-200"
           >
             <ArrowLeft className="w-3.5 h-3.5" /> Switch to Windows Desktop View
           </button>

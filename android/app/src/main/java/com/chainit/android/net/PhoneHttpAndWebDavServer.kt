@@ -8,6 +8,7 @@ import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import com.chainit.android.vfs.AndroidStorageVfsProvider
+import com.chainit.android.vfs.FileOps
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -215,7 +216,7 @@ class PhoneHttpAndWebDavServer(
             pathPart == "/chainit/upload" && method == "POST" -> {
                 val dir = uri.getQueryParameter("dir") ?: "/ChainIt_Inbox"
                 val rawName = uri.getQueryParameter("filename") ?: "received_${System.currentTimeMillis()}.bin"
-                val safeName = File(rawName).name.replace(Regex("[<>:\"/\\\\|?*]"), "_")
+                val safeName = FileOps.sanitizeName(File(rawName).name)
                 val dirFile = vfs.resolveSafe(dir)
                 dirFile.mkdirs()
                 val dest = File(dirFile, safeName)
@@ -369,7 +370,7 @@ $responses
                     sendSimpleResponse(output, 404, "Not Found", "text/plain", ByteArray(0), extraHeaders)
                     return
                 }
-                targetFile.deleteRecursively()
+                FileOps.deleteRecursive(targetFile)
                 lastActivitySummary = "WebDAV Delete ${targetFile.name}"
                 sendSimpleResponse(output, 204, "No Content", "text/plain", ByteArray(0), extraHeaders)
             }
@@ -381,12 +382,12 @@ $responses
                 val existed = destFile.exists()
                 destFile.parentFile?.mkdirs()
                 if (method == "COPY") {
-                    targetFile.copyRecursively(destFile, overwrite = true)
+                    FileOps.copyRecursive(targetFile, destFile)
                 } else {
-                    if (existed) destFile.deleteRecursively()
+                    if (existed) FileOps.deleteRecursive(destFile)
                     if (!targetFile.renameTo(destFile)) {
-                        targetFile.copyRecursively(destFile, overwrite = true)
-                        targetFile.deleteRecursively()
+                        FileOps.copyRecursive(targetFile, destFile)
+                        FileOps.deleteRecursive(targetFile)
                     }
                 }
                 lastActivitySummary = "WebDAV $method ${destFile.name}"

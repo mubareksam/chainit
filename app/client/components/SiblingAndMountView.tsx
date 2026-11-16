@@ -75,7 +75,7 @@ export const SiblingAndMountView: React.FC<Props> = ({ snapshot, onSnapshot, not
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
       {/* Left: Sibling Mode Cryptographic Trust & Zero-Touch Policies */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 space-y-5">
+      <div className="ci-card-pad space-y-5">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
             <div
@@ -91,7 +91,7 @@ export const SiblingAndMountView: React.FC<Props> = ({ snapshot, onSnapshot, not
               <h2 className="text-base font-semibold text-slate-100">
                 Sibling Mode — Zero-Touch Device Bond
               </h2>
-              <p className="text-xs text-slate-400">
+              <p className="ci-body">
                 Paired Peer: <strong className="text-slate-200">{snapshot.sibling.peerDeviceName}</strong> (
                 {snapshot.sibling.peerModel} • {snapshot.sibling.peerAndroidVersion})
               </p>
@@ -186,7 +186,7 @@ export const SiblingAndMountView: React.FC<Props> = ({ snapshot, onSnapshot, not
       </div>
 
       {/* Right: Windows Z:\ Virtual Drive Mount & Live WebDAV Inspector */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 space-y-5">
+      <div className="ci-card-pad space-y-5">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="p-2.5 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-400">
@@ -196,7 +196,7 @@ export const SiblingAndMountView: React.FC<Props> = ({ snapshot, onSnapshot, not
               <h2 className="text-base font-semibold text-slate-100">
                 Windows File Explorer Z:\ Drive Integration
               </h2>
-              <p className="text-xs text-slate-400">
+              <p className="ci-body">
                 Mount phone storage natively in <code className="text-slate-200">explorer.exe</code> alongside the
                 dedicated ChainIt File Manager
               </p>

@@ -1,41 +1,63 @@
-import React from 'react';
-import { CheckCircle2, Download, Laptop, ShieldCheck, Smartphone, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle2, Download, Laptop, RefreshCw, ShieldCheck, Smartphone, X } from 'lucide-react';
+import { api } from '../api/client';
 
 interface Props {
   onClose: () => void;
 }
 
 export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
+  const [version, setVersion] = useState<{ version: string; runtime: string } | null>(null);
+  const [updateMsg, setUpdateMsg] = useState<string>('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    api.appVersion().then(setVersion).catch(() => setVersion(null));
+  }, []);
+
+  const runUpdate = async () => {
+    setBusy(true);
+    setUpdateMsg('Checking the release server…');
+    try {
+      const res = await api.checkForUpdate();
+      setUpdateMsg(res.message);
+    } catch (err) {
+      setUpdateMsg(err instanceof Error ? err.message : 'Update check failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4"
+      className="ci-modal-backdrop"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden"
+        className="ci-modal max-w-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-950/70">
+        <div className="ci-card-head">
           <div className="flex items-center gap-2.5">
             <ShieldCheck className="w-5 h-5 text-emerald-400" />
             <div>
               <h2 className="text-base font-bold text-white">
                 Download ChainIt Final Installers (.exe & .apk)
               </h2>
-              <p className="text-xs text-slate-400">
+              <p className="ci-body">
                 Standalone zero-dependency binaries for Windows 10/11 & Android 8–15
               </p>
             </div>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+            className="ci-btn-icon"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        <div className="p-5 space-y-5 max-h-[82vh] overflow-y-auto">
+        <div className="ci-scroll p-5 space-y-5 max-h-[82vh] overflow-y-auto">
           {/* Two Download Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="rounded-2xl border border-cyan-500/30 bg-cyan-950/15 p-4 flex flex-col justify-between space-y-4">
@@ -44,7 +66,7 @@ export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
                   <Laptop className="w-5 h-5" />
                 </div>
                 <h3 className="text-sm font-bold text-white">ChainIt for Windows (64-bit)</h3>
-                <p className="text-xs text-slate-400 leading-relaxed">
+                <p className="ci-body leading-relaxed">
                   Single portable <code className="text-cyan-300">ChainIt-Windows.exe</code>. Includes
                   System Tray daemon, Smart Link auto-discovery, automatic <code className="text-cyan-300">Z:\</code>{' '}
                   Explorer drive mounter, and the dedicated ChainIt File Manager.
@@ -66,7 +88,7 @@ export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
                   <Smartphone className="w-5 h-5" />
                 </div>
                 <h3 className="text-sm font-bold text-white">ChainIt Sibling for Android</h3>
-                <p className="text-xs text-slate-400 leading-relaxed">
+                <p className="ci-body leading-relaxed">
                   Signed <code className="text-emerald-300">ChainIt-Android.apk</code> (Android 8–15).
                   Runs screen-off background Sibling VFS over USB Tethering, Wi-Fi LAN, or Local Hotspot
                   with zero prompts.
@@ -81,6 +103,38 @@ export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
                 Download ChainIt-Android.apk
               </a>
             </div>
+          </div>
+
+          {/* In-place update */}
+          <div className="ci-inset p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h4 className="ci-h2 flex items-center gap-2">
+                  <RefreshCw className="w-4 h-4 text-[var(--ci-accent)]" />
+                  Update ChainIt in place
+                </h4>
+                <p className="ci-muted mt-1">
+                  Installed:{' '}
+                  <code className="text-[var(--ci-accent-soft)]">
+                    v{version ? version.version : '…'}
+                  </code>{' '}
+                  {version ? `· ${version.runtime === 'windows-native' ? 'Windows native engine' : 'browser preview engine'}` : ''}
+                </p>
+              </div>
+              <button type="button" className="ci-btn-ghost" onClick={() => void runUpdate()} disabled={busy}>
+                <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
+                {busy ? 'Working…' : 'Check for update'}
+              </button>
+            </div>
+            <p className="ci-body">
+              Updates <strong className="text-[var(--ci-text)]">replace</strong> the existing app — the
+              Windows binary swaps itself and restarts, and the Android APK upgrades over the installed
+              build with the same signing key, so you never end up with two copies and your Sibling key,
+              paired links and permissions are kept.
+            </p>
+            {updateMsg && (
+              <div className="ci-inset px-3 py-2 ci-body text-[var(--ci-accent-soft)]">{updateMsg}</div>
+            )}
           </div>
 
           {/* 3-Minute Setup Checklist */}

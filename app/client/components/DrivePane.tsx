@@ -366,18 +366,18 @@ export const DrivePane: React.FC<Props> = ({
         if (e.currentTarget === e.target) setIsDragOverPane(false);
       }}
       onDrop={(e) => void handleDropOnDir(e, currentDir)}
-      className={`relative flex flex-col rounded-2xl border bg-slate-900/90 transition-all overflow-hidden min-h-[540px] ${
+      className={`ci-card-flush relative flex flex-col transition-all min-h-[540px] ${
         isDragOverPane
-          ? 'border-emerald-400 ring-2 ring-emerald-500/30'
+          ? 'border-[var(--ci-accent)] ring-2 ring-[rgba(16,185,129,0.28)]'
           : isFocused
             ? isPhone
-              ? 'border-emerald-500/50 shadow-lg shadow-emerald-950/30'
-              : 'border-cyan-500/50 shadow-lg shadow-cyan-950/30'
-            : 'border-slate-800/90'
+              ? 'border-[rgba(16,185,129,0.45)] shadow-[var(--ci-shadow)]'
+              : 'border-[rgba(34,211,238,0.42)] shadow-[var(--ci-shadow)]'
+            : ''
       }`}
     >
       {/* Drive Header */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 bg-slate-950/70 border-b border-slate-800/80">
+      <div className="ci-card-head flex-wrap">
         <div className="flex items-center gap-2.5 min-w-0">
           <div
             className={`p-2 rounded-xl border ${
@@ -390,12 +390,12 @@ export const DrivePane: React.FC<Props> = ({
           </div>
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-slate-800 text-slate-100">
+              <span className="ci-pill-off font-mono normal-case tracking-normal text-[11px]">
                 {stats.driveLetter}\
               </span>
-              <h2 className="text-sm font-semibold text-slate-100 truncate">{stats.label}</h2>
+              <h2 className="ci-h2 truncate">{stats.label}</h2>
             </div>
-            <p className="text-[11px] text-slate-400">
+            <p className="ci-muted">
               {stats.folderCount} folders • {stats.fileCount} files •{' '}
               {isPhone ? 'Mounted via Sibling VFS (/dav)' : 'Local NVMe Workspace'}
             </p>
@@ -404,7 +404,7 @@ export const DrivePane: React.FC<Props> = ({
 
         {/* Screen-off badge on Phone Drive */}
         {isPhone && snapshot.sibling.zDriveMounted && (
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/25 text-[11px] text-emerald-300">
+          <div className="ci-pill-ok">
             {snapshot.environment.phoneScreenLocked ? (
               <>
                 <Lock className="w-3 h-3" />
@@ -421,28 +421,28 @@ export const DrivePane: React.FC<Props> = ({
       </div>
 
       {/* Windows-style Path Bar & Search */}
-      <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-slate-900 border-b border-slate-800/70">
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 border-b border-[var(--ci-border-soft)] bg-[var(--ci-surface)]">
         <button
           onClick={goUp}
           disabled={currentDir === '/'}
-          className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 disabled:opacity-40 text-slate-200 transition"
+          className="ci-btn-icon border border-[var(--ci-border-soft)] bg-[var(--ci-bg-soft)] disabled:opacity-40"
           title="Up one folder"
         >
           <ArrowUp className="w-3.5 h-3.5" />
         </button>
         <button
           onClick={() => void loadDirectory()}
-          className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-700 text-slate-200 transition"
+          className="ci-btn-icon border border-[var(--ci-border-soft)] bg-[var(--ci-bg-soft)]"
           title="Refresh directory"
         >
           <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
         </button>
 
         {/* Breadcrumbs */}
-        <div className="flex-1 min-w-[180px] flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 overflow-x-auto text-xs font-mono">
+        <div className="ci-scroll flex-1 min-w-[180px] flex items-center gap-1 px-2 py-1 rounded-xl bg-[var(--ci-bg-soft)] border border-[var(--ci-border)] overflow-x-auto text-xs font-mono min-h-[34px]">
           <button
             onClick={() => onNavigate('/')}
-            className="text-slate-200 hover:text-cyan-400 font-semibold shrink-0"
+            className="ci-crumb shrink-0" data-active={false}
           >
             {stats.driveLetter}\
           </button>
@@ -453,7 +453,7 @@ export const DrivePane: React.FC<Props> = ({
                 <span className="text-slate-600">\</span>
                 <button
                   onClick={() => onNavigate(targetPath)}
-                  className="text-slate-300 hover:text-cyan-400 truncate max-w-[140px]"
+                  className="ci-crumb truncate max-w-[150px]"
                 >
                   {seg}
                 </button>
@@ -469,11 +469,11 @@ export const DrivePane: React.FC<Props> = ({
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter..."
-            className="w-full pl-8 pr-2 py-1 rounded-lg bg-slate-950 border border-slate-800 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-cyan-500/60"
+            className="ci-input pl-8 text-xs min-h-[34px] py-1.5"
           />
         </div>
 
-        <div className="flex rounded-lg border border-slate-800 bg-slate-950 p-0.5">
+        <div className="ci-nav p-0.5 rounded-lg">
           <button
             onClick={() => setViewMode('list')}
             className={`p-1 rounded ${
@@ -518,14 +518,14 @@ export const DrivePane: React.FC<Props> = ({
       </div>
 
       {/* Action Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-1.5 px-3 py-2 bg-slate-900/60 border-b border-slate-800/70 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-1.5 px-3 py-2 border-b border-[var(--ci-border-soft)] bg-[rgba(10,15,25,0.6)] text-xs">
         <div className="flex flex-wrap items-center gap-1">
           <button
             onClick={() => {
               setCreatingFolder(true);
               setNewFolderName('');
             }}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 transition"
+            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
           >
             <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
             <span>New Folder</span>
@@ -543,7 +543,7 @@ export const DrivePane: React.FC<Props> = ({
           />
           <button
             onClick={() => fileInputRef.current?.click()}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 transition"
+            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
             title="Drop or pick files from your computer"
           >
             <Upload className="w-3.5 h-3.5 text-cyan-400" />
@@ -557,7 +557,7 @@ export const DrivePane: React.FC<Props> = ({
               onSetClipboard({ op: 'copy', fromTarget: target, paths: selectedPaths, names });
               notify(`Copied ${selectedPaths.length} item(s)`, 'info');
             }}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-slate-200 transition"
+            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
             title="Copy (Ctrl+C)"
           >
             <Copy className="w-3.5 h-3.5" />
@@ -571,7 +571,7 @@ export const DrivePane: React.FC<Props> = ({
               onSetClipboard({ op: 'move', fromTarget: target, paths: selectedPaths, names });
               notify(`Cut ${selectedPaths.length} item(s)`, 'info');
             }}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-slate-200 transition"
+            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
             title="Cut / Move (Ctrl+X)"
           >
             <Scissors className="w-3.5 h-3.5" />
@@ -629,7 +629,7 @@ export const DrivePane: React.FC<Props> = ({
                 toDir: otherCurrentDir,
               })
             }
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-35 text-slate-200 transition"
+            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
             title={`Move selected items to ${otherLabel}`}
           >
             <MoveRight className="w-3.5 h-3.5" />
@@ -694,19 +694,24 @@ export const DrivePane: React.FC<Props> = ({
             <p className="text-xs text-slate-400 max-w-sm leading-relaxed">{unavailableError}</p>
             <button
               onClick={onQuickEnableSibling}
-              className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs transition"
+              className="ci-btn-primary"
             >
               Enable Sibling Mode & Restore Zero-Touch Z:\
             </button>
           </div>
         ) : filteredItems.length === 0 ? (
-          <div className="h-64 flex flex-col items-center justify-center text-slate-500 text-xs gap-2">
-            <Folder className="w-8 h-8 opacity-30" />
-            <p>Folder is empty — drag & drop files here or paste (Ctrl+V).</p>
+          <div className="h-64 flex flex-col items-center justify-center gap-3 px-6 text-center">
+            <span className="ci-logo-mark w-14 h-14 opacity-70">
+              <Folder className="w-6 h-6 text-[var(--ci-text-3)]" />
+            </span>
+            <div>
+              <p className="ci-h2">This folder is empty</p>
+              <p className="ci-muted mt-1">Drag &amp; drop files here, or press Ctrl+V to paste from the other drive.</p>
+            </div>
           </div>
         ) : viewMode === 'list' ? (
           <div className="space-y-0.5">
-            <div className="grid grid-cols-12 px-2.5 py-1 text-[11px] font-medium text-slate-500 border-b border-slate-800/60">
+            <div className="ci-section-label grid grid-cols-12 px-2.5 py-1.5 border-b border-[var(--ci-border-soft)]">
               <div className="col-span-7">Name</div>
               <div className="col-span-2 text-right">Size</div>
               <div className="col-span-3 text-right">Type</div>
@@ -749,14 +754,14 @@ export const DrivePane: React.FC<Props> = ({
                     }
                     setCtxMenu({ x: e.clientX, y: e.clientY, item });
                   }}
-                  className={`grid grid-cols-12 items-center px-2.5 py-1.5 rounded-lg text-xs cursor-pointer transition ${
+                  className={`ci-file-row grid grid-cols-12 items-center px-2.5 py-1.5 text-xs ${
                     isDropFolder
-                      ? 'bg-emerald-500/25 ring-1 ring-emerald-400'
+                      ? 'bg-[rgba(16,185,129,0.22)] ring-1 ring-[var(--ci-accent)]'
                       : selected
                         ? isPhone
-                          ? 'bg-emerald-500/20 text-emerald-100 ring-1 ring-emerald-500/40'
-                          : 'bg-cyan-500/20 text-cyan-100 ring-1 ring-cyan-500/40'
-                        : 'hover:bg-slate-800/70 text-slate-200'
+                          ? 'bg-[rgba(16,185,129,0.14)] text-emerald-50 ring-1 ring-[rgba(16,185,129,0.35)]'
+                          : 'bg-[rgba(34,211,238,0.12)] text-cyan-50 ring-1 ring-[rgba(34,211,238,0.32)]'
+                        : 'text-[var(--ci-text-2)]'
                   } ${isCut ? 'opacity-50' : ''}`}
                 >
                   <div className="col-span-7 flex items-center gap-2 min-w-0 pr-2">

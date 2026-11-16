@@ -113,6 +113,25 @@ const normalizeBtLink = (raw: string): string | null => {
   return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
 };
 
+const APP_VERSION = '1.2.0';
+
+app.get('/api/app/version', (_req, res) => {
+  res.json({ version: APP_VERSION, runtime: 'node-preview', channel: 'stable' });
+});
+
+// The Node server is only the live preview of the same UI the Windows binary embeds; the real
+// in-place self-replacement is implemented by ChainIt-Windows.exe (POST /api/app/update there).
+app.post('/api/app/update', (_req, res) => {
+  res.json({
+    status: 'unsupported',
+    version: APP_VERSION,
+    latestVersion: APP_VERSION,
+    message:
+      'This is the browser preview of the ChainIt engine. Run releases/ChainIt-Windows.exe and use ' +
+      'its "Check for update" button to replace the installed binary in place.',
+  });
+});
+
 app.post('/api/transport/connect-ip', (req, res) => {
   const { phoneIp, siblingKey } = (req.body || {}) as { phoneIp?: string; siblingKey?: string };
   if (!phoneIp || !phoneIp.trim()) {

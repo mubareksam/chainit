@@ -86,15 +86,15 @@ export const FilePreviewModal: React.FC<Props> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4"
+      className="ci-modal-backdrop"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-4xl rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl overflow-hidden flex flex-col max-h-[88vh]"
+        className="ci-modal max-w-4xl flex flex-col max-h-[88vh]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between gap-3 px-5 py-3.5 border-b border-slate-800 bg-slate-950/60">
+        <div className="ci-card-head">
           <div className="flex items-center gap-3 min-w-0">
             <div
               className={`p-2 rounded-lg ${
@@ -107,7 +107,7 @@ export const FilePreviewModal: React.FC<Props> = ({
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <h3 className="text-sm font-semibold text-slate-100 truncate">{item.name}</h3>
+                <h3 className="ci-h2 truncate">{item.name}</h3>
                 <span className="text-xs px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
                   {formatBytes(item.sizeBytes)}
                 </span>
@@ -187,7 +187,7 @@ export const FilePreviewModal: React.FC<Props> = ({
                 alt={item.name}
                 className="max-h-[64vh] w-auto rounded-xl border border-slate-800 shadow-lg bg-slate-950"
               />
-              <p className="text-xs text-slate-400">
+              <p className="ci-body">
                 Streamed directly via VFS ({winPath}) — no manual send/receive step required.
               </p>
             </div>

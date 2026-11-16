@@ -101,7 +101,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
   return (
     <div className="space-y-6">
       {/* Top Mode Banner */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+      <div className="ci-card-pad flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
             <Cpu className="w-4 h-4 text-cyan-400" />
@@ -109,7 +109,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
               Multi-Transport Engine — Offline-First + Pluggable Online
             </h2>
           </div>
-          <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
+          <p className="ci-body max-w-2xl leading-relaxed">
             In <strong className="text-slate-200">Automatic</strong> mode, ChainIt continuously scores bandwidth,
             RTT latency, signal stability, and battery cost (with +6.0 hysteresis to prevent link flapping), and
             transparently promotes Bluetooth to a router-free 5 GHz Local Hotspot for bulk transfers.
@@ -190,7 +190,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
                   </div>
                 </div>
 
-                <h3 className="text-sm font-semibold text-slate-100">{t.shortName}</h3>
+                <h3 className="ci-h2">{t.shortName}</h3>
                 <p className="text-[11px] text-slate-400 mt-0.5 min-h-[32px]">{t.statusNote}</p>
 
                 {/* Metrics */}
@@ -242,13 +242,13 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
       </div>
 
       {/* Physical Scenario Lab */}
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 space-y-4">
+      <div className="ci-card-pad space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-sm font-semibold text-slate-100">
+            <h3 className="ci-h2">
               Interactive Hardware & Network Environment Simulator
             </h3>
-            <p className="text-xs text-slate-400">
+            <p className="ci-body">
               Toggle cables, routers, or phone screen lock below to watch ChainIt fail over and adapt in real time.
             </p>
           </div>
@@ -314,7 +314,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
         </div>
 
         {activeTransport && (
-          <div className="rounded-xl bg-slate-950/80 border border-slate-800 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="ci-inset px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
             <span className="text-slate-300">
               Current Winning Link:{' '}
               <strong className="text-emerald-400">{activeTransport.name}</strong> (
@@ -341,14 +341,14 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
             notify(err instanceof Error ? err.message : 'Direct connect failed', 'error');
           }
         }}
-        className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+        className="ci-card-pad flex flex-col lg:flex-row lg:items-center justify-between gap-4"
       >
         <div className="space-y-1">
-          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+          <h3 className="ci-h2 flex items-center gap-2">
             <Link2 className="w-4 h-4 text-emerald-400" />
             Direct Phone IP or Bluetooth MAC Link (Optional — Auto-Discovery Scans Paired Bluetooth & LAN Automatically)
           </h3>
-          <p className="text-xs text-slate-400">
+          <p className="ci-body">
             Paired Bluetooth phones & LAN phones connect automatically. You can also enter a Phone IP (e.g.{' '}
             <code className="text-slate-200">192.168.43.1</code>) or Bluetooth address (e.g.{' '}
             <code className="text-slate-200">bt://AA:BB:CC:DD:EE:FF</code>).
@@ -360,17 +360,17 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
             value={phoneIp}
             onChange={(e) => setPhoneIp(e.target.value)}
             placeholder="IP or bt://AA:BB:CC:DD:EE:FF"
-            className="w-56 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-400"
+            className="w-56 px-3 py-2 ci-inset text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-400"
           />
           <input
             value={siblingKey}
             onChange={(e) => setSiblingKey(e.target.value)}
             placeholder="Sibling Key"
-            className="w-40 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-emerald-300 focus:outline-none focus:border-emerald-400"
+            className="w-40 px-3 py-2 ci-inset text-xs font-mono text-emerald-300 focus:outline-none focus:border-emerald-400"
           />
           <button
             type="submit"
-            className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition"
+            className="ci-btn-primary"
           >
             Connect Link
           </button>
@@ -381,7 +381,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
       {bt && (
         <div className="rounded-2xl border border-sky-900/60 bg-sky-950/25 p-5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <h3 className="ci-h2 flex items-center gap-2">
               <Bluetooth className="w-4 h-4 text-sky-400" />
               Native Bluetooth RFCOMM Engine (Zero Wi-Fi • Zero Hotspot • Zero USB)
             </h3>

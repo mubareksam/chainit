@@ -65,7 +65,7 @@ class AndroidStorageVfsProvider(
         }
         val children = (dir.listFiles() ?: emptyArray())
             .filter { !it.name.startsWith(".") }
-            .sortedWith(compareBy<File>({ !it.isDirectory }, { it.name.lowercase() }))
+            .sortedWith(FileOps.EXPLORER_ORDER)
             .map { toEntry(it) }
         return Pair(normalizeVirtualPath(dir), children)
     }
@@ -110,7 +110,7 @@ class AndroidStorageVfsProvider(
     }
 
     fun makeDirectory(parentDir: String, folderName: String): AndroidVfsEntry {
-        val clean = folderName.replace(Regex("[<>:\"/\\\\|?*]"), "").trim()
+        val clean = FileOps.stripIllegal(folderName)
         require(clean.isNotEmpty()) { "Invalid folder name" }
         val parent = resolveSafe(parentDir)
         val target = File(parent, clean)
@@ -120,7 +120,7 @@ class AndroidStorageVfsProvider(
     }
 
     fun renameItem(itemPath: String, newName: String): AndroidVfsEntry {
-        val clean = newName.replace(Regex("[<>:\"/\\\\|?*]"), "").trim()
+        val clean = FileOps.stripIllegal(newName)
         require(clean.isNotEmpty()) { "Invalid file name" }
         val src = resolveSafe(itemPath)
         require(src.exists()) { "Item not found" }
@@ -138,7 +138,7 @@ class AndroidStorageVfsProvider(
             val target = resolveSafe(p)
             if (target.canonicalPath == canonicalRoot) continue
             if (target.exists()) {
-                if (target.deleteRecursively()) count++
+                if (FileOps.deleteRecursive(target)) count++
             }
         }
         return count
@@ -164,30 +164,22 @@ class AndroidStorageVfsProvider(
                     idx++
                 }
             }
-            val bytes = computeSize(src)
+            val bytes = FileOps.sizeOf(src)
             if (op == "move") {
                 if (src.canonicalPath != dst.canonicalPath) {
-                    if (dst.exists()) dst.deleteRecursively()
+                    if (dst.exists()) FileOps.deleteRecursive(dst)
                     if (!src.renameTo(dst)) {
-                        src.copyRecursively(dst, overwrite = true)
-                        src.deleteRecursively()
+                        FileOps.copyRecursive(src, dst)
+                        FileOps.deleteRecursive(src)
                     }
                 }
             } else {
-                src.copyRecursively(dst, overwrite = true)
+                FileOps.copyRecursive(src, dst)
             }
             totalBytes += bytes
             names.add(dst.name)
         }
         return Pair(totalBytes, names)
-    }
-
-    private fun computeSize(f: File): Long {
-        if (!f.exists()) return 0L
-        if (f.isFile) return f.length()
-        var sum = 0L
-        f.listFiles()?.forEach { sum += computeSize(it) }
-        return sum
     }
 
     fun getStorageCapacity(): Pair<Long, Long> {

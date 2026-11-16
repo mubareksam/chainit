@@ -125,6 +125,26 @@ export const api = {
       body: JSON.stringify({ phoneIp, siblingKey }),
     }).then((r) => parseJsonOrThrow<SystemSnapshot>(r)),
 
+  /** Version of the engine currently serving this UI (Windows exe or Node preview). */
+  appVersion: () =>
+    fetch('/api/app/version').then((r) =>
+      parseJsonOrThrow<{ version: string; runtime: string; channel: string }>(r)
+    ),
+
+  /**
+   * Downloads the newest release and replaces the running binary in place.
+   * On Windows this swaps ChainIt-Windows.exe and relaunches it (nothing is installed twice).
+   */
+  checkForUpdate: () =>
+    fetch('/api/app/update', { method: 'POST' }).then((r) =>
+      parseJsonOrThrow<{
+        status: 'updated' | 'up_to_date' | 'unsupported' | 'error';
+        message: string;
+        version?: string;
+        latestVersion?: string;
+      }>(r)
+    ),
+
   probeWebDavRoot: async (): Promise<{ status: number; xml: string; durationMs: number }> => {
     const start = performance.now();
     const res = await fetch('/dav/', {

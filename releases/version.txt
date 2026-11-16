@@ -1,0 +1,16 @@
+# ChainIt release manifest - consumed by the in-place updaters:
+#   windows/src/chainit_win_main.cpp  (performAppUpdate: version + exe_sha256)
+#   android/.../update/UpdateManager.kt (versionCode inside the APK itself)
+# Regenerate with: python3 scripts/publish_release_manifest.py
+version=1.2.0
+channel=stable
+released=2026-11-16
+
+exe=ChainIt-Windows.exe
+exe_sha256=b804fc1e2809278b36601c48bc22374be715d346689a4c8088b2e86cc9ad3f3d
+exe_bytes=1010176
+
+apk=ChainIt-Android.apk
+apk_sha256=3bbaec9835809fa405a55ee953429251fc8ab2c3c38d18a180d6667304f708e3
+apk_bytes=880996
+apk_version_code=3

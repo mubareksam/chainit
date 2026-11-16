@@ -12,6 +12,7 @@ import {
   Lock,
   PanelLeft,
   Radio,
+  RefreshCw,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -21,6 +22,7 @@ import {
 } from 'lucide-react';
 import { DriveTarget, SystemSnapshot, VfsItem } from '../shared/types';
 import { api } from './api/client';
+import { LogoBadge } from './components/Brand';
 import { ConnectivityView } from './components/ConnectivityView';
 import { DownloadsModal } from './components/DownloadsModal';
 import { ClipboardState, DrivePane } from './components/DrivePane';
@@ -28,6 +30,9 @@ import { FilePreviewModal } from './components/FilePreviewModal';
 import { MobileCompanionPage } from './components/MobileCompanionPage';
 import { SiblingAndMountView } from './components/SiblingAndMountView';
 import { formatBytes, formatShortTime, toWindowsDisplayPath } from './utils/format';
+
+/** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
+export const APP_VERSION = '1.2.0';
 
 type MainTab = 'explorer' | 'connectivity' | 'sibling';
 type ExplorerLayout = 'dual' | 'single_z';
@@ -60,6 +65,18 @@ export const App: React.FC = () => {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [showTelemetry, setShowTelemetry] = useState(true);
   const [showDownloads, setShowDownloads] = useState(false);
+  const [engineVersion, setEngineVersion] = useState<string>(APP_VERSION);
+  const [engineRuntime, setEngineRuntime] = useState<string>('');
+  const [updating, setUpdating] = useState(false);
+
+  useEffect(() => {
+    api.appVersion()
+      .then((v) => {
+        if (v && v.version) setEngineVersion(v.version);
+        if (v && v.runtime) setEngineRuntime(v.runtime);
+      })
+      .catch(() => undefined);
+  }, []);
 
   const notify = useCallback(
     (message: string, kind: 'success' | 'error' | 'info' = 'info') => {
@@ -71,6 +88,23 @@ export const App: React.FC = () => {
     },
     []
   );
+
+  /**
+   * True in-place update: the running engine replaces its own binary and restarts,
+   * so the old build is gone instead of sitting next to the new one.
+   */
+  const runSelfUpdate = useCallback(async () => {
+    setUpdating(true);
+    notify('Checking for a newer ChainIt build…', 'info');
+    try {
+      const res = await api.checkForUpdate();
+      notify(res.message || `Update status: ${res.status}`, res.status === 'error' ? 'error' : 'success');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Update check failed', 'error');
+    } finally {
+      setUpdating(false);
+    }
+  }, [notify]);
 
   useEffect(() => {
     api
@@ -217,25 +251,27 @@ export const App: React.FC = () => {
   const activeTransport = snapshot.transports.find((t) => t.isActive) || null;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      {/* Top Desktop Application Window Bar */}
-      <header className="sticky top-0 z-30 border-b border-slate-800/90 bg-slate-950/90 backdrop-blur-md px-4 lg:px-6 py-3">
-        <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
+    <div className="ci-shell">
+      {/* Application bar */}
+      <header className="ci-header px-4 lg:px-6 py-3">
+        <div className="ci-container flex flex-wrap items-center justify-between gap-3">
           {/* Brand + Peer Pill */}
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center text-slate-950 font-black shadow-lg shadow-emerald-500/20">
-                <Link2 className="w-5 h-5 stroke-[2.5]" />
-              </div>
+            <div className="flex items-center gap-3">
+              <LogoBadge size={38} />
               <div>
                 <div className="flex items-center gap-2">
-                  <span className="text-base font-bold tracking-tight text-white">ChainIt</span>
-                  <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 border border-slate-700">
-                    CHNP/1.0
+                  <span className="text-[15px] font-bold tracking-tight text-white">ChainIt</span>
+                  <span
+                    className="ci-pill-info"
+                    style={{ letterSpacing: '0.06em' }}
+                    title={engineRuntime === 'windows-native' ? 'ChainIt-Windows.exe native engine' : 'ChainIt preview engine'}
+                  >
+                    v{engineVersion}
                   </span>
                 </div>
-                <p className="text-[11px] text-slate-400 hidden sm:block">
-                  Seamless Windows ⇄ Android Sibling Link & Local Z:\ Drive
+                <p className="ci-muted hidden sm:block mt-0.5">
+                  Windows ⇄ Android Sibling link · USB · Wi-Fi · Hotspot · native Bluetooth
                 </p>
               </div>
             </div>
@@ -341,17 +377,29 @@ export const App: React.FC = () => {
                 window.history.pushState({}, '', '/mobile');
                 setIsMobileRoute(true);
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 transition"
-              title="Preview the Android Phone side"
+              className="ci-btn-ghost"
+              title="Preview the Android phone side"
             >
               <Smartphone className="w-3.5 h-3.5 text-emerald-400" />
               <span className="hidden sm:inline">Phone View</span>
             </button>
 
+            {/* Replace the installed build with the newest one */}
+            <button
+              type="button"
+              onClick={() => void runSelfUpdate()}
+              disabled={updating}
+              className="ci-btn-ghost"
+              title="Download the newest release and replace the installed ChainIt (no second copy)"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-[var(--ci-info)] ${updating ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">{updating ? 'Updating…' : 'Update'}</span>
+            </button>
+
             {/* Download Final .exe & .apk */}
             <button
               onClick={() => setShowDownloads(true)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 hover:opacity-95 text-slate-950 text-xs font-bold shadow transition"
+              className="ci-btn-primary"
             >
               <Download className="w-3.5 h-3.5" />
               <span>Download .exe & .apk</span>
@@ -360,27 +408,27 @@ export const App: React.FC = () => {
         </div>
 
         {/* Navigation Bar */}
-        <div className="max-w-[1600px] mx-auto mt-3 pt-2.5 border-t border-slate-900 flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-1.5">
+        <div className="ci-container mt-3 pt-3 border-t border-[var(--ci-border-soft)] flex flex-wrap items-center justify-between gap-2">
+          <nav className="ci-nav">
             <NavTabButton
               active={activeTab === 'explorer'}
               onClick={() => setActiveTab('explorer')}
               icon={<FolderTree className="w-4 h-4" />}
-              label="ChainIt File Manager (C:\ ⇄ Z:\)"
+              label="File Manager"
             />
             <NavTabButton
               active={activeTab === 'connectivity'}
               onClick={() => setActiveTab('connectivity')}
               icon={<Sparkles className="w-4 h-4" />}
-              label="Smart Connectivity (Auto / Manual)"
+              label="Connectivity"
             />
             <NavTabButton
               active={activeTab === 'sibling'}
               onClick={() => setActiveTab('sibling')}
               icon={<HardDrive className="w-4 h-4" />}
-              label="Sibling Bond & Z:\ Explorer Mount"
+              label="Sibling & Z:\ Mount"
             />
-          </div>
+          </nav>
 
           {activeTab === 'explorer' && (
             <div className="flex items-center gap-2">
@@ -739,15 +787,8 @@ const NavTabButton: React.FC<{
   icon: React.ReactNode;
   label: string;
 }> = ({ active, onClick, icon, label }) => (
-  <button
-    onClick={onClick}
-    className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition ${
-      active
-        ? 'bg-slate-800 text-white border border-slate-700 shadow-sm'
-        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
-    }`}
-  >
-    <span className={active ? 'text-emerald-400' : 'text-slate-500'}>{icon}</span>
+  <button onClick={onClick} className="ci-nav-btn" data-active={active} type="button">
+    <span className="ci-nav-icon">{icon}</span>
     <span>{label}</span>
   </button>
 );
@@ -757,12 +798,12 @@ const ToastStack: React.FC<{ toasts: ToastItem[] }> = ({ toasts }) => (
     {toasts.map((t) => (
       <div
         key={t.id}
-        className={`pointer-events-auto px-4 py-2.5 rounded-xl border shadow-xl text-xs font-medium backdrop-blur-md ${
+        className={`ci-toast ${
           t.kind === 'success'
-            ? 'bg-emerald-950/90 border-emerald-500/50 text-emerald-200'
+            ? 'bg-[rgba(6,46,34,0.94)] border-[rgba(16,185,129,0.45)] text-emerald-100'
             : t.kind === 'error'
-              ? 'bg-rose-950/90 border-rose-500/50 text-rose-200'
-              : 'bg-slate-900/95 border-slate-700 text-slate-200'
+              ? 'bg-[rgba(58,15,26,0.94)] border-[rgba(244,63,94,0.45)] text-rose-100'
+              : 'bg-[rgba(14,20,32,0.96)] border-[var(--ci-border-strong)] text-slate-100'
         }`}
       >
         {t.message}

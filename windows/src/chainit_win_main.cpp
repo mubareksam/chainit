@@ -9,6 +9,8 @@
 #include <ws2bth.h>
 #include <shellapi.h>
 #include <wincrypt.h>
+#include <wininet.h>
+#include <urlmon.h>
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +43,7 @@ static const int PHONE_VFS_PORT = 49180;
 #define ID_TRAY_OPEN_Z 4002
 #define ID_TRAY_REMOUNT_Z 4003
 #define ID_TRAY_EXIT 4004
+#define ID_TRAY_UPDATE 4005
 
 // --- Native Bluetooth RFCOMM (ws2bth.h / AF_BTH) ---
 // These service UUIDs MUST match android/.../net/BluetoothRfcommTransport.kt so the phone
@@ -1460,6 +1463,343 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
 
 // --- HTTP Response Helpers ---
 
+// ---------------------------------------------------------------------------
+// In-place application update (a real replacement — never a second install)
+//
+// The published binary lives next to this source in releases/. The updater
+//   1. reads releases/version.txt (version + SHA-256 of the published exe),
+//   2. compares it with the SHA-256 of the exe that is running right now,
+//   3. downloads the new exe to %TEMP%\ChainIt-Update and verifies its hash,
+//   4. writes a tiny detached .cmd that overwrites the installed file and
+//      relaunches it, then exits this process so the file lock is released.
+// Nothing is ever installed side-by-side: the same path is overwritten, the
+// same tray/UI/single-instance identity is reused, and settings survive
+// because they live in %APPDATA%\ChainIt, not in the binary.
+// ---------------------------------------------------------------------------
+// Tray icon handle (declared early so the updater can drop the icon before it exits).
+static NOTIFYICONDATAW gNid{};
+
+static const char* const kChainItAppVersion = "1.2.0";
+
+static std::vector<std::wstring> updateUrlCandidates() {
+    std::vector<std::wstring> urls;
+    wchar_t buf[2048] = {};
+    DWORD n = GetEnvironmentVariableW(L"CHAINIT_UPDATE_URL", buf, 2047);
+    if (n > 0 && n < 2047) urls.push_back(std::wstring(buf));
+    urls.push_back(L"https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe");
+    urls.push_back(L"https://github.com/mubareksam/chainit/raw/arena/37fd3890-chainit/releases/ChainIt-Windows.exe");
+    return urls;
+}
+
+static std::wstring updateVersionFileUrl() {
+    // Same directory as the binary: swap the trailing filename for version.txt.
+    for (const auto& u : updateUrlCandidates()) {
+        size_t slash = u.find_last_of(L'/');
+        if (slash != std::wstring::npos) return u.substr(0, slash + 1) + L"version.txt";
+    }
+    return L"";
+}
+
+static std::wstring currentExePath() {
+    wchar_t buf[MAX_PATH * 2] = {};
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH * 2 - 1);
+    if (n == 0 || n >= MAX_PATH * 2 - 1) return L"";
+    return std::wstring(buf, n);
+}
+
+static std::wstring chainItTempDir() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetTempPathW(MAX_PATH, buf);
+    std::wstring p = (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : std::wstring(L"C:\\Windows\\Temp");
+    if (!p.empty() && p.back() != L'\\') p.push_back(L'\\');
+    return p;
+}
+
+static std::string sha256HexFile(const std::wstring& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    if (!in) return "";
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    if (!CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return "";
+    if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return "";
+    }
+    char chunk[65536];
+    while (in) {
+        in.read(chunk, sizeof(chunk));
+        std::streamsize got = in.gcount();
+        if (got > 0) CryptHashData(hHash, reinterpret_cast<const BYTE*>(chunk), static_cast<DWORD>(got), 0);
+    }
+    BYTE digest[32] = {};
+    DWORD len = sizeof(digest);
+    CryptGetHashParam(hHash, HP_HASHVAL, digest, &len, 0);
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (DWORD i = 0; i < len; ++i) {
+        out.push_back(kHex[digest[i] >> 4]);
+        out.push_back(kHex[digest[i] & 0x0F]);
+    }
+    return out;
+}
+
+static std::string readFileUtf8(const std::wstring& path) {
+    std::ifstream in(path.c_str(), std::ios::binary);
+    if (!in) return "";
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+// key=value lookup inside version.txt (tolerates CRLF, spaces and comments).
+static std::string versionFileField(const std::string& text, const std::string& key) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find('\n', pos);
+        std::string line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? text.size() : eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t lead = line.find_first_not_of(" \t");
+        if (lead == std::string::npos || line[lead] == '#') continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(lead, eq - lead);
+        while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+        if (k != key) continue;
+        std::string v = line.substr(eq + 1);
+        size_t vs = v.find_first_not_of(" \t");
+        if (vs == std::string::npos) return "";
+        return v.substr(vs);
+    }
+    return "";
+}
+
+static HRESULT downloadFresh(const std::wstring& url, const std::wstring& dest) {
+    DeleteFileW(dest.c_str());
+    // Purge any WinINET copy first so we never "update" from a stale cache entry.
+    DeleteUrlCacheEntryW(url.c_str());
+    return URLDownloadToFileW(nullptr, url.c_str(), dest.c_str(), 0, nullptr);
+}
+
+static std::wstring wideFromAnsi(const std::string& in) {
+    if (in.empty()) return L"";
+    int n = MultiByteToWideChar(CP_ACP, 0, in.c_str(), static_cast<int>(in.size()), nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, in.c_str(), static_cast<int>(in.size()), out.data(), n);
+    return out;
+}
+
+static std::string ansiFromWide(const std::wstring& in) {
+    if (in.empty()) return "";
+    int n = WideCharToMultiByte(CP_ACP, 0, in.c_str(), static_cast<int>(in.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_ACP, 0, in.c_str(), static_cast<int>(in.size()), out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+struct AppUpdateResult {
+    std::string status = "error"; // updated | up_to_date | unsupported | error
+    std::string message;
+    std::string installedVersion = kChainItAppVersion;
+    std::string latestVersion = kChainItAppVersion;
+    bool restart = false;
+    std::wstring updaterScript;
+};
+
+static bool writeUpdaterScript(const std::wstring& scriptPath, const std::wstring& targetExe,
+                              const std::wstring& stagedExe) {
+    // cmd.exe reads batch files in the ANSI codepage, so escape backslashes and write ANSI.
+    std::string body;
+    body += "@echo off\r\n";
+    body += "rem ChainIt in-place updater: overwrite the installed binary, then relaunch it.\r\n";
+    body += "set \"CHAINIT_TARGET=" + ansiFromWide(targetExe) + "\"\r\n";
+    body += "set \"CHAINIT_STAGE=" + ansiFromWide(stagedExe) + "\"\r\n";
+    body += "set /a CHAINIT_TRIES=0\r\n";
+    body += ":chainit_retry\r\n";
+    body += "ping -n 2 127.0.0.1 >nul\r\n";
+    body += "copy /y \"%CHAINIT_STAGE%\" \"%CHAINIT_TARGET%\" >nul 2>&1\r\n";
+    body += "if not errorlevel 1 goto chainit_done\r\n";
+    body += "set /a CHAINIT_TRIES+=1\r\n";
+    body += "if %CHAINIT_TRIES% LSS 10 goto chainit_retry\r\n";
+    body += "echo replace-failed > \"%TEMP%\\chainit-update.log\"\r\n";
+    body += ":chainit_done\r\n";
+    body += "del \"%CHAINIT_STAGE%\" >nul 2>&1\r\n";
+    body += "start \"\" \"%CHAINIT_TARGET%\"\r\n";
+    body += "del \"%~f0\" >nul 2>&1\r\n";
+
+    std::ofstream out(scriptPath.c_str(), std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(body.data(), static_cast<std::streamsize>(body.size()));
+    return static_cast<bool>(out);
+}
+
+static bool launchDetached(const std::wstring& commandLine) {
+    STARTUPINFOW si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    std::wstring mutableCmd = commandLine;
+    mutableCmd.push_back(L'\0');
+    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                        DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, nullptr, nullptr,
+                        &si, &pi)) {
+        // CREATE_BREAKAWAY_FROM_JOB is rejected when we are not inside a job object.
+        if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                            DETACHED_PROCESS | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            return false;
+        }
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+static AppUpdateResult performAppUpdate() {
+    AppUpdateResult result;
+    const std::wstring exe = currentExePath();
+    if (exe.empty()) {
+        result.message = "Could not resolve the running ChainIt-Windows.exe path.";
+        return result;
+    }
+
+    const std::wstring stageDir = chainItTempDir() + L"ChainIt-Update";
+    CreateDirectoryW(stageDir.c_str(), nullptr);
+    const std::wstring staged = stageDir + L"\\ChainIt-Windows-new.exe";
+    const std::wstring manifest = stageDir + L"\\version.txt";
+    const std::wstring script = stageDir + L"\\ChainIt-Updater.cmd";
+
+    const std::string currentHash = sha256HexFile(exe);
+
+    // --- 1) published manifest (optional but preferred) -------------------
+    std::string latestVersion = kChainItAppVersion;
+    std::string publishedHash;
+    const std::wstring manifestUrl = updateVersionFileUrl();
+    if (!manifestUrl.empty() && SUCCEEDED(downloadFresh(manifestUrl, manifest))) {
+        const std::string text = readFileUtf8(manifest);
+        const std::string v = versionFileField(text, "version");
+        const std::string h = versionFileField(text, "exe_sha256");
+        if (!v.empty()) latestVersion = v;
+        if (h.size() == 64) publishedHash = h;
+    }
+    result.latestVersion = latestVersion;
+
+    // --- 2) already current? ---------------------------------------------
+    if (!publishedHash.empty() && !currentHash.empty() && publishedHash == currentHash) {
+        DeleteFileW(staged.c_str());
+        result.status = "up_to_date";
+        result.message = "You are already running the newest build (v" + latestVersion +
+                         "). Nothing was replaced.";
+        return result;
+    }
+
+    // --- 3) download the new binary --------------------------------------
+    HRESULT hr = E_FAIL;
+    std::wstring usedUrl;
+    for (const auto& url : updateUrlCandidates()) {
+        hr = downloadFresh(url, staged);
+        if (SUCCEEDED(hr)) {
+            usedUrl = url;
+            break;
+        }
+    }
+    if (FAILED(hr)) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "Could not download the update (HRESULT 0x%08lX). ChainIt stays on v%s.",
+                      static_cast<unsigned long>(hr), kChainItAppVersion);
+        result.message = buf;
+        return result;
+    }
+
+    // --- 4) verify before replacing anything -----------------------------
+    std::ifstream probe(staged.c_str(), std::ios::binary);
+    char magic[2] = {0, 0};
+    probe.read(magic, 2);
+    probe.close();
+    LARGE_INTEGER fileSize{};
+    {
+        HANDLE hFile = CreateFileW(staged.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            fileSize.QuadPart = 0;
+            fileSize.LowPart = GetFileSize(hFile, reinterpret_cast<DWORD*>(&fileSize.HighPart));
+            CloseHandle(hFile);
+        }
+    }
+    if (magic[0] != 'M' || magic[1] != 'Z' || fileSize.QuadPart < 200000) {
+        DeleteFileW(staged.c_str());
+        result.message = "The downloaded file is not a valid ChainIt binary, so nothing was replaced.";
+        return result;
+    }
+    const std::string stagedHash = sha256HexFile(staged);
+    if (!publishedHash.empty() && stagedHash != publishedHash) {
+        DeleteFileW(staged.c_str());
+        result.message = "Integrity check failed (SHA-256 mismatch), so nothing was replaced.";
+        return result;
+    }
+    if (!currentHash.empty() && stagedHash == currentHash) {
+        DeleteFileW(staged.c_str());
+        result.status = "up_to_date";
+        result.message = "The published build is identical to the one you are running (v" + latestVersion + ").";
+        return result;
+    }
+
+    // --- 5) overwrite in place and relaunch ------------------------------
+    if (!writeUpdaterScript(script, exe, staged)) {
+        DeleteFileW(staged.c_str());
+        result.message = "Could not write the updater script to " + ansiFromWide(stageDir) + ".";
+        return result;
+    }
+    if (!launchDetached(L"cmd.exe /c \"" + script + L"\"")) {
+        DeleteFileW(staged.c_str());
+        DeleteFileW(script.c_str());
+        result.message = "Windows refused to start the updater script.";
+        return result;
+    }
+
+    addLogLocked("UPDATE", "Replacing ChainIt-Windows.exe in place",
+                 "v" + result.installedVersion + " -> v" + latestVersion + " from " +
+                     ansiFromWide(usedUrl) + " (sha256 " + stagedHash.substr(0, 12) + "...)");
+
+    result.status = "updated";
+    result.restart = true;
+    result.updaterScript = script;
+    result.message = "Downloaded v" + latestVersion +
+                     ". ChainIt is replacing the installed program now and will restart itself in a second.";
+    return result;
+}
+
+// Gives the HTTP response time to reach the UI before this process steps aside.
+static void scheduleRestartForUpdate() {
+    std::thread([]() {
+        for (int i = 0; i < 12 && gRunning.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        gRunning.store(false);
+        Shell_NotifyIconW(NIM_DELETE, &gNid);
+        ExitProcess(0);
+    }).detach();
+}
+
+static std::string appUpdateJson(const AppUpdateResult& r) {
+    auto esc = [](const std::string& in) {
+        std::string out;
+        for (char c : in) {
+            if (c == '"' || c == '\\') out.push_back('\\');
+            out.push_back(c);
+        }
+        return out;
+    };
+    std::ostringstream ss;
+    ss << "{\"status\":\"" << r.status << "\",\"message\":\"" << esc(r.message)
+       << "\",\"version\":\"" << esc(r.installedVersion) << "\",\"latestVersion\":\""
+       << esc(r.latestVersion) << "\",\"restart\":" << (r.restart ? "true" : "false") << "}";
+    return ss.str();
+}
+
 static void sendHttpResponse(
     SOCKET client,
     int status,
@@ -1693,6 +2033,18 @@ static void handleHttpClient(SOCKET client) {
     }
 
     // 3. Control Plane APIs
+    if (urlPath == "/api/app/version" && method == "GET") {
+        std::ostringstream ss;
+        ss << "{\"version\":\"" << kChainItAppVersion << "\",\"runtime\":\"windows-native\",\"channel\":\"stable\"}";
+        sendJsonStr(client, 200, ss.str());
+        return;
+    }
+    if (urlPath == "/api/app/update" && method == "POST") {
+        AppUpdateResult result = performAppUpdate();
+        sendJsonStr(client, 200, appUpdateJson(result));
+        if (result.restart) scheduleRestartForUpdate();
+        return;
+    }
     if (urlPath == "/api/state" && method == "GET") {
         sendJsonStr(client, 200, buildStateSnapshotJson());
         closesocket(client);
@@ -2065,7 +2417,6 @@ static void httpServerLoop() {
 
 // --- Win32 System Tray Window Procedure ---
 
-static NOTIFYICONDATAW gNid{};
 
 static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_TRAYICON) {
@@ -2078,6 +2429,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_UI, L"Open ChainIt File Manager");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_Z, L"Open Z:\\ Phone Drive in Explorer");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_REMOUNT_Z, L"Mount / Refresh Z:\\ Drive");
+            AppendMenuW(hMenu, MF_STRING, ID_TRAY_UPDATE, L"Update ChainIt in place…");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Unmount Z:\\ && Exit ChainIt");
             SetForegroundWindow(hwnd);
@@ -2097,6 +2449,21 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case ID_TRAY_REMOUNT_Z:
                 mountZDriveAsync();
                 break;
+            case ID_TRAY_UPDATE: {
+                std::thread([]() {
+                    AppUpdateResult r = performAppUpdate();
+                    std::wstring text = wideFromAnsi(r.message.empty() ? "Update finished." : r.message);
+                    MessageBoxW(nullptr, text.c_str(),
+                                r.status == "error" ? L"ChainIt update failed" : L"ChainIt update",
+                                MB_OK | (r.status == "error" ? MB_ICONWARNING : MB_ICONINFORMATION));
+                    if (r.restart) {
+                        gRunning.store(false);
+                        Shell_NotifyIconW(NIM_DELETE, &gNid);
+                        ExitProcess(0);
+                    }
+                }).detach();
+                break;
+            }
             case ID_TRAY_EXIT:
                 gRunning.store(false);
                 Shell_NotifyIconW(NIM_DELETE, &gNid);

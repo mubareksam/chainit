@@ -10,12 +10,49 @@ Both standalone, zero-dependency binaries are compiled and ready to use right no
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~950 KB | **v1.1.0** — Single portable `.exe` (no installer, no runtime, no extra DLLs). Includes System Tray icon, Smart Link UDP auto-discovery, **native Bluetooth RFCOMM sockets (`AF_BTH` / `ws2bth.h`) for both directions**, automatic `Z:\` File Explorer drive mounter, and the dedicated ChainIt File Manager window. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~832 KB | **v1.1.0 (`versionCode 2`)** — V2+V3 signed native Kotlin APK (`com.chainit.android`). Runs the screen-off `SiblingDaemonService` over USB Tethering, Wi-Fi LAN, Local Hotspot, **or pure Bluetooth RFCOMM** with zero confirmation prompts. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~986 KB | **v1.2.0** — Single portable `.exe` (no installer, no runtime, no extra DLLs). Includes System Tray icon, Smart Link UDP auto-discovery, **native Bluetooth RFCOMM sockets (`AF_BTH` / `ws2bth.h`) for both directions**, automatic `Z:\` File Explorer drive mounter, the dedicated ChainIt File Manager window, and a built-in **in-place self-updater**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~860 KB | **v1.2.0 (`versionCode 3`)** — V2+V3 signed native Kotlin APK (`com.chainit.android`). **Launch crash fixed**, fully redesigned UI, same beloved chain-link launcher icon, crash-log recovery, in-app updates that replace the installed build, and the screen-off `SiblingDaemonService` over USB Tethering, Wi-Fi LAN, Local Hotspot, **or pure Bluetooth RFCOMM** with zero confirmation prompts. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows: <https://github.com/mubareksam/chainit/raw/arena/37fd3890-chainit/releases/ChainIt-Windows.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/arena/37fd3890-chainit/releases/ChainIt-Android.apk>
+- Release manifest (version + SHA-256 of both binaries): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.2.0
+
+1. **Android launch crash fixed (was a blocker).** Kotlin 2.x emits `invokedynamic` lambdas by default and
+   the `dx` dexer cannot lower them for API 26, so the previous build died inside `attachBaseContext` with
+   *"ChainIt Sibling keeps stopping"*. `android/build-apk.sh` now compiles with
+   `-Xlambdas=class -Xsam-conversions=class`, and `android/tools/verify_dex_safety.py` proves three things on
+   every build: all 68 first-party classes are `invokedynamic`-free, the bundled Kotlin runtime's
+   `invokedynamic` users are only the ones `dx` legitimately lowers, and no first-party source calls a stdlib
+   method that is itself `invokedynamic`-emulated (`File.copyRecursively`, `compareBy`, `Regex.findAll`, ...).
+   Those calls were replaced by `com.chainit.android.vfs.FileOps`. `ChainItApp` also installs an
+   uncaught-exception handler that writes `chainit-crash.log` and shows it on the next launch instead of
+   failing silently.
+2. **One identity for both apps.** The emerald + cyan chain-link launcher icon is unchanged on Android and is
+   now the brand mark everywhere else too: browser favicon, desktop UI header, and
+   `app/client/components/Brand.tsx`.
+3. **Redesigned interfaces.** The Windows/browser UI now runs on a token-based `.ci-*` design system
+   (`app/client/index.css`: cards, navigation pills, buttons, inputs, file rows, breadcrumbs, toasts, modals),
+   and the Android app on `ui/DesignSystem.kt` + a rewritten `MainActivity` — one clean, organized visual
+   language on both sides.
+4. **Real in-place updates, never a second copy.**
+   - *Windows:* tray menu -> **Update ChainIt in place...**, or the header **Update** button, calls
+     `POST /api/app/update`. The engine reads `releases/version.txt`, compares the published SHA-256 with the
+     hash of the `.exe` currently running, downloads and hash-verifies the new binary into
+     `%TEMP%\ChainIt-Update`, then spawns a detached `ChainIt-Updater.cmd` that overwrites the *same* file
+     path and relaunches it. Settings live in `%APPDATA%\ChainIt`, so they survive the swap.
+   - *Android:* `UpdateManager` downloads the APK, reads its `versionCode` (it never downgrades and never
+     re-installs an identical build) and installs through `UpdateFileProvider`, which upgrades the existing
+     `com.chainit.android` package in place — same icon slot, same permissions, same Sibling key.
+   - After rebuilding either binary, run `python3 scripts/publish_release_manifest.py` so
+     `releases/version.txt` keeps matching what is committed.
+
+> **One-time note for phones that already run the v1.1.0 build:** the release signing key is now committed at
+> `android/keystore/chainit-release.p12` (the old key's password was unrecoverable). Android refuses to
+> upgrade across different signatures, so uninstall the previous build once. Every update after that is a true
+> in-place upgrade.
 
 ---
 
