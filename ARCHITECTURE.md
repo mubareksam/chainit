@@ -138,7 +138,9 @@ In Sibling Mode on Windows, phone files are accessible **both ways simultaneousl
      so `setZDriveLabelInExplorer()` writes `<phone name> (ChainIt)` there after `net use` and re-applies it on a
      short back-off (Explorer only creates the key on first browse). The `127.0.0.1:4173` loopback URL is never
      shown as the drive name.
-3. **Dedicated ChainIt File Manager App**:
+3. **Dedicated ChainIt File Manager App** — since v1.5.0 this is a **native Win32 window drawn by
+   `ChainIt-Windows.exe` itself** (see §8); the React bundle below is still served at `/` for browsers,
+   remote use and the phone's Mobile Companion page, but the desktop app never opens it.
    - Dual-pane (`C:\` PC $\leftrightarrow$ `Z:\` Phone) and Single-Pane Explorer views, list *and* grid.
    - Explorer-grade columns (**Name / Size / Type / Modified**), click-to-sort headers, folders-first toggle,
      live filtering, and a status bar with item count, selection size and the active sort chip. The sort model
@@ -148,15 +150,16 @@ In Sibling Mode on Windows, phone files are accessible **both ways simultaneousl
      drives or directly from Windows Desktop, inline file preview/editing, a right-click menu with
      *Download to this PC*, and live chunked transfer speed telemetry.
 4. **Native ChainIt hub window (taskbar identity + mini form)**:
-   - The File Manager renders in Edge app-mode, whose taskbar button belongs to the *browser* process. ChainIt
-     therefore creates a real top-level `ChainItHubWindowClass` window whose class icon is resource #1 of the
-     exe, and pins one taskbar identity with
+   - ChainIt creates a real top-level `ChainItHubWindowClass` window whose class icon is resource #1 of the exe,
+     and pins one taskbar identity with
      `SetCurrentProcessExplicitAppUserModelID(L"ChainIt.Sibling.Hub")` - so the taskbar, Alt-Tab and the tray all
-     show the chain-link mark rather than a generic globe.
+     show the chain-link mark rather than a generic globe. Since v1.5.0 the File Manager window shares that same
+     identity, so every ChainIt window groups under one button (§8.1).
    - The same window is the app's **mini form**: link state, transport, `Z:\` status and integrity counters with
      keycap buttons for *Open File Manager*, *Open `Z:\`*, *Mount / Refresh `Z:\`*, *Create Desktop Icon*,
      *Check for Updates* and *Quit*. It is the first tray menu entry and the tray double-click action; closing it
-     keeps ChainIt resident. The browser route `/mini` renders the equivalent panel for remote use.
+     keeps ChainIt resident. The tray's *Mini status panel* entry opens this same native window — the Edge
+     app-mode `/mini` launcher was deleted in v1.5.0.
 
 ## 5. Building the Shipped Binaries From Source
 
@@ -320,3 +323,94 @@ in an amber banner in the web UI and as the headline of the native hub window.
 
 **Built by Qmer** - the Windows About tab, the native hub window header and footer, the Android app footer,
 and the `VERSIONINFO` of both exes (`CompanyName = Qmer`, `LegalCopyright = "Built by Qmer"`).
+
+## 8. The Native Win32 File Manager (v1.5.0)
+
+### 8.1 Why the browser had to go
+
+The desktop UI was opened with `ShellExecuteW(msedge.exe, L"--app=http://127.0.0.1:4173")`. App-mode removes
+Edge's own chrome, but the **window still belongs to the browser process**, and Windows derives a taskbar
+button's icon from the process that owns the window plus its AppUserModelID. Neither is ChainIt's, so the
+button showed Edge's **globe**, and no `RT_GROUP_ICON` in this exe could change it. The only correct fix is to
+own the window, so both browser launchers (`launchDesktopUiWindow`, `launchMiniPanelWindow`) were deleted and
+replaced by `showNativeMainWindow()`.
+
+Consequences that are now guaranteed by construction:
+
+| Property | How |
+| :--- | :--- |
+| Taskbar/Alt-Tab icon is the chain-link mark | The window is created by this process; class icon + `WM_SETICON` (`ICON_BIG` 32 px, `ICON_SMALL`/`ICON_SMALL2` 16 px) all resolve resource `#1` |
+| One taskbar button for the whole app | `SetCurrentProcessExplicitAppUserModelID(L"ChainIt.Sibling.Hub")` is applied to the process, shared with the hub window |
+| No runtime dependency | Plain Win32 + GDI: no Edge, WebView2, Chromium, .NET or PWA install |
+| No second UI from a double launch | `FindWindowW(kMainClass)` → restore + `PostMessage(WM_UI_REFRESH_ALL)` → exit |
+| Closing the window keeps the service | `WM_CLOSE` hides; the engine, tray icon and `Z:\` mount stay up |
+
+### 8.2 Drawing model
+
+`ChainItMainWindowClass` (`CS_DBLCLKS`, `WS_OVERLAPPEDWINDOW`, no background brush, `WM_ERASEBKGND` returns 1)
+paints into a memory bitmap and blits once, so there is no flicker and no partial frame. Every visual is GDI:
+
+```
+tab strip (Files | Link | About) + brand          kTabH    = 38
+toolbar (13 measured buttons, live enabled state)  kToolH   = 42
+per pane: breadcrumb strip                         kPathH   = 26
+          column header (Name | Size | Type | Mod) kColHeaderH = 27
+          rows                                     kRowH    = 28
+status bar (counts · transport · version)           kStatusH = 28
+toast pill (amber on refusal, emerald on success), drawn above the status bar
+```
+
+Rows are hand-drawn rather than `SysListView32` on purpose: full control of the dark theme, no header/theming
+quirks, identical metrics on every build, and only the visible slice of a 400-row listing is drawn. Columns
+degrade with width — below 560 px Type and Modified are dropped, below 400 px only Name remains — and
+`WM_GETMINMAXINFO` keeps the window at 720×480 or larger. Dual pane needs 900 px and collapses to a single
+pane automatically below that. `SetDCBrushColor`/`SetDCPenColor` with the stock `DC_BRUSH`/`DC_PEN` objects
+means no GDI brush or pen is allocated per frame.
+
+Each pane also carries a **live type-ahead filter**. `allItems` holds everything the last listing returned and
+`items` is the filtered + sorted view, so `WM_CHAR` appends to `UiList::filter`, `uiApplyFilter()` rebuilds the
+view, and selection/focus indices stay parallel to what is actually drawn. `Backspace` edits the filter while it
+is non-empty and goes up a level otherwise; `Esc` clears the filter before it clears the selection; navigating
+into a folder drops the filter so a stale one cannot make a new folder look empty.
+
+`uiComputeLayout()` is the single source of geometry: it returns every rect (tabs, toolbar buttons, pane
+blocks, column header, list area, Link-tab action column) and both the painter and the hit tester consume it,
+so a click can never land somewhere the pixels say it should not.
+
+### 8.3 Threading contract
+
+The UI thread never waits on the link. `uiLoadPaneAsync()` spawns a worker that lists a directory (locally with
+`listLocalDirJson`, or over LAN/Bluetooth with `httpRequestToPhone`) and posts a heap `ListPayload` back as
+`WM_UI_LISTDONE`; renames, deletes, folder creation, transfers and downloads do the same and finish with
+`WM_UI_REFRESH`. Toasts are posted too (`WM_UI_TOAST` carrying a heap `ToastMsg`), so the toast string is only
+ever written on the UI thread and the painter cannot read a half-assigned `std::wstring`. A 1 s timer refreshes
+telemetry and notices the moment a phone appears — it reloads `Z:\` and says so, instead of leaving a stale
+"No phone linked yet" panel on screen.
+
+### 8.4 Data contract
+
+Both sides emit byte-identical listing JSON, and the native UI parses it directly with `parseVfsListing()`:
+
+```json
+{"currentPath":"/DCIM","items":[{"name":"IMG_1.jpg","path":"/DCIM/IMG_1.jpg","kind":"file",
+  "sizeBytes":3312,"modifiedMs":1763299200000,"mimeType":"image/jpeg","ext":".jpg"}]}
+```
+
+Filenames are UTF-8 on the wire (Android JSON, `fs::u8path` on Windows), so the UI converts with `CP_UTF8`
+explicitly rather than the ANSI code page — accents, Cyrillic, CJK and emoji survive. `\uXXXX` escapes are
+decoded during parsing. File-type icons come from `SHGetFileInfoW` with `SHGFI_USEFILEATTRIBUTES`, which
+resolves an icon from the *name* alone, so a phone-only `.heic` gets the right glyph on a PC that has never
+seen one. Icons are cached per extension.
+
+### 8.5 Native prompt
+
+Win32 ships no input box, so Rename and New Folder assemble a `DLGTEMPLATE` in memory (header, `DS_SETFONT`,
+four `DLGITEMTEMPLATE` children, DWORD-aligned, no resource entry) and run it with `DialogBoxIndirectParamW`.
+That keeps the modal behaviour, tab order, Enter/Escape and system menu correct without adding a `.rc` dialog
+or borrowing a browser `prompt()`.
+
+### 8.6 What the web bundle is still for
+
+`app/dist` stays embedded and served: `/mobile` is the phone's companion page, `/mini` still renders for remote
+use, and `/dav` is the WebDAV surface Explorer mounts as `Z:\`. The difference is that **nothing in the
+Windows app opens them any more** — the desktop experience is entirely the native window.

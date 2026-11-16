@@ -10,16 +10,75 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.24 MB | **v1.4.0** — Portable `.exe`. **Bluetooth is now a full `Z:\` transport**: three persistent RFCOMM channels reused as HTTP/1.1 keep-alive sessions (one dial serves a whole Explorer session, not one request), SDP channel number cached after the first lookup. Native hub window owns the taskbar identity, `Z:\` is labelled with the phone's name, parallel 2 MiB chunked transfers with SHA-256 gates, in-place self-updater, `/uninstall`. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.4.0.exe`](./releases/ChainIt-Setup-1.4.0.exe) | ~1.54 MB | **v1.4.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.3.0.exe`](./releases/ChainIt-Setup-1.3.0.exe) | ~1.51 MB | **v1.3.0** — A real setup program with **no third-party packaging tool**: the installer stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, an **Apps & features** entry with a working uninstaller, and `/S` for silent deployment. Re-running it updates the same file in place. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.4.0 (`versionCode 5`)** — V2+V3 signed Kotlin APK. The VFS server now speaks **HTTP/1.1 keep-alive**, so a single Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.36 MB | **v1.5.0** — Portable `.exe`. **Fully native: the File Manager is now a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. Dual-pane PC + `Z:\` browser with sortable columns, shell file-type icons, right-click menu, cut/copy/paste between devices, native rename prompt, and Link + About tabs. Bluetooth remains a full `Z:\` transport over three persistent RFCOMM keep-alive channels; parallel 2 MiB chunked transfers with SHA-256 gates; in-place self-updater; `/uninstall`. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.5.0.exe`](./releases/ChainIt-Setup-1.5.0.exe) | ~1.67 MB | **v1.5.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.5.0 (`versionCode 6`)** — V2+V3 signed Kotlin APK, same certificate as every previous build so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.4.0.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.5.0.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.5.0
+
+> **ChainIt on Windows is now a genuinely standalone native application.** No browser is involved at any point.
+
+1. **The File Manager is drawn by ChainIt itself — Edge is gone.**
+   Until now the desktop UI was opened with `ShellExecuteW(msedge.exe, "--app=http://127.0.0.1:4173")`. That hands the
+   window — and therefore the **taskbar button** — to a *browser* process, which is exactly why Windows showed
+   Edge’s **globe/internet icon** while ChainIt was running, and why no icon compiled into the `.exe` could change it.
+   Both browser launchers (`launchDesktopUiWindow`, `launchMiniPanelWindow`) have been **deleted**. The File Manager is
+   now a `WS_OVERLAPPEDWINDOW` window of class `ChainItMainWindowClass`, painted with GDI into an off-screen bitmap:
+   tab strip, toolbar, breadcrumb strip, sortable column header, rows with shell file-type icons, a slim scrollbar, a
+   status bar and an amber/emerald toast pill. One process, one window, one taskbar button — the chain-link mark.
+   - **Nothing to install or enable**: no Edge, no WebView2, no Chromium runtime, no `.NET`, no PWA. The window is
+     ordinary Win32 + GDI, so it behaves identically on every Windows 10/11 build.
+   - **Icons are loaded at exact sizes** (16 px for the caption and alt-tab, 32 px for the class, 64 px for the About
+     tab) from resource `#1` — the same artwork as the Android launcher and the tray — and set with
+     `WM_SETICON`/`ICON_SMALL2`, so nothing is stretched or blurred.
+   - **The process’s AppUserModelID is `ChainIt.Sibling.Hub`**, so the File Manager, the mini hub and any dialog group
+     under a single taskbar button wearing ChainIt’s icon.
+   - **Launching ChainIt twice no longer opens a second UI**: the second process finds the live window with
+     `FindWindowW`, restores it, posts `WM_UI_REFRESH_ALL` and exits.
+2. **Everything the browser UI did, and a few things it could not.**
+   - **Dual pane by default**: `This PC` on the left, the phone (`Z:\`) on the right, each with its own breadcrumb,
+     sort state, selection and scroll. Collapse to one pane with the *Split view* button or the *PC*/*Phone* buttons.
+   - **Sort by Name / Size / Type / Modified** by clicking a column header (click again to reverse), folders first.
+   - **Real shell icons per file type**, resolved with `SHGFI_USEFILEATTRIBUTES` so phone-only files get the right
+     icon even though they do not exist on this PC.
+   - **Right-click menu**: Open, Open in Explorer (PC), Send to phone / Save to PC, Save to Downloads, Cut, Copy,
+     Paste, Rename, Delete, New folder, Refresh, Split view.
+   - **Explorer key bindings**: `Ctrl+A/C/X/V`, `Del`, `F2`, `Enter`, `Backspace` or `Alt+↑` (up a level), `F5`,
+     `Ctrl+Shift+N`, `F6` (switch pane), `Ctrl+T` and `1`/`2`/`3` (switch tab).
+   - **Live type-ahead filter**: just start typing and the active pane narrows to matching names, with an emerald
+     chip in the breadcrumb strip showing the text and a `12/400` match count. `Backspace` edits it, `Esc` clears
+     it, `Ctrl+F` restarts it, and navigating into a folder drops it so a stale filter can never make a new folder
+     look empty.
+   - **Cut/copy/paste moves files between the two devices**, through the same integrity-gated 2 MiB chunk pipeline as
+     `Z:\` — SHA-256 per chunk and per file, partial data in a hidden `.chainit-part` that only replaces the target
+     once it verifies. A transfer is never shown as done when it was not.
+   - **Double-clicking a phone file downloads it and opens it** with the right Windows app; nothing is opened from a
+     half-written file.
+   - **Rename and New folder use a native modal dialog built in memory** (`DialogBoxIndirectParamW`) — Win32 has no
+     input box and this app will not borrow a browser `prompt()`.
+3. **The UI thread never blocks on the link.**
+   Listing the phone over Bluetooth can take seconds, so every listing and every transfer runs on a worker thread and
+   posts its result back (`WM_UI_LISTDONE`). While it works the pane says *reading…*; a refusal is reported as a
+   real reason in an amber panel (HTTP 401/403/429 message, RFCOMM silence, no phone paired) together with the retry
+   hint, and a failed phone read forces an immediate transport re-scan.
+4. **New Link and About tabs.**
+   - **Link** shows the live picture: active transport, phone endpoint, peer device, Sibling Mode, `Z:\` mount state,
+     phone storage, discovered endpoints, the RFCOMM channel pool (`n of 3 keep-alive channels open`), cached SDP
+     channel, requests served, re-dials, last round-trip, radio/receiver state and the paired Bluetooth devices —
+     plus one-click actions: rescan every transport, mount/refresh `Z:\`, open `Z:\` in Explorer, create the desktop
+     shortcut, show the mini hub, update in place, copy the pairing key.
+   - **About** carries the version, the **Built by Qmer** credit and six tiles explaining what the build guarantees.
+5. **Filenames survive every language.** The listings on both sides are UTF-8, and the UI converts through `CP_UTF8`
+   explicitly rather than the ANSI code page, so accents, Cyrillic, CJK and emoji render correctly instead of turning
+   into question marks.
+6. **Closing the window does not kill the service.** The File Manager hides, while the engine, the tray icon and the
+   `Z:\` mount keep running; *Unmount `Z:\` && Exit ChainIt* in the tray is still the way out.
 
 ### What is new in v1.4.0
 
@@ -215,7 +274,7 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.3.0.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.5.0.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
 | [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
 | [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |

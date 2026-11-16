@@ -2,21 +2,21 @@
 #   windows/src/chainit_win_main.cpp  (performAppUpdate: version + exe_sha256)
 #   android/.../update/UpdateManager.kt (versionCode inside the APK itself)
 # Regenerate with: python3 scripts/publish_release_manifest.py
-version=1.4.0
+version=1.5.0
 channel=stable
 released=2026-11-16
 
 exe=ChainIt-Windows.exe
-exe_sha256=090206ab680b7db82bf41c4eb04143e0473cd995e9a5fc9be2ff0ad345c03939
-exe_bytes=1297408
+exe_sha256=6af574b66ebf65b51f3f2da3e6f10c81e2a9fa4caab38d6085a8eed3ab61fbf9
+exe_bytes=1434112
 
 apk=ChainIt-Android.apk
-apk_sha256=62792406142d4d1959fe3209f300199f2467fc4402f70065b60b9f6fec74c2f5
+apk_sha256=6ddd48c5cab87bb5bbc4caf2e6c398685f7c49b32044212c5e68aaee1da2d628
 apk_bytes=893284
-apk_version_code=5
+apk_version_code=6
 
-setup=ChainIt-Setup-1.4.0.exe
-setup_sha256=39839bca354c380c0ecc188fbe5a1683c9cd4a15d5afbcf50d2c98ca84a8dc3c
-setup_bytes=1617972
+setup=ChainIt-Setup-1.5.0.exe
+setup_sha256=c4e1b0da885de95deb297454fd3d539ed19efb1aa89dc5676598c4b3244e1012
+setup_bytes=1754676
 setup_silent_flag=/S
 setup_uninstall_flag=/uninstall
