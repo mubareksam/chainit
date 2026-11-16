@@ -118,6 +118,15 @@ export interface BluetoothLinkInfo {
   pcReceiverUuid: string;
   activeLink: string;
   pairedDevices: string[];
+  /** Persistent keep-alive RFCOMM channels parked and ready to reuse. */
+  pooledChannels?: number;
+  maxChannels?: number;
+  /** RFCOMM channel number cached from the first SDP query (skips later lookups). */
+  cachedRfcommChannel?: number;
+  requestsServed?: number;
+  redials?: number;
+  lastRttMs?: number;
+  keepAlive?: boolean;
 }
 
 export interface SystemSnapshot {
@@ -138,6 +147,8 @@ export interface SystemSnapshot {
   serverPort: number;
   bluetooth?: BluetoothLinkInfo;
   security?: SecurityPosture;
+  /** Non-empty when the sibling link is up but not actually serving files - shown verbatim. */
+  linkProblem?: string;
 }
 
 export interface SecurityPosture {

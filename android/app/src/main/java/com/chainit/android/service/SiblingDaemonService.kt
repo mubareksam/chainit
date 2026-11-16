@@ -11,7 +11,10 @@ import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.app.AlarmManager
 import android.os.PowerManager
+import android.os.SystemClock
+import android.net.Uri
 import com.chainit.android.R
 import com.chainit.android.net.BluetoothRfcommTransport
 import com.chainit.android.net.DiscoveredPcInfo
@@ -38,6 +41,24 @@ class SiblingDaemonService : Service() {
         const val NOTIFICATION_ID = 4918
         const val VFS_PORT = 49180
         const val DISCOVERY_PORT = 49179
+
+        /** Doze heartbeat: re-arms listeners and renews the wake lock while the phone is locked. */
+        const val ACTION_HEARTBEAT = "com.chainit.android.action.SIBLING_HEARTBEAT"
+        private const val HEARTBEAT_MINUTES = 9L
+
+        /**
+         * True when Android is allowed to ignore battery optimisation for us. A phone that stays
+         * locked for hours is put into Doze, which suspends sockets - this is the single most
+         * important switch for "still works in the morning".
+         */
+        fun isIgnoringBatteryOptimizations(ctx: Context): Boolean = runCatching {
+            val pm = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
+            pm.isIgnoringBatteryOptimizations(ctx.packageName)
+        }.getOrDefault(false)
+
+        fun batteryOptimizationIntent(ctx: Context): Intent =
+            Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                .setData(Uri.parse("package:" + ctx.packageName))
 
         @Volatile
         var isRunning: Boolean = false
@@ -82,6 +103,23 @@ class SiblingDaemonService : Service() {
 
         fun isBluetoothListening(): Boolean = activeBluetooth?.isListeningRfcomm == true
 
+        /** RFCOMM listener detail for the UI: secure vs insecure channel, and the last failure. */
+        fun bluetoothListenMode(): String = activeBluetooth?.listenMode ?: "not started"
+
+        fun bluetoothLastError(): String? = activeBluetooth?.lastError
+
+        fun bluetoothSessions(): Long = activeBluetooth?.acceptedSessions ?: 0L
+
+        fun openVfsSessions(): Int = activeServer?.openSessions ?: 0
+
+        fun servedRequests(): Long = activeServer?.servedRequests ?: 0L
+
+        fun heartbeatsSurvived(): Long = activeHeartbeats
+
+        @Volatile
+        var activeHeartbeats: Long = 0L
+            private set
+
         fun getLastBluetoothPeer(): String? = activeBluetooth?.lastBtPeerName
 
         fun start(ctx: Context) {
@@ -102,6 +140,10 @@ class SiblingDaemonService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var lockAcquiredMs: Long = 0L
+
+    /** Renew 30 minutes before the 12 h ceiling so there is never an unlocked gap. */
+    private val RENEW_AFTER_MS = 11L * 60 * 60 * 1000 + 30 * 60 * 1000
 
     override fun onCreate() {
         try {
@@ -115,7 +157,7 @@ class SiblingDaemonService : Service() {
             ensureChannel()
             val notification = buildForegroundNotification("Starting Sibling link…")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                startForeground(NOTIFICATION_ID, notification, foregroundType())
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
@@ -196,7 +238,124 @@ class SiblingDaemonService : Service() {
         }
     }
 
+    @Volatile
+    var lastSelfCheckMs: Long = 0L
+        private set
+
+    /**
+     * Re-arm everything a long lock screen can break: renew the wake lock before its hard ceiling
+     * expires, restart the VFS server or the RFCOMM listener if either died, and re-schedule the
+     * next heartbeat. Runs from [onStartCommand] on the Doze alarm and from the local watchdog, so
+     * it must never throw.
+     */
+    private fun selfCheck() {
+        lastSelfCheckMs = System.currentTimeMillis()
+        try {
+            renewWakeLock()
+            if (!httpReady || activeServer == null) {
+                val storage = vfs ?: AndroidStorageVfsProvider().also { vfs = it }
+                runCatching {
+                    val server = PhoneHttpAndWebDavServer(applicationContext, storage, VFS_PORT)
+                    server.start()
+                    httpServer = server
+                    activeServer = server
+                    httpReady = true
+                }
+            }
+            val srv = httpServer
+            if (srv != null && (activeBluetooth == null || !isBluetoothListening())) {
+                runCatching {
+                    btTransport?.stop()
+                    val bt = BluetoothRfcommTransport(applicationContext, srv)
+                    btTransport = bt
+                    bt.start()
+                    activeBluetooth = bt
+                }
+            }
+            if (!discoveryReady || activeDiscovery == null) {
+                runCatching {
+                    val d = UdpSiblingDiscovery(applicationContext, VFS_PORT, DISCOVERY_PORT)
+                    d.start()
+                    discovery = d
+                    activeDiscovery = d
+                    discoveryReady = true
+                }
+            }
+            runCatching { wifiLock?.takeIf { !it.isHeld }?.acquire() }
+            updateNotification()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** The wake lock has a hard 12 h ceiling; renew it well before that so Doze cannot win. */
+    private fun renewWakeLock() {
+        try {
+            val held = wakeLock?.isHeld == true
+            if (held && System.currentTimeMillis() - lockAcquiredMs < RENEW_AFTER_MS) return
+            runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ChainIt::SiblingScreenOffLock").apply {
+                setReferenceCounted(false)
+                acquire(12L * 60 * 60 * 1000)
+            }
+            lockAcquiredMs = System.currentTimeMillis()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /**
+     * Exact-while-idle alarm: the only scheduler Doze still honours. Cadence is 9 minutes because
+     * that is the minimum Android allows for a repeating while-idle alarm.
+     */
+    private fun scheduleHeartbeat() {
+        try {
+            val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val pi = PendingIntent.getForegroundService(
+                this, 7,
+                Intent(this, SiblingDaemonService::class.java).setAction(ACTION_HEARTBEAT),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val triggerAt = SystemClock.elapsedRealtime() + HEARTBEAT_MINUTES * 60 * 1000
+            try {
+                am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+            } catch (_: Throwable) {
+                // No exact-alarm privilege: the inexact while-idle variant still keeps us alive.
+                am.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping ChainIt out of recents must not drop the link: come straight back.
+        scheduleHeartbeat()
+        try {
+            val pi = PendingIntent.getForegroundService(
+                this, 8,
+                Intent(applicationContext, SiblingDaemonService::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val am = getSystemService(Context.ALARM_SERVICE) as? AlarmManager
+            am?.set(
+                AlarmManager.ELAPSED_REALTIME,
+                SystemClock.elapsedRealtime() + 1200,
+                pi
+            )
+        } catch (_: Throwable) {
+        }
+        try {
+            super.onTaskRemoved(rootIntent)
+        } catch (_: Throwable) {
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_HEARTBEAT) {
+            activeHeartbeats += 1
+            selfCheck()
+            scheduleHeartbeat()
+            return START_STICKY
+        }
         // Guarantee we are foregrounded even if onCreate's notification path was delayed.
         try {
             if (!isForeground()) {
@@ -205,7 +364,7 @@ class SiblingDaemonService : Service() {
                     startForeground(
                         NOTIFICATION_ID,
                         buildForegroundNotification("Sibling link active"),
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                        foregroundType()
                     )
                 } else {
                     startForeground(NOTIFICATION_ID, buildForegroundNotification("Sibling link active"))
@@ -213,7 +372,25 @@ class SiblingDaemonService : Service() {
             }
         } catch (_: Throwable) {
         }
+        selfCheck()
+        scheduleHeartbeat()
         return START_STICKY
+    }
+
+    /**
+     * `dataSync` foreground services are capped by Android 14 (roughly 6 h per 24 h) and then get
+     * stopped - which is exactly the "worked, then my phone was locked too long and it died" bug.
+     * `connectedDevice` has no such cap and is the correct type for a link that must survive the
+     * night. Older platforms fall back gracefully.
+     */
+    private fun foregroundType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        return try {
+            if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            else ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        } catch (_: Throwable) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        }
     }
 
     private fun isForeground(): Boolean {
@@ -258,19 +435,13 @@ class SiblingDaemonService : Service() {
         if (httpReady) parts.add("Z:\\ ready")
         if (isBluetoothListening()) parts.add("Bluetooth live")
         if (getDiscoveredPc() != null) parts.add("PC: " + (getDiscoveredPc()?.pcName ?: ""))
+        if (activeHeartbeats > 0) parts.add("awake ${activeHeartbeats}x")
         if (parts.isEmpty()) parts.add("Waiting for Windows")
         return parts.joinToString(" • ")
     }
 
     private fun acquireScreenOffLocks() {
-        try {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ChainIt::SiblingScreenOffLock").apply {
-                setReferenceCounted(false)
-                acquire(12L * 60 * 60 * 1000) // hard ceiling: never hold a lock forever
-            }
-        } catch (_: Throwable) {
-        }
+        renewWakeLock()
 
         try {
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager

@@ -27,6 +27,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -460,6 +461,11 @@ struct GlobalState {
 
     fs::path pcRoot;
     fs::path fallbackPhoneRoot;
+
+    /** Set once a real phone answers, so Z: stops serving the "waiting" placeholder. */
+    bool everDiscoveredPhone = false;
+    /** Human-readable reason the link is not serving files - shown in the hub window and the UI. */
+    std::string phoneLinkProblem;
 };
 
 static GlobalState gState;
@@ -624,12 +630,352 @@ static void launchDesktopUiWindow() {
 
 // --- Simple Outbound HTTP Client to Talk to ChainIt-Android.apk (Port 49180) ---
 
+// --- XML / DAV helpers -----------------------------------------------------
+
+static std::string xmlEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 16);
+    for (char c : in) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default: out.push_back(c);
+        }
+    }
+    return out;
+}
+
+/** Ask both discovery loops to run their next sweep immediately instead of after their nap. */
+static std::atomic<bool> gForceRescan{false};
+static void triggerTransportRescan() { gForceRescan.store(true); }
+
+static std::string waitingDriveReadme() {
+    std::string peer;
+    std::string problem;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        peer = gState.peerDeviceName;
+        problem = gState.phoneLinkProblem;
+    }
+    std::ostringstream os;
+    os << "ChainIt Z: drive - waiting for your Android phone\r\n"
+       << "==================================================\r\n\r\n"
+       << "This drive is the live storage of your Android phone. It is empty right now only\r\n"
+       << "because no phone has answered yet - nothing is broken and nothing is disabled.\r\n\r\n"
+       << "To bring it online:\r\n"
+       << "  1. Open ChainIt on the Android phone.\r\n"
+       << "  2. Make sure Sibling Mode is ON and the Pairing Key matches this PC.\r\n"
+       << "  3. Turn on Bluetooth, or connect both devices to the same Wi-Fi / hotspot,\r\n"
+       << "     or plug in the USB cable and enable USB tethering.\r\n"
+       << "  4. Grant 'All files access' when the phone asks - that is what lets Z: see\r\n"
+       << "     DCIM, Download, Documents and the rest.\r\n\r\n"
+       << "The moment the phone answers, this drive fills with its real folders. The phone\r\n"
+       << "can stay locked and even have its screen off: ChainIt keeps serving from a\r\n"
+       << "foreground service with a Doze heartbeat.\r\n\r\n"
+       << "Current status\r\n"
+       << "--------------\r\n"
+       << "  Sibling engine : running (port 4173)\r\n"
+       << "  Peer           : " << (peer.empty() ? "not discovered yet" : peer) << "\r\n"
+       << "  Last problem   : " << (problem.empty() ? "none" : problem) << "\r\n";
+    return os.str();
+}
+
+/**
+ * WebDAV PROPFIND for the placeholder drive: a real collection holding one readme,
+ * so Explorer renders something that explains itself instead of an empty disk.
+ */
+static std::string buildWaitingDrivePropfind(const std::string& urlPath,
+                                            const std::map<std::string, std::string>& headers) {
+    std::string depth = "1";
+    auto it = headers.find("depth");
+    if (it != headers.end() && !it->second.empty()) depth = it->second;
+
+    const std::string readmeName = "READ ME FIRST - waiting for your phone.txt";
+    const std::string readmeBody = waitingDriveReadme();
+
+    std::ostringstream os;
+    os << "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+       << "<D:multistatus xmlns:D=\"DAV:\">"
+       << "<D:response><D:href>/dav/</D:href><D:propstat><D:prop>"
+       << "<D:displayname>ChainIt (waiting for phone)</D:displayname>"
+       << "<D:resourcetype><D:collection/></D:resourcetype>"
+       << "<D:getcontenttype>httpd/unix-directory</D:getcontenttype>"
+       << "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>";
+
+    if (depth != "0") {
+        os << "<D:response><D:href>/dav/" << xmlEscape(readmeName) << "</D:href><D:propstat><D:prop>"
+           << "<D:displayname>" << xmlEscape(readmeName) << "</D:displayname>"
+           << "<D:resourcetype/>"
+           << "<D:getcontentlength>" << readmeBody.size() << "</D:getcontentlength>"
+           << "<D:getcontenttype>text/plain</D:getcontenttype>"
+           << "<D:isreadonly>1</D:isreadonly>"
+           << "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>";
+    }
+    os << "</D:multistatus>";
+    (void)urlPath;
+    return os.str();
+}
+
 struct HttpReply {
     int status = 0;
     std::map<std::string, std::string> headers;
     std::string body;
     double rttMs = 0.0;
+    /** False when the peer asked to close (or sent no framing), so the channel must be dropped. */
+    bool keepAliveOk = false;
 };
+
+/** Blocking full write - a short send on RFCOMM would silently truncate an upload. */
+static bool sendAll(SOCKET s, const std::string& data) {
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const int n = send(s, data.data() + sent, static_cast<int>(std::min<size_t>(65536, data.size() - sent)), 0);
+        if (n <= 0) {
+            const int err = WSAGetLastError();
+            if (err == WSAEINTR || err == WSAEWOULDBLOCK) continue;
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// ===========================================================================
+// Persistent RFCOMM channel pool (Bluetooth as a first-class transport)
+//
+// Dialling an RFCOMM link costs an SDP lookup plus a page - routinely 1-5 s on a
+// real radio. Explorer issues dozens of requests to render one folder, so a
+// connect-per-request design makes Bluetooth look "connected but dead": the link
+// is up, the queue never drains.
+//
+// These channels are therefore *kept open* and reused. The phone answers them as
+// HTTP/1.1 keep-alive sessions, so one dial serves a whole browsing session, and
+// several channels run side by side (per-channel mutex, not a global one) so a
+// slow PROPFIND never blocks a file read. The RFCOMM channel number discovered by
+// the first SDP query is cached, which removes the lookup from every later dial.
+// ===========================================================================
+
+static const size_t kBtChannelCount = 3;
+static std::atomic<ULONG> gBtCachedPort{0};
+static std::atomic<uint64_t> gBtRequestsServed{0};
+static std::atomic<uint64_t> gBtRedials{0};
+static std::atomic<int64_t> gBtLastRttUs{0};
+
+struct BtChannel {
+    SOCKET sock = INVALID_SOCKET;
+    std::mutex mtx;            // one request in flight per channel
+    std::string buf;           // bytes read ahead of the parser
+    size_t pos = 0;
+    int64_t lastUseMs = 0;
+    bool inPool = false;
+
+    bool ensure(size_t want) {
+        while (buf.size() - pos < want) {
+            char tmp[16384];
+            const int n = recv(sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) return false;
+            buf.append(tmp, static_cast<size_t>(n));
+        }
+        return true;
+    }
+    int getByte() {
+        if (!ensure(1)) return -1;
+        return static_cast<unsigned char>(buf[pos++]);
+    }
+    bool readExact(size_t want, std::string& out) {
+        if (want == 0) return true;
+        if (!ensure(want)) return false;
+        out.append(buf, pos, want);
+        pos += want;
+        return true;
+    }
+    void compact() {
+        if (pos > 0 && pos == buf.size()) { buf.clear(); pos = 0; }
+    }
+    bool readHeaderBlock(std::string& out) {
+        // Byte-at-a-time until CRLFCRLF: headers are small and this never over-reads
+        // into the body, which is what makes keep-alive framing safe.
+        out.clear();
+        int crlf = 0;
+        while (true) {
+            const int c = getByte();
+            if (c < 0) return false;
+            out.push_back(static_cast<char>(c));
+            if (c == '\n') {
+                if (crlf == 1) return true;   // saw "\r\n\r\n"
+                crlf = (out.size() >= 2 && out[out.size() - 2] == '\r') ? 1 : 0;
+                if (out.size() < 2) crlf = 0;
+            } else if (c != '\r') {
+                crlf = 0;
+            }
+            if (out.size() > 65536) return false;
+        }
+    }
+};
+
+static std::mutex gBtPoolMtx;
+static std::vector<std::shared_ptr<BtChannel>> gBtPool;
+
+static void btChannelClose(const std::shared_ptr<BtChannel>& ch) {
+    if (!ch) return;
+    if (ch->sock != INVALID_SOCKET) { closesocket(ch->sock); ch->sock = INVALID_SOCKET; }
+    ch->buf.clear();
+    ch->pos = 0;
+}
+
+static std::shared_ptr<BtChannel> btAcquireChannel(const std::string& endpoint, int timeoutMs) {
+    // 1. reuse a live channel
+    {
+        std::lock_guard<std::mutex> lk(gBtPoolMtx);
+        for (auto& ch : gBtPool) {
+            if (ch->inPool && ch->sock != INVALID_SOCKET) {
+                ch->inPool = false;
+                return ch;
+            }
+        }
+    }
+    // 2. dial a new one (SDP is skipped when we already know the RFCOMM channel)
+    SOCKET s = btRfcommConnect(endpoint, timeoutMs);
+    if (s == INVALID_SOCKET) return nullptr;
+    gBtRedials.fetch_add(1);
+
+    if (gBtCachedPort.load() == 0) {
+        SOCKADDR_BTH peer{};
+        int len = sizeof(peer);
+        if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &len) == 0 && peer.port != 0) {
+            gBtCachedPort.store(peer.port);
+        }
+    }
+
+    auto ch = std::make_shared<BtChannel>();
+    ch->sock = s;
+    ch->lastUseMs = nowMs();
+    return ch;
+}
+
+static void btReleaseChannel(const std::shared_ptr<BtChannel>& ch, bool healthy) {
+    if (!ch) return;
+    ch->lastUseMs = nowMs();
+    ch->compact();
+    if (!healthy) { btChannelClose(ch); return; }
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    if (ch->sock == INVALID_SOCKET) return;
+    for (auto& e : gBtPool) {
+        if (e == ch) { e->inPool = true; return; }
+    }
+    if (gBtPool.size() < kBtChannelCount) {
+        ch->inPool = true;
+        gBtPool.push_back(ch);
+    } else {
+        btChannelClose(ch);
+    }
+}
+
+/** How many reusable RFCOMM channels are parked and ready (0 = the next request must dial). */
+static size_t btPooledChannels() {
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    size_t n = 0;
+    for (const auto& ch : gBtPool) if (ch->inPool && ch->sock != INVALID_SOCKET) ++n;
+    return n;
+}
+
+/**
+ * Drop every *idle* pooled channel (radio went away, transport changed, peer re-paired).
+ * A channel that is mid-request is marked inPool == false and is left alone; its owner
+ * closes it when the exchange finishes.
+ */
+static void btPoolReset() {
+    std::lock_guard<std::mutex> lk(gBtPoolMtx);
+    for (auto& ch : gBtPool) {
+        if (ch->inPool) btChannelClose(ch);
+    }
+    gBtPool.clear();
+    gBtCachedPort.store(0);
+}
+
+/**
+ * One HTTP exchange over an already-open RFCOMM channel, framed for keep-alive:
+ * the body length comes from Content-Length or from de-chunking, never from EOF.
+ */
+static bool btHttpExchangeOnChannel(BtChannel& ch, const std::string& request,
+                                    const std::string& body, HttpReply& rep, int timeoutMs) {
+    if (ch.sock == INVALID_SOCKET) return false;
+    DWORD to = static_cast<DWORD>(timeoutMs);
+    setsockopt(ch.sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+    setsockopt(ch.sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+
+    if (!sendAll(ch.sock, request)) return false;
+    if (!body.empty() && !sendAll(ch.sock, body)) return false;
+
+    std::string headers;
+    if (!ch.readHeaderBlock(headers)) return false;
+
+    size_t sp1 = headers.find(' ');
+    if (sp1 != std::string::npos) {
+        size_t sp2 = headers.find(' ', sp1 + 1);
+        const std::string code = headers.substr(sp1 + 1, (sp2 == std::string::npos ? headers.size() : sp2) - sp1 - 1);
+        rep.status = std::atoi(code.c_str());
+    }
+
+    long long contentLength = -1;
+    bool chunked = false;
+    bool closes = false;
+    {
+        std::istringstream iss(headers);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t c = line.find(':');
+            if (c == std::string::npos) continue;
+            std::string k = line.substr(0, c);
+            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+            std::string v = line.substr(c + 1);
+            while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+            if (k == "content-length") contentLength = std::atoll(v.c_str());
+            else if (k == "transfer-encoding" && v.find("chunked") != std::string::npos) chunked = true;
+            else if (k == "connection" && v.find("close") != std::string::npos) closes = true;
+            rep.headers[k] = v;
+        }
+    }
+    if (rep.status == 204 || rep.status == 304) { rep.keepAliveOk = !closes; return true; }
+
+    if (chunked) {
+        while (true) {
+            std::string sizeLine;
+            int c;
+            while ((c = ch.getByte()) >= 0) {
+                if (c == '\n') break;
+                if (c != '\r') sizeLine.push_back(static_cast<char>(c));
+            }
+            if (c < 0) return false;
+            const size_t n = static_cast<size_t>(std::strtoull(sizeLine.c_str(), nullptr, 16));
+            if (n == 0) {
+                // trailer + final CRLF
+                std::string tail;
+                ch.readHeaderBlock(tail);
+                break;
+            }
+            if (!ch.readExact(n, rep.body)) return false;
+            ch.getByte(); ch.getByte(); // CRLF after the chunk
+        }
+    } else if (contentLength >= 0) {
+        if (!ch.readExact(static_cast<size_t>(contentLength), rep.body)) return false;
+    } else {
+        // No framing information: the peer will close, so this channel cannot be reused.
+        char tmp[16384];
+        while (true) {
+            const int n = recv(ch.sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) break;
+            rep.body.append(tmp, static_cast<size_t>(n));
+        }
+        closes = true;
+    }
+    rep.keepAliveOk = !closes;
+    return true;
+}
 
 static HttpReply httpRequestToPhone(
     const std::string& ip,
@@ -647,16 +993,56 @@ static HttpReply httpRequestToPhone(
     // exactly the same HTTP/WebDAV protocol as the TCP transports, so Z:\ and the File Manager work
     // with Wi-Fi / Hotspot / USB all switched OFF.
     const bool viaBluetooth = isBtEndpoint(ip);
-    std::unique_lock<std::mutex> btLk(gBtRfcommClientMtx, std::defer_lock);
-    SOCKET s = INVALID_SOCKET;
+
+    std::string keyCopy;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        keyCopy = gState.siblingKey;
+    }
 
     if (viaBluetooth) {
-        btLk.lock(); // one serialized RFCOMM stream at a time
-        s = btRfcommConnect(ip, timeoutMs);
-        if (s == INVALID_SOCKET) return rep;
-    } else {
-        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (s == INVALID_SOCKET) return rep;
+        // --- persistent RFCOMM channel: dial once, then reuse for the whole session ---
+        std::ostringstream req;
+        req << method << " " << targetPath << " HTTP/1.1\r\n";
+        req << "Host: chainit-bluetooth\r\n";
+        req << "X-ChainIt-Transport: bluetooth-rfcomm\r\n";
+        req << "X-ChainIt-Key: " << keyCopy << "\r\n";
+        req << "Content-Length: " << body.size() << "\r\n";
+        req << "Connection: keep-alive\r\n";
+        for (const auto& kv : extraHeaders) req << kv.first << ": " << kv.second << "\r\n";
+        req << "\r\n";
+        const std::string headStr = req.str();
+
+        const int dialTimeout = std::max(timeoutMs, 12000);
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            std::shared_ptr<BtChannel> ch = btAcquireChannel(ip, dialTimeout);
+            if (!ch) break;
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lk(ch->mtx); // per channel, so channels run in parallel
+                HttpReply attemptRep;
+                ok = btHttpExchangeOnChannel(*ch, headStr, body, attemptRep, timeoutMs);
+                if (ok) rep = std::move(attemptRep);
+                const bool reusable = ok && rep.keepAliveOk;
+                btReleaseChannel(ch, reusable);
+            }
+            if (ok && rep.status > 0) {
+                auto t1 = std::chrono::steady_clock::now();
+                rep.rttMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                gBtLastRttUs.store(static_cast<int64_t>(rep.rttMs * 1000.0));
+                gBtRequestsServed.fetch_add(1);
+                return rep;
+            }
+            // The link died (radio napped, peer closed, Doze suspended it): drop the stale
+            // channels and re-dial rather than reporting a dead transport.
+            rep = HttpReply{};
+            btPoolReset();
+        }
+        return rep;
+    }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return rep;
 
         u_long nonBlock = 1;
         ioctlsocket(s, FIONBIO, &nonBlock);
@@ -685,23 +1071,11 @@ static HttpReply httpRequestToPhone(
         ioctlsocket(s, FIONBIO, &nonBlock);
         DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
-    }
-
-    std::string keyCopy;
-    {
-        std::lock_guard<std::mutex> lk(gState.mtx);
-        keyCopy = gState.siblingKey;
-    }
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
 
     std::ostringstream req;
     req << method << " " << targetPath << " HTTP/1.1\r\n";
-    if (viaBluetooth) {
-        req << "Host: chainit-bluetooth\r\n";
-        req << "X-ChainIt-Transport: bluetooth-rfcomm\r\n";
-    } else {
-        req << "Host: " << ip << ":" << port << "\r\n";
-    }
+    req << "Host: " << ip << ":" << port << "\r\n";
     req << "X-ChainIt-Key: " << keyCopy << "\r\n";
     req << "Content-Length: " << body.size() << "\r\n";
     req << "Connection: close\r\n";
@@ -1066,6 +1440,13 @@ static std::string buildStateSnapshotJson() {
         << "\"phoneServerUuid\":\"" << kChainItPhoneUuidStr << "\","
         << "\"pcReceiverUuid\":\"" << kChainItPcUuidStr << "\","
         << "\"activeLink\":\"" << jsonEscape(isBtEndpoint(gState.activePhoneIp) ? gState.activePhoneIp : std::string("")) << "\","
+        << "\"pooledChannels\":" << btPooledChannels() << ","
+        << "\"maxChannels\":" << kBtChannelCount << ","
+        << "\"cachedRfcommChannel\":" << gBtCachedPort.load() << ","
+        << "\"requestsServed\":" << gBtRequestsServed.load() << ","
+        << "\"redials\":" << gBtRedials.load() << ","
+        << "\"lastRttMs\":" << (static_cast<double>(gBtLastRttUs.load()) / 1000.0) << ","
+        << "\"keepAlive\":true,"
         << "\"pairedDevices\":[";
     for (size_t i = 0; i < gState.btPairedDevices.size(); ++i) {
         if (i > 0) oss << ",";
@@ -1134,7 +1515,7 @@ static std::string buildStateSnapshotJson() {
         if (i > 0) oss << ",";
         oss << "\"" << jsonEscape(lanIps[i]) << "\"";
     }
-    oss << "],\"security\":{\"keyAuth\":\"required\",\"lockoutAfter\":5,\"lockoutWindowSec\":60,\"lockoutCooldownSec\":30,\"integrity\":\"sha256 per chunk + whole file\",\"chunkBytes\":" << kTransferChunkBytes << ",\"parallelWorkers\":" << (isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan) << ",\"chunksVerified\":" << gIntegrityChunksOk.load() << ",\"integrityFailures\":" << gIntegrityFailures.load() << "},\"serverPort\":" << HTTP_PORT << "}";
+    oss << "],\"linkProblem\":\"" << jsonEscape(gState.phoneLinkProblem) << "\",\"security\":{\"keyAuth\":\"required\",\"lockoutAfter\":5,\"lockoutWindowSec\":60,\"lockoutCooldownSec\":30,\"integrity\":\"sha256 per chunk + whole file\",\"chunkBytes\":" << kTransferChunkBytes << ",\"parallelWorkers\":" << (isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan) << ",\"chunksVerified\":" << gIntegrityChunksOk.load() << ",\"integrityFailures\":" << gIntegrityFailures.load() << "},\"serverPort\":" << HTTP_PORT << "}";
     return oss.str();
 }
 
@@ -1271,7 +1652,8 @@ static void discoveryLoop() {
         }
 
         tick++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(900));
+        if (gForceRescan.exchange(false)) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); }
+        else { std::this_thread::sleep_for(std::chrono::milliseconds(900)); }
     }
 
     closesocket(sock);
@@ -1407,7 +1789,8 @@ static void bluetoothServerLoop() {
         SOCKET srv = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
         if (srv == INVALID_SOCKET) {
             gBtServerListening.store(false);
-            std::this_thread::sleep_for(std::chrono::seconds(20));
+            for (int i = 0; i < 200 && gRunning.load() && !gForceRescan.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
@@ -1420,7 +1803,8 @@ static void bluetoothServerLoop() {
         if (bind(srv, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR || listen(srv, 4) == SOCKET_ERROR) {
             closesocket(srv);
             gBtServerListening.store(false);
-            std::this_thread::sleep_for(std::chrono::seconds(20));
+            for (int i = 0; i < 200 && gRunning.load() && !gForceRescan.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
 
@@ -1943,7 +2327,7 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.3.0";
+static const char* const kChainItAppVersion = "1.4.0";
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -2463,34 +2847,107 @@ static void handleHttpClient(SOCKET client) {
     // 2. Multipath RFC 4918 WebDAV Gateway (/dav & /dav/*) -> forwards to active Android phone!
     if (urlPath == "/dav" || urlPath.rfind("/dav/", 0) == 0) {
         std::string phoneIp;
+        bool everSawPhone = false;
         {
             std::lock_guard<std::mutex> lk(gState.mtx);
             phoneIp = gState.activePhoneIp;
+            everSawPhone = gState.everDiscoveredPhone || !phoneIp.empty();
+            if (!phoneIp.empty()) gState.everDiscoveredPhone = true;
         }
+
         if (!phoneIp.empty()) {
             std::map<std::string, std::string> fwdHeaders;
             if (headers.count("depth")) fwdHeaders["Depth"] = headers["depth"];
             if (headers.count("destination")) fwdHeaders["Destination"] = headers["destination"];
             if (headers.count("overwrite")) fwdHeaders["Overwrite"] = headers["overwrite"];
             if (headers.count("range")) fwdHeaders["Range"] = headers["range"];
+            if (headers.count("if")) fwdHeaders["If"] = headers["if"];
+            if (headers.count("if-match")) fwdHeaders["If-Match"] = headers["if-match"];
+            if (headers.count("if-none-match")) fwdHeaders["If-None-Match"] = headers["if-none-match"];
+            if (headers.count("content-type")) fwdHeaders["Content-Type"] = headers["content-type"];
+            if (headers.count("x-chainit-file-sha256")) fwdHeaders["X-ChainIt-File-Sha256"] = headers["x-chainit-file-sha256"];
 
-            HttpReply rep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, method, fullUrl, body, fwdHeaders, 60000);
+            const int timeout = isBtEndpoint(phoneIp) ? 90000 : 60000;
+            HttpReply rep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, method, fullUrl, body, fwdHeaders, timeout);
+
             if (rep.status > 0) {
+                // Surface an actionable reason instead of letting Explorer show a dead drive.
+                if (rep.status == 401 || rep.status == 403 || rep.status == 429) {
+                    std::string why = jsonExtractString(rep.body, "error", "");
+                    if (why.empty()) why = (rep.status == 429)
+                        ? "Phone VFS is cooling down after repeated Pairing Key failures (30 s)."
+                        : "Phone rejected the Pairing Key.";
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    gState.phoneLinkProblem = why;
+                } else if (!gState.phoneLinkProblem.empty()) {
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    gState.phoneLinkProblem.clear();
+                }
+
                 std::string ct = rep.headers.count("content-type") ? rep.headers["content-type"] : "application/xml; charset=\"utf-8\"";
                 std::map<std::string, std::string> outHdrs = {
                     {"DAV", "1, 2"},
                     {"MS-Author-Via", "DAV"},
                     {"Accept-Ranges", "bytes"},
                 };
-                if (rep.headers.count("lock-token")) outHdrs["Lock-Token"] = rep.headers["lock-token"];
-                if (rep.headers.count("content-range")) outHdrs["Content-Range"] = rep.headers["content-range"];
-                sendHttpResponse(client, rep.status, rep.status == 207 ? "Multi-Status" : "OK", ct, rep.body.data(), rep.body.size(), outHdrs);
+                for (const char* hk : {"lock-token", "content-range", "x-chainit-file-sha256",
+                                       "x-chainit-chunk-sha256", "last-modified", "etag", "content-disposition"}) {
+                    if (rep.headers.count(hk)) {
+                        std::string canon = hk;
+                        bool up = true;
+                        for (auto& c : canon) { if (up) { c = (char)toupper((unsigned char)c); up = false; } else { up = (c == '-'); } }
+                        outHdrs[canon] = rep.headers[hk];
+                    }
+                }
+                const char* reason = rep.status == 207 ? "Multi-Status"
+                                   : rep.status == 201 ? "Created"
+                                   : rep.status == 204 ? "No Content"
+                                   : rep.status == 206 ? "Partial Content"
+                                   : rep.status == 401 ? "Unauthorized"
+                                   : rep.status == 403 ? "Forbidden"
+                                   : rep.status == 404 ? "Not Found"
+                                   : rep.status == 409 ? "Conflict"
+                                   : rep.status == 429 ? "Too Many Requests"
+                                   : rep.status >= 500 ? "Server Error" : "OK";
+                sendHttpResponse(client, rep.status, reason, ct, rep.body.data(), rep.body.size(), outHdrs);
                 closesocket(client);
                 return;
             }
+
+            // The sibling endpoint is known but the request never completed. Do NOT hand Explorer
+            // an empty fake drive - that is exactly the "connected but does nothing" failure. Say
+            // why, so the user and the UI can act on it.
+            std::string why;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                if (!gState.phoneLinkProblem.empty()) why = gState.phoneLinkProblem;
+            }
+            if (why.empty()) {
+                why = isBtEndpoint(phoneIp)
+                    ? "Bluetooth RFCOMM link to the phone did not answer. Keep the phone in range and Bluetooth on; ChainIt re-dials automatically."
+                    : "The phone did not answer on " + phoneIp + ". ChainIt is re-scanning every transport now.";
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                gState.phoneLinkProblem = why;
+            }
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("VFS", "Z:\\ request failed - phone unreachable", why);
+            }
+            triggerTransportRescan();
+
+            std::map<std::string, std::string> davHdr = {{"DAV", "1, 2"}, {"MS-Author-Via", "DAV"},
+                                                         {"Retry-After", "5"}};
+            const std::string errXml =
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                "<D:error xmlns:D=\"DAV:\">" + xmlEscape(why) + "</D:error>";
+            sendHttpResponse(client, 503, "Service Unavailable", "application/xml; charset=\"utf-8\"",
+                             errXml.data(), errXml.size(), davHdr);
+            closesocket(client);
+            return;
         }
 
-        // Local WebDAV fallback when phone isn't on LAN yet so Z:\ still mounts cleanly!
+        // No phone has ever paired. Serve an honest, labelled placeholder drive with one readme so
+        // Z:\\ explains itself instead of looking like an empty disk that silently does nothing.
         std::map<std::string, std::string> davHdr = {{"DAV", "1, 2"}, {"MS-Author-Via", "DAV"}};
         if (method == "OPTIONS") {
             sendHttpResponse(client, 200, "OK", "text/plain", "", 0, davHdr);
@@ -2498,17 +2955,24 @@ static void handleHttpClient(SOCKET client) {
             return;
         }
         if (method == "PROPFIND") {
-            std::string xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:multistatus xmlns:D=\"DAV:\">"
-                              "<D:response><D:href>/dav/</D:href><D:propstat><D:prop>"
-                              "<D:displayname>ChainIt Sibling (Z:)</D:displayname>"
-                              "<D:resourcetype><D:collection/></D:resourcetype>"
-                              "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
-                              "</D:multistatus>";
-            sendHttpResponse(client, 207, "Multi-Status", "application/xml; charset=\"utf-8\"", xml.data(), xml.size(), davHdr);
+            const std::string xml = buildWaitingDrivePropfind(urlPath, headers);
+            sendHttpResponse(client, 207, "Multi-Status", "application/xml; charset=\"utf-8\"",
+                             xml.data(), xml.size(), davHdr);
             closesocket(client);
             return;
         }
-        sendHttpResponse(client, 200, "OK", "text/plain", "", 0, davHdr);
+        if (method == "GET" && urlPath.find("READ ME FIRST") != std::string::npos) {
+            const std::string txt = waitingDriveReadme();
+            sendHttpResponse(client, 200, "OK", "text/plain; charset=\"utf-8\"",
+                             txt.data(), txt.size(), davHdr);
+            closesocket(client);
+            return;
+        }
+        const std::string msg = "ChainIt has not found your Android phone yet. Open ChainIt on the phone, "
+                                "enable Sibling Mode, and make sure Bluetooth or Wi-Fi is on. "
+                                "Z:\\ fills itself in the moment the phone answers.";
+        sendHttpResponse(client, 503, "Service Unavailable", "text/plain; charset=\"utf-8\"",
+                         msg.data(), msg.size(), davHdr);
         closesocket(client);
         return;
     }
@@ -3027,13 +3491,26 @@ static std::wstring hubStatusLines(std::wstring* sub, std::wstring* foot) {
     else if (tr == L"bluetooth") tr = L"Bluetooth RFCOMM";
     else if (tr == L"online_p2p") tr = L"Online relay";
     *sub = std::wstring(L"Transport: ") + tr + (gState.zDriveMounted || connected ? L"   \u00b7   Z:\\ mounted" : L"   \u00b7   Z:\\ idle");
-    char buf[256];
-    std::snprintf(buf, sizeof(buf),
-                  "Pairing key required \u00b7 %llu chunk hashes verified \u00b7 %llu integrity failures \u00b7 %d x 2 MiB parallel streams",
-                  (unsigned long long)gIntegrityChunksOk.load(),
-                  (unsigned long long)gIntegrityFailures.load(),
-                  isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan);
+
+    // A link that is up but not serving must say so here, not silently show an empty Z:\ drive.
+    std::wstring problem = wideFromAnsi(gState.phoneLinkProblem);
+
+    char buf[320];
+    if (isBtEndpoint(gState.activePhoneIp)) {
+        std::snprintf(buf, sizeof(buf),
+                      "Bluetooth RFCOMM keep-alive \u00b7 %llu/%llu channels parked \u00b7 %llu requests served \u00b7 %llu dials \u00b7 %.0f ms",
+                      (unsigned long long)btPooledChannels(), (unsigned long long)kBtChannelCount,
+                      (unsigned long long)gBtRequestsServed.load(), (unsigned long long)gBtRedials.load(),
+                      static_cast<double>(gBtLastRttUs.load()) / 1000.0);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "Pairing key required \u00b7 %llu chunk hashes verified \u00b7 %llu integrity failures \u00b7 %d x 2 MiB parallel streams",
+                      (unsigned long long)gIntegrityChunksOk.load(),
+                      (unsigned long long)gIntegrityFailures.load(),
+                      isBtEndpoint(gState.activePhoneIp) ? 1 : kTransferWorkersLan);
+    }
     *foot = wideFromAnsi(buf);
+    if (!problem.empty()) return problem;
     return connected ? main : std::wstring(L"ChainIt Sibling");
 }
 
@@ -3140,14 +3617,20 @@ static LRESULT CALLBACK HubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             RECT title{header.left + 48, header.top + 4, header.right, header.top + 30};
             hubText(hdc, title, L"ChainIt Sibling", 19, RGB(0xF1, 0xF5, 0xF9), DT_LEFT | DT_VCENTER | DT_SINGLELINE, true);
             RECT ver{header.left + 48, header.top + 30, header.right, header.top + 50};
-            hubText(hdc, ver, std::wstring(L"v") + wideFromAnsi(kChainItAppVersion) + L"  \u00b7  Android \u2194 Windows file bridge",
+            hubText(hdc, ver, std::wstring(L"v") + wideFromAnsi(kChainItAppVersion) +
+                            L"  \u00b7  Android \u2194 Windows file bridge  \u00b7  Built by Qmer",
                     12, RGB(0x94, 0xA3, 0xB8), DT_LEFT | DT_VCENTER | DT_SINGLELINE, false);
 
             // status panel (recessed, skeuomorphic)
             hubRoundRect(hdc, status, 12, RGB(0x0E, 0x14, 0x20), RGB(0x1E, 0x29, 0x3B), false);
             std::wstring sub, foot;
             const std::wstring mainLine = hubStatusLines(&sub, &foot);
-            const bool linked = (mainLine != L"ChainIt Sibling");
+            std::wstring problemNow;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                problemNow = wideFromAnsi(gState.phoneLinkProblem);
+            }
+            const bool linked = (mainLine != L"ChainIt Sibling") && problemNow.empty();
             RECT led{status.left + 16, status.top + 18, status.left + 28, status.top + 30};
             HBRUSH ledBrush = CreateSolidBrush(linked ? RGB(0x10, 0xB9, 0x81) : RGB(0xF5, 0x9E, 0x0B));
             HGDIOBJ ob2 = SelectObject(hdc, ledBrush);
@@ -3193,7 +3676,7 @@ static LRESULT CALLBACK HubWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hubRoundRect(hdc, footer, 11, RGB(0x0C, 0x12, 0x1E), RGB(0x1A, 0x24, 0x34), false);
             const bool toastLive = nowMs() < gHubToastUntil.load() && !gHubToast.empty();
             const std::wstring footText = toastLive ? gHubToast
-                : std::wstring(L"Right-click the tray icon for the full menu \u00b7 closing this window keeps ChainIt running.");
+                : std::wstring(L"Built by Qmer \u00b7 right-click the tray icon for the full menu \u00b7 closing this window keeps ChainIt running.");
             RECT tr{footer.left + 14, footer.top + 6, footer.right - 14, footer.bottom - 6};
             hubText(hdc, tr, footText, 11, toastLive ? RGB(0xA7, 0xF3, 0xD0) : RGB(0x52, 0x60, 0x79),
                     DT_LEFT | DT_VCENTER | DT_WORDBREAK, false);

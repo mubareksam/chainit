@@ -251,3 +251,72 @@ file, and to make every refusal visible instead of failing quietly.
   unmaps `Z:\`, removes both shortcuts, deletes the uninstall registry key and the saved settings in
   `%APPDATA%\ChainIt`, then hands its own file and folder to a detached `cmd.exe` - a running exe cannot
   delete itself.
+
+---
+
+## 7. Bluetooth as a First-Class Drive Transport (v1.4.0)
+
+Before v1.4.0 the RFCOMM link came up and then appeared to do nothing. Three independent causes, all fixed.
+
+### 7.1 Why it looked dead
+
+| Cause | Symptom | Fix |
+| :--- | :--- | :--- |
+| Windows dialled the radio **per request** behind one global mutex | An RFCOMM connect is an SDP lookup + page (1-5 s); Explorer issues dozens of requests per folder, so the queue never drained | Three **persistent channels** (`kBtChannelCount`), each with its own mutex, reused as HTTP/1.1 keep-alive sessions |
+| The phone served **one request per connection** | Even a reused socket could not carry a second request | `handleStreamSession` loops: parses as many requests as the peer pipelines, frames each response by `Content-Length`/chunked (never by EOF), drains unconsumed bodies, flushes per response |
+| `/dav` **faked success** when the phone did not answer | Explorer mounted `Z:\` and showed an empty synthetic drive - "connected but does nothing" | Real **503 + the actual reason**, logged, transport re-scan forced, published as `linkProblem` in `/api/state`; before any phone has paired, `Z:\` serves one readable `READ ME FIRST` file |
+
+### 7.2 Persistent RFCOMM channel pool (Windows)
+
+```text
+httpRequestToPhone("bt://AA:BB:CC:DD:EE:FF", ...)
+  btAcquireChannel()   -> reuse a parked channel, else btRfcommConnect()
+                          (first dial caches the SDP-discovered RFCOMM channel
+                           number in gBtCachedPort, so later dials skip SDP)
+  lock channel.mtx     -> per channel, NOT global: 3 requests run in parallel
+  btHttpExchangeOnChannel()
+      send request with "Connection: keep-alive"
+      read headers byte-at-a-time to CRLFCRLF (never over-reads into the body)
+      body from Content-Length, or by de-chunking, or (no framing) to EOF -> drop channel
+  btReleaseChannel(ok && keepAliveOk)  -> park for reuse, or close
+  on failure: btPoolReset() and re-dial (up to 3 attempts)
+```
+
+`btPoolReset()` only closes channels marked `inPool`; a channel mid-request is owned by its caller and closed
+by it, so a transport switch can never pull a socket out from under an in-flight transfer.
+
+Telemetry published in `/api/state -> bluetooth`: `pooledChannels`, `maxChannels`, `cachedRfcommChannel`,
+`requestsServed`, `redials`, `lastRttMs`, `keepAlive`.
+
+### 7.3 Keep-alive session loop (Android)
+
+`PhoneHttpAndWebDavServer.handleStreamSession` wraps the stream in a `CountingInputStream` so that after each
+handler returns it can drain `Content-Length - consumed` bytes. Without that, an upload body a handler did not
+read would be parsed as the next request line and desynchronise the session permanently. Responses ask
+`connectionHeader()` (a `ThreadLocal` set per request) whether to advertise `keep-alive` or `close`. Sessions
+are registered so a sweeper can force-close one idle for 10 minutes - Bluetooth streams have no `SO_TIMEOUT`
+of their own, and a blocked `read()` on a vanished peer would otherwise pin a thread forever.
+
+### 7.4 Surviving a phone locked for hours
+
+| Mechanism | Detail |
+| :--- | :--- |
+| Foreground type | `connectedDevice` (not `dataSync`, which Android 14 stops after ~6 h per 24 h) |
+| Doze heartbeat | `setExactAndAllowWhileIdle` every 9 minutes -> `selfCheck()` restarts the VFS server, RFCOMM listener or UDP discovery if any died, and re-takes the Wi-Fi/multicast locks |
+| Wake lock | `PARTIAL_WAKE_LOCK` renewed 30 minutes before its 12-hour ceiling, so there is never an unlocked gap |
+| Recents swipe | `onTaskRemoved` schedules an immediate restart via `AlarmManager` |
+| Listener watchdog | Re-arms RFCOMM if `accept()` throws, if the radio is toggled, or if Doze suspends it; secure channel first, then the insecure channel many desktop stacks require |
+| Battery exemption | Surfaced as a setup row with an `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` intent |
+| Proof of life | Survived heartbeats are counted and shown in the notification, the Android footer and the Windows About tab |
+
+### 7.5 Refusals are never silent
+
+A correct Pairing Key with Sibling Mode switched off answers **403** with the exact remedy instead of a 401
+that is indistinguishable from a dead link. Wrong or missing keys still answer 401 and still trip the
+brute-force lockout. Any of these, plus an unreachable phone, is written to `gState.phoneLinkProblem`, shown
+in an amber banner in the web UI and as the headline of the native hub window.
+
+### 7.6 Attribution
+
+**Built by Qmer** - the Windows About tab, the native hub window header and footer, the Android app footer,
+and the `VERSIONINFO` of both exes (`CompanyName = Qmer`, `LegalCopyright = "Built by Qmer"`).

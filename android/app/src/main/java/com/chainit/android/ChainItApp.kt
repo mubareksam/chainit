@@ -79,6 +79,6 @@ class ChainItApp : Application() {
 
 /** Small compile-time constants injected by android/build-apk.sh (kept in sync with the manifest). */
 object BuildConfig {
-    const val VERSION_LABEL = "1.3.0"
-    const val VERSION_CODE = 4
+    const val VERSION_LABEL = "1.4.0"
+    const val VERSION_CODE = 5
 }

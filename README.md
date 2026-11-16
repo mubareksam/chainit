@@ -10,15 +10,60 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.21 MB | **v1.3.0** — Portable `.exe` (no runtime, no extra DLLs). Native **ChainIt hub window** that owns the taskbar button with the real chain-link icon, System Tray icon, Smart Link UDP auto-discovery, **native Bluetooth RFCOMM sockets (`AF_BTH` / `ws2bth.h`) for both directions**, automatic `Z:\` drive mounter **labelled with your phone's name**, the dedicated File Manager window, **parallel 2 MiB chunked transfers with SHA-256 integrity checks**, and a built-in **in-place self-updater**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.24 MB | **v1.4.0** — Portable `.exe`. **Bluetooth is now a full `Z:\` transport**: three persistent RFCOMM channels reused as HTTP/1.1 keep-alive sessions (one dial serves a whole Explorer session, not one request), SDP channel number cached after the first lookup. Native hub window owns the taskbar identity, `Z:\` is labelled with the phone's name, parallel 2 MiB chunked transfers with SHA-256 gates, in-place self-updater, `/uninstall`. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.4.0.exe`](./releases/ChainIt-Setup-1.4.0.exe) | ~1.54 MB | **v1.4.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
 | **Windows installer** | [`releases/ChainIt-Setup-1.3.0.exe`](./releases/ChainIt-Setup-1.3.0.exe) | ~1.51 MB | **v1.3.0** — A real setup program with **no third-party packaging tool**: the installer stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, an **Apps & features** entry with a working uninstaller, and `/S` for silent deployment. Re-running it updates the same file in place. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~864 KB | **v1.3.0 (`versionCode 4`)** — V2+V3 signed native Kotlin APK (`com.chainit.android`). Same beloved chain-link launcher icon, fully redesigned UI, crash-log recovery, in-app updates that replace the installed build, screen-off `SiblingDaemonService` over USB Tethering / Wi-Fi LAN / Local Hotspot / **pure Bluetooth RFCOMM**, and a **hardened VFS server**: the Pairing Key is now mandatory (with a brute-force lockout) and every served byte range is published with its SHA-256 so a tampered upload is rejected with `409 Conflict`. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.4.0 (`versionCode 5`)** — V2+V3 signed Kotlin APK. The VFS server now speaks **HTTP/1.1 keep-alive**, so a single Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.3.0.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.4.0.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.4.0
+
+> **Built by Qmer** — credited on the Windows About tab, in the native hub window, in the Android app footer,
+> and in the `VERSIONINFO` of both exes (`CompanyName` = Qmer, `LegalCopyright` = "Built by Qmer").
+
+1. **Bluetooth now behaves like Wi-Fi/LAN — a real `Z:\` drive, not a status line.**
+   The link was up before but effectively did nothing, for three concrete reasons, all fixed:
+   - *Windows dialled the radio for every single request.* An RFCOMM connect is an SDP lookup plus a page
+     (1–5 s), and a global mutex meant only one request could ever be in flight. Explorer issues dozens of
+     requests to draw one folder, so the queue never drained. ChainIt now keeps **three persistent channels**
+     open and reuses them as **HTTP/1.1 keep-alive** sessions, each with its own mutex so they run in
+     parallel. One dial serves a whole browsing session.
+   - *The phone answered exactly one request per connection.* `handleStreamSession` now loops: it parses as
+     many requests as the peer pipelines, frames each response by `Content-Length`/chunked instead of EOF,
+     drains any body a handler did not consume (so upload bytes can never be mis-read as the next request
+     line), and flushes per response.
+   - *`Z:\` faked success.* When the phone did not answer, the `/dav` handler served a synthetic empty drive, so
+     Explorer showed a mounted disk with nothing in it — the literal "connected but does nothing". It now
+     returns **503 with the actual reason**, logs it, forces a transport re-scan, and publishes it as
+     `linkProblem` in `/api/state`, which the UI shows in an amber banner and the hub window shows as its
+     headline. Before any phone has ever paired, `Z:\` serves one readable `READ ME FIRST` file instead of a void.
+   - Also: the SDP-discovered RFCOMM channel number is cached (later dials skip SDP), the Android listener
+     falls back from the secure to the **insecure** channel that many desktop stacks require, and a watchdog
+     re-arms it forever. Live telemetry (`pooledChannels`, `requestsServed`, `redials`, `lastRttMs`) is in
+     `/api/state` and on the About tab, and the Android footer shows its own RFCOMM readout.
+2. **A phone locked for hours keeps working.**
+   - The service now runs as **`connectedDevice`**, not `dataSync` — Android 14 time-caps `dataSync`
+     foreground services at roughly 6 h per 24 h and then stops them, which is exactly the "worked, then died
+     overnight" failure.
+   - A **Doze heartbeat** (`setExactAndAllowWhileIdle`, 9-minute cadence, the minimum Android allows) runs a
+     self-check that restarts the VFS server, the RFCOMM listener or UDP discovery if any of them died, and
+     re-takes the Wi-Fi/multicast locks.
+   - The partial wake lock **renews itself** 30 minutes before its 12-hour ceiling, so there is never an
+     unlocked gap.
+   - Swiping ChainIt out of recents (`onTaskRemoved`) schedules an immediate restart.
+   - The battery-optimisation exemption is surfaced as a setup row with a tap-to-allow intent.
+   - Survived heartbeats are shown in the notification and the UI as proof of life.
+3. **A refusal is never silent.** The Pairing Key is still mandatory, but a *correct* key with Sibling Mode
+   switched off now answers **403 with the exact remedy** ("enable Sibling Mode on the phone") instead of a
+   401 that looks like a dead link. Wrong keys still 401 and still trip the brute-force lockout.
+4. **About tab.** New fourth tab in the Windows/browser UI: attribution, version, and live per-transport
+   telemetry (RFCOMM channels parked, requests served, dials, cached channel, integrity counters), plus a
+   plain-English explanation of what each transport actually does.
 
 ### What is new in v1.3.0
 
