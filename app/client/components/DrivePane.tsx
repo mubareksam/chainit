@@ -32,7 +32,7 @@ import {
 import { DriveStats, DriveTarget, SystemSnapshot, VfsItem } from '../../shared/types';
 import { api } from '../api/client';
 import { formatBytes, isImageMime, toWindowsDisplayPath } from '../utils/format';
-import { SortState, sortItems } from '../utils/sort';
+import { SORT_LABELS, SortState, sortItems } from '../utils/sort';
 import { SortMenu } from './SortMenu';
 
 export interface ClipboardState {
@@ -170,6 +170,18 @@ export const DrivePane: React.FC<Props> = ({
     return () => window.removeEventListener('click', closeMenu);
   }, []);
 
+  const filteredItems = items.filter((i) =>
+    search.trim() ? i.name.toLowerCase().includes(search.trim().toLowerCase()) : true
+  );
+
+  /** Explorer-grade ordering (name / size / date / type, direction, folders first). */
+  const shownItems = useMemo(() => sortItems(filteredItems, sort), [filteredItems, sort]);
+
+  const selectedBytes = useMemo(
+    () => items.filter((i) => selectedPaths.includes(i.path)).reduce((acc, i) => acc + i.sizeBytes, 0),
+    [items, selectedPaths]
+  );
+
   // Keyboard shortcuts when pane is focused
   useEffect(() => {
     if (!isFocused) return;
@@ -179,7 +191,7 @@ export const DrivePane: React.FC<Props> = ({
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
         e.preventDefault();
-        setSelectedPaths(items.map((i) => i.path));
+        setSelectedPaths(shownItems.map((i) => i.path));
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && selectedPaths.length > 0) {
         e.preventDefault();
         const names = items.filter((i) => selectedPaths.includes(i.path)).map((i) => i.name);
@@ -203,11 +215,51 @@ export const DrivePane: React.FC<Props> = ({
           setRenamingPath(item.path);
           setRenameValue(item.name);
         }
+      } else if (e.key === 'Enter' && selectedPaths.length >= 1) {
+        // Explorer: Enter opens the focused item - a folder drills in, a file opens.
+        e.preventDefault();
+        const item = shownItems.find((i) => i.path === selectedPaths[0]);
+        if (item) handleDoubleClick(item);
+      } else if ((e.key === 'Backspace' || (e.altKey && e.key === 'ArrowUp')) && currentDir !== '/') {
+        e.preventDefault();
+        const parts = currentDir.split('/').filter(Boolean);
+        parts.pop();
+        onNavigate(parts.length === 0 ? '/' : '/' + parts.join('/'));
+      } else if (e.key === 'F5') {
+        e.preventDefault();
+        void loadDirectory();
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        setNewFolderName('');
+        setCreatingFolder(true);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'e') {
+        // Explorer's "jump to the search box" - focus this pane and its filter.
+        e.preventDefault();
+        onFocusPane();
+        const box = document.getElementById(`ci-search-${target}`) as HTMLInputElement | null;
+        box?.focus();
+      } else if (e.key === 'Escape') {
+        setCtxMenu(null);
+        setSelectedPaths([]);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isFocused, items, selectedPaths, clipboard, target, currentDir, onSetClipboard, onPasteInto, notify]);
+  }, [
+    isFocused,
+    items,
+    shownItems,
+    selectedPaths,
+    clipboard,
+    target,
+    currentDir,
+    onSetClipboard,
+    onPasteInto,
+    onNavigate,
+    onFocusPane,
+    loadDirectory,
+    notify,
+  ]);
 
   const handleSelectItem = (item: VfsItem, e: React.MouseEvent) => {
     onFocusPane();
@@ -338,13 +390,6 @@ export const DrivePane: React.FC<Props> = ({
       await handleExternalFilesUpload(e.dataTransfer.files, destDir);
     }
   };
-
-  const filteredItems = items.filter((i) =>
-    search.trim() ? i.name.toLowerCase().includes(search.trim().toLowerCase()) : true
-  );
-
-  /** Explorer-grade ordering (name / size / date / type, direction, folders first). */
-  const shownItems = useMemo(() => sortItems(filteredItems, sort), [filteredItems, sort]);
 
   const toggleSortKey = (key: SortState['key']) =>
     onSortChange(
@@ -483,6 +528,7 @@ export const DrivePane: React.FC<Props> = ({
         <div className="relative w-32 sm:w-40">
           <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2" />
           <input
+            id={`ci-search-${target}`}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Filter..."
@@ -490,26 +536,6 @@ export const DrivePane: React.FC<Props> = ({
           />
         </div>
 
-        <div className="ci-nav p-0.5 rounded-lg">
-          <button
-            onClick={() => setViewMode('list')}
-            className={`p-1 rounded ${
-              viewMode === 'list' ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300'
-            }`}
-            title="Details List"
-          >
-            <ListIcon className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => setViewMode('grid')}
-            className={`p-1 rounded ${
-              viewMode === 'grid' ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300'
-            }`}
-            title="Icon Grid"
-          >
-            <LayoutGrid className="w-3.5 h-3.5" />
-          </button>
-        </div>
       </div>
 
       {/* Quick Folder Chips */}
@@ -789,7 +815,7 @@ export const DrivePane: React.FC<Props> = ({
         ) : viewMode === 'list' ? (
           <div className="space-y-0.5">
             <div className="ci-section-label grid grid-cols-12 px-2.5 py-1.5 border-b border-[var(--ci-border-soft)]">
-              <div className="col-span-7">
+              <div className="col-span-6">
                 <button type="button" className="ci-th" data-active={sort.key === 'name'} onClick={() => toggleSortKey('name')} title="Sort by name">
                   <span>Name</span>
                   {sort.key === 'name' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
@@ -801,10 +827,16 @@ export const DrivePane: React.FC<Props> = ({
                   {sort.key === 'size' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
                 </button>
               </div>
-              <div className="col-span-3 flex justify-end pr-1">
-                <button type="button" className="ci-th" data-active={sort.key === 'type'} onClick={() => toggleSortKey('type')} title="Sort by type">
+              <div className="col-span-2 flex justify-end pr-1">
+                <button type="button" className="ci-th" data-active={sort.key === 'type'} onClick={() => toggleSortKey('type')} title="Sort by extension / type">
                   <span>Type</span>
                   {sort.key === 'type' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
+                </button>
+              </div>
+              <div className="col-span-2 flex justify-end pr-1">
+                <button type="button" className="ci-th" data-active={sort.key === 'modified'} onClick={() => toggleSortKey('modified')} title="Sort by date modified">
+                  <span>Modified</span>
+                  {sort.key === 'modified' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
                 </button>
               </div>
             </div>
@@ -856,7 +888,7 @@ export const DrivePane: React.FC<Props> = ({
                         : 'text-[var(--ci-text-2)]'
                   } ${isCut ? 'opacity-50' : ''}`}
                 >
-                  <div className="col-span-7 flex items-center gap-2 min-w-0 pr-2">
+                  <div className="col-span-6 flex items-center gap-2 min-w-0 pr-2">
                     {renderItemIcon(item)}
                     {renamingPath === item.path ? (
                       <form onSubmit={handleRenameSubmit} className="flex items-center gap-1 flex-1">
@@ -878,8 +910,11 @@ export const DrivePane: React.FC<Props> = ({
                   <div className="col-span-2 text-right font-mono text-[11px] text-slate-400">
                     {item.kind === 'directory' ? '—' : formatBytes(item.sizeBytes)}
                   </div>
-                  <div className="col-span-3 text-right text-[11px] text-slate-500 truncate pl-2">
+                  <div className="col-span-2 text-right text-[11px] text-slate-500 truncate pl-2">
                     {item.kind === 'directory' ? 'Folder' : item.ext.replace('.', '').toUpperCase() || 'FILE'}
+                  </div>
+                  <div className="col-span-2 text-right text-[11px] text-slate-500 truncate pl-2" title={new Date(item.modifiedMs).toLocaleString()}>
+                    {item.kind === 'directory' ? '—' : new Date(item.modifiedMs).toLocaleDateString() + ' ' + new Date(item.modifiedMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                   </div>
                 </div>
               );
@@ -939,12 +974,18 @@ export const DrivePane: React.FC<Props> = ({
 
       {/* Footer Status */}
       <div className="flex items-center justify-between px-3.5 py-1.5 bg-slate-950/80 border-t border-slate-800/80 text-[11px] text-slate-400">
-        <span>
-          {filteredItems.length} item(s)
-          {selectedPaths.length > 0 ? ` • ${selectedPaths.length} selected` : ''}
+        <span className="flex items-center gap-2">
+          <span>
+            {shownItems.length} item(s)
+            {selectedPaths.length > 0 ? ` • ${selectedPaths.length} selected (${formatBytes(selectedBytes)})` : ''}
+          </span>
+          <span className="ci-chip" title="Active sorting">
+            {SORT_LABELS[sort.key]} {sort.desc ? '↓' : '↑'}{sort.foldersFirst ? ' · folders first' : ''}
+          </span>
         </span>
-        <span className="text-slate-500">
-          Drag between C:\ & Z:\ • Double-click to open/edit
+        <span className="text-slate-500 hidden sm:inline">
+          Drag between C:\ & Z:\ • Enter open • F2 rename • Del delete • F5 refresh •
+          Backspace up • Ctrl+A/C/X/V • Ctrl+Shift+N new folder • Ctrl+E filter
         </span>
       </div>
 
@@ -1004,6 +1045,22 @@ export const DrivePane: React.FC<Props> = ({
                 <MoveRight className="w-3.5 h-3.5 text-amber-400" />
                 Move to {otherLabel}
               </button>
+              {ctxMenu.item!.kind === 'file' && (
+                <button
+                  onClick={() => {
+                    const it = ctxMenu.item!;
+                    setCtxMenu(null);
+                    const a = document.createElement('a');
+                    a.href = api.rawUrl(target, it.path, true);
+                    a.download = it.name;
+                    a.click();
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-slate-800 text-left"
+                >
+                  <Download className="w-3.5 h-3.5 text-cyan-400" />
+                  Download to this PC
+                </button>
+              )}
               <div className="my-1 border-t border-slate-800" />
               <button
                 onClick={() => {

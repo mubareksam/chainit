@@ -8,7 +8,7 @@ So the hashes here MUST match the committed binaries — run this script after e
 release build (android/build-apk.sh and the Windows zig c++ command) and commit the
 result together with the binaries.
 
-Usage:  python3 scripts/publish_release_manifest.py [--version 1.2.0] [--code 3]
+Usage:  python3 scripts/publish_release_manifest.py [--version 1.3.0] [--code 4]
 """
 
 from __future__ import annotations
@@ -26,6 +26,11 @@ APK = RELEASES / "ChainIt-Android.apk"
 MANIFEST = RELEASES / "version.txt"
 
 
+def setup_exe(version: str) -> pathlib.Path:
+    """The packed Windows installer for this version, if it has been built."""
+    return RELEASES / f"ChainIt-Setup-{version}.exe"
+
+
 def sha256(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -36,8 +41,8 @@ def sha256(path: pathlib.Path) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default="1.2.0", help="human version label (versionName)")
-    parser.add_argument("--code", type=int, default=3, help="Android versionCode")
+    parser.add_argument("--version", default="1.3.0", help="human version label (versionName)")
+    parser.add_argument("--code", type=int, default=4, help="Android versionCode")
     parser.add_argument("--channel", default="stable")
     args = parser.parse_args()
 
@@ -48,6 +53,24 @@ def main() -> int:
 
     exe_hash, apk_hash = sha256(EXE), sha256(APK)
     today = _dt.date.today().isoformat()
+
+    # The setup package is optional but published when present: it carries the very
+    # same ChainIt-Windows.exe payload, so its hash is recorded for completeness.
+    setup = setup_exe(args.version)
+    setup_lines: list[str] = []
+    if setup.exists():
+        setup_lines = [
+            f"setup={setup.name}",
+            f"setup_sha256={sha256(setup)}",
+            f"setup_bytes={setup.stat().st_size}",
+            "setup_silent_flag=/S",
+            "setup_uninstall_flag=/uninstall",
+        ]
+    else:
+        print(
+            f"note: {setup.name} not found - run ./installer/build-installer.sh to publish the installer",
+            file=sys.stderr,
+        )
 
     MANIFEST.write_text(
         "\n".join(
@@ -70,6 +93,8 @@ def main() -> int:
                 f"apk_version_code={args.code}",
                 "",
             ]
+            + setup_lines
+            + [""]
         ),
         encoding="utf-8",
     )
@@ -78,6 +103,8 @@ def main() -> int:
     print(f"  version   {args.version} (code {args.code})")
     print(f"  exe       {EXE.stat().st_size} bytes  {exe_hash}")
     print(f"  apk       {APK.stat().st_size} bytes  {apk_hash}")
+    if setup_lines:
+        print(f"  setup     {setup.stat().st_size} bytes  {setup_lines[1].split('=', 1)[1]}")
     return 0
 
 

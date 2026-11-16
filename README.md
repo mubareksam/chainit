@@ -6,19 +6,81 @@
 
 ## Ready-to-Install Final Releases (`releases/`)
 
-Both standalone, zero-dependency binaries are compiled and ready to use right now:
+All three artifacts are compiled, signed and committed — pick the portable exe, the setup program, or the APK:
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~986 KB | **v1.2.0** — Single portable `.exe` (no installer, no runtime, no extra DLLs). Includes System Tray icon, Smart Link UDP auto-discovery, **native Bluetooth RFCOMM sockets (`AF_BTH` / `ws2bth.h`) for both directions**, automatic `Z:\` File Explorer drive mounter, the dedicated ChainIt File Manager window, and a built-in **in-place self-updater**. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~860 KB | **v1.2.0 (`versionCode 3`)** — V2+V3 signed native Kotlin APK (`com.chainit.android`). **Launch crash fixed**, fully redesigned UI, same beloved chain-link launcher icon, crash-log recovery, in-app updates that replace the installed build, and the screen-off `SiblingDaemonService` over USB Tethering, Wi-Fi LAN, Local Hotspot, **or pure Bluetooth RFCOMM** with zero confirmation prompts. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.21 MB | **v1.3.0** — Portable `.exe` (no runtime, no extra DLLs). Native **ChainIt hub window** that owns the taskbar button with the real chain-link icon, System Tray icon, Smart Link UDP auto-discovery, **native Bluetooth RFCOMM sockets (`AF_BTH` / `ws2bth.h`) for both directions**, automatic `Z:\` drive mounter **labelled with your phone's name**, the dedicated File Manager window, **parallel 2 MiB chunked transfers with SHA-256 integrity checks**, and a built-in **in-place self-updater**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.3.0.exe`](./releases/ChainIt-Setup-1.3.0.exe) | ~1.51 MB | **v1.3.0** — A real setup program with **no third-party packaging tool**: the installer stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, an **Apps & features** entry with a working uninstaller, and `/S` for silent deployment. Re-running it updates the same file in place. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~864 KB | **v1.3.0 (`versionCode 4`)** — V2+V3 signed native Kotlin APK (`com.chainit.android`). Same beloved chain-link launcher icon, fully redesigned UI, crash-log recovery, in-app updates that replace the installed build, screen-off `SiblingDaemonService` over USB Tethering / Wi-Fi LAN / Local Hotspot / **pure Bluetooth RFCOMM**, and a **hardened VFS server**: the Pairing Key is now mandatory (with a brute-force lockout) and every served byte range is published with its SHA-256 so a tampered upload is rejected with `409 Conflict`. |
 
 **Direct downloads (always the latest build on this branch):**
-- Windows: <https://github.com/mubareksam/chainit/raw/arena/37fd3890-chainit/releases/ChainIt-Windows.exe>
-- Android: <https://github.com/mubareksam/chainit/raw/arena/37fd3890-chainit/releases/ChainIt-Android.apk>
-- Release manifest (version + SHA-256 of both binaries): [`releases/version.txt`](./releases/version.txt)
+- Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.3.0.exe>
+- Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
+- Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
 
-### What is new in v1.2.0
+### What is new in v1.3.0
+
+1. **The taskbar finally shows the ChainIt chain-link.** The web File Manager runs in Edge app-mode, so the
+   button Windows drew on the taskbar belonged to the *browser* process and fell back to its generic globe.
+   ChainIt now owns a real top-level Win32 window (`ChainItHubWindowClass`) created from the icon compiled
+   into the exe as resource #1, and pins one taskbar identity for the process with
+   `SetCurrentProcessExplicitAppUserModelID(L"ChainIt.Sibling.Hub")`. Taskbar, Alt-Tab, the tray tooltip and
+   every shortcut now show the same emerald + cyan chain-link mark as the Android launcher icon.
+2. **A native mini panel in the app list.** That hub window *is* the mini form of the app: link status, the
+   active transport, `Z:" + BS + "` state and the integrity counters, with keycap buttons for *Open File Manager*,
+   *Open `Z:" + BS + "`*, *Mount / Refresh `Z:" + BS + "`*, *Create Desktop Icon*, *Check for Updates* and *Quit*. It is one
+   click from the tray (first menu entry, and tray double-click), starts with the app, and closing it keeps
+   ChainIt resident in the tray. `/mini` in the browser is still available.
+3. **Desktop icon that is actually created and verified.** `createDesktopShortcut()` no longer trusts COM: it
+   writes the `.lnk` through `IShellLinkW`, then *checks that the file exists*, and if Explorer's shell host
+   refused, it writes the documented MS-SHLLINK binary layout itself (`writeShellLinkFile`). It probes several
+   Desktop locations (known folder, `%USERPROFILE%" + BS + "Desktop`, OneDrive Desktop), also drops a Start Menu
+   entry, flushes the shell notification queue, and reports the exact verified path back to the UI.
+4. **`Z:" + BS + "` shows your phone's name, never `127.0.0.1:4173`.** After `net use`, the engine writes
+   `_LabelFromReg` on the Explorer `MountPoints2` key for the share so "This PC" reads
+   `<Phone name> (ChainIt)`. Explorer only creates that key on first browse, so the label is re-applied on a
+   short back-off (2 s, then 6 s x 3) and refreshed whenever the sibling reports a new device name.
+5. **Full Windows-Explorer behaviour in the file panes.** A real **Modified** column (sortable, with the full
+   locale timestamp on hover), list/grid views, *Name / Size / Type / Date modified* sort with a
+   folders-first toggle, live filtering, a status bar with item count, selection size and the active sort
+   chip, Explorer keyboard shortcuts (**Enter** open, **F2** rename, **Del** delete, **F5** refresh,
+   **Backspace**/**Alt+" + chr(0x2191) + "** up, **Ctrl+A/C/X/V**, **Ctrl+Shift+N** new folder, **Ctrl+E** filter,
+   **Esc** clear) and a **Download to this PC** entry in the right-click menu.
+6. **Malware isolation between the two devices.** Sensitive data must not let one compromised device poison
+   the other, so both ends now enforce integrity instead of trusting the link:
+   - *Android:* the Pairing Key is **mandatory** on every VFS/WebDAV request (401 without it), and 5 bad keys
+     inside 60 s locks the port for 30 s (429) to stop brute-force guessing.
+   - *Both directions:* every served byte range publishes `X-ChainIt-File-Sha256` (whole file) and
+     `X-ChainIt-Chunk-Sha256` (that range). Inbound `PUT` / `/chainit/upload` bodies are verified against the
+     sender's declared digest and **deleted + rejected with `409 Conflict`** on mismatch.
+   - *Windows:* each downloaded chunk is hashed before it is written, the finished file is hashed again as a
+     whole, and only then does it replace anything on disk. Failures are counted and surfaced
+     (`/api/state` -> `security`, plus the Connectivity "Sibling security & transfer integrity" card).
+7. **Skeuomorphic UI.** A depth layer over the existing `.ci-*` design system
+   (`app/client/index.css`): brushed-metal header, bevelled cards, recessed insets and tool groups, embossed
+   buttons that physically depress on `:active`, glass LED status dots with a real glow, engraved pills, a
+   heavily floating modal, and paper-grain hover on file rows. Nothing was renamed, so every existing screen
+   and feature is preserved.
+8. **Fast, reliable transfers: simultaneous chunks.** Downloads split into **2 MiB chunks fetched by 4
+   parallel workers** over an atomic offset cursor, written at exact offsets with `OVERLAPPED` I/O into a
+   temporary reassembly buffer. Bluetooth RFCOMM stays single-stream on purpose (the radio serializes one
+   link, so extra workers would only add contention). Chunking is **transfer-only**: the buffer carries the
+   hidden + temporary attributes so it never appears in Explorer or any listing, it is SHA-256 gated before
+   the atomic `MoveFileExW` rename, and it is deleted on any failure - a file is either complete and correct
+   or it does not exist.
+9. **A real Windows installer.** `installer/build-installer.sh` compiles `windows/src/chainit_installer.cpp`
+   and appends the app payload with a 52-byte trailer (`installer/pack_installer.py`): magic, payload size,
+   SHA-256 and trailer size. The setup program reads the trailer back out of its own image, verifies the
+   digest before touching disk, installs per-user into `%LOCALAPPDATA%" + BS + "Programs" + BS + "ChainIt`, creates the
+   shortcuts, registers Apps & features with `ChainIt-Windows.exe /uninstall`, and can launch the app.
+   `/S` installs silently; `/uninstall` removes everything. No Inno Setup, no NSIS, no WiX.
+10. **Version metadata in the binaries.** Both exes now carry `VERSIONINFO` (FileDescription *ChainIt
+    Sibling*, version 1.3.0.0), so Task Manager, Alt-Tab and file properties show the product name instead of
+    a bare filename.
+
+### What is new in v1.2.1 / v1.2.0
 
 1. **Android launch crash fixed (was a blocker).** Kotlin 2.x emits `invokedynamic` lambdas by default and
    the `dx` dexer cannot lower them for API 26, so the previous build died inside `attachBaseContext` with
@@ -108,10 +170,13 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe` & `ChainIt-Android.apk` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.3.0.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
+| [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
+| [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |
-| [`windows/src/chainit_win_main.cpp`](./windows/src/chainit_win_main.cpp) | Native Win32 C++17 single-binary source (System Tray, UDP discovery, **`AF_BTH` RFCOMM client + published SDP receiver + `WSALookupService` paired-device discovery**, multipath WebDAV `Z:\` mounter, embedded UI server) |
-| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, `PhoneHttpAndWebDavServer`, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`) |
+| [`windows/src/chainit_win_main.cpp`](./windows/src/chainit_win_main.cpp) | Native Win32 C++17 single-binary source (**native hub window + AppUserModelID taskbar identity**, System Tray, UDP discovery, **`AF_BTH` RFCOMM client + published SDP receiver + `WSALookupService` paired-device discovery**, multipath WebDAV `Z:\` mounter with phone-name labelling, **parallel 2 MiB chunked transfers with per-chunk SHA-256**, verified desktop-shortcut writer with an MS-SHLLINK fallback, `/uninstall` mode, embedded UI server) |
+| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, **`PhoneHttpAndWebDavServer` with mandatory Pairing Key, brute-force lockout and SHA-256 range/upload verification**, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`) |
 | [`crates/`](./crates) | Shared Rust core (`chainit-core`) & Windows library (`chainit-windows`) |
 | [`app/`](./app) | ChainIt File Manager React/TypeScript UI + Node live preview server |
-| [`scripts/`](./scripts) | PowerShell `Z:\` drive helpers (`mount-z-drive.ps1`, `unmount-z-drive.ps1`) & asset embedder |
+| [`scripts/`](./scripts) | PowerShell `Z:\` drive helpers (`mount-z-drive.ps1`, `unmount-z-drive.ps1`), asset embedder (`gen_embedded_assets.py`) & release manifest publisher |
+| [`windows/build.sh`](./windows/build.sh) | Reproducible cross-compile of the exe with `zig c++` (no Visual Studio), then republishes `releases/version.txt` |

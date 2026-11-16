@@ -137,4 +137,17 @@ export interface SystemSnapshot {
   lanAddresses: string[];
   serverPort: number;
   bluetooth?: BluetoothLinkInfo;
+  security?: SecurityPosture;
+}
+
+export interface SecurityPosture {
+  keyAuth: string;
+  lockoutAfter: number;
+  lockoutWindowSec: number;
+  lockoutCooldownSec: number;
+  integrity: string;
+  chunkBytes: number;
+  parallelWorkers: number;
+  chunksVerified: number;
+  integrityFailures: number;
 }

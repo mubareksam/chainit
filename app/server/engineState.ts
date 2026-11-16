@@ -539,6 +539,18 @@ class ChainItEngine {
       logs: [...this.logs],
       lanAddresses: this.getLanAddresses(),
       serverPort: this.serverPort,
+    security: {
+      keyAuth: 'required',
+      lockoutAfter: 5,
+      lockoutWindowSec: 60,
+      lockoutCooldownSec: 30,
+      integrity: 'sha256 per chunk + whole file',
+      chunkBytes: 2 * 1024 * 1024,
+      parallelWorkers: 4,
+      chunksVerified: 0,
+      integrityFailures: 0,
+    },
+    
       bluetooth: {
         nativeRfcomm: true,
         radioPresent: this.environment.bluetoothEnabled,

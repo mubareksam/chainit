@@ -25,6 +25,16 @@ chainit/
 │           ├── vfs/AndroidStorageVfsProvider.kt     # Direct POSIX random-access /storage/emulated/0 VFS
 │           ├── receiver/BootAndBleWakeReceiver.kt   # Doze-safe BLE ScanFilter PendingIntent wakeup
 │           └── ui/MainActivity.kt                   # Jetpack Compose pairing, Sibling & transport UI
+├── windows/                        # Shipped Win32 single-binary engine (no Visual Studio needed)
+│   ├── src/chainit_win_main.cpp    # Tray + native hub window, UDP discovery, AF_BTH RFCOMM, WebDAV Z:\,
+│   │                               # parallel chunked transfers, self-updater, /uninstall
+│   ├── src/chainit_installer.cpp   # Self-contained setup stub (reads its own appended payload)
+│   ├── res/make_icon.py            # Renders the Android launcher vector -> chainit.ico / PNG icons
+│   └── build.sh                    # zig c++ cross-compile + manifest republish
+├── installer/                      # Windows setup packaging (no Inno Setup / NSIS / WiX)
+│   ├── build-installer.sh          # Compiles the stub, then packs stub + payload + trailer
+│   └── pack_installer.py           # 52-byte trailer: magic | payload size | SHA-256 | trailer size
+├── releases/                       # Committed deliverables + version.txt (in-place update manifest)
 ├── scripts/
 │   ├── mount-z-drive.ps1           # Mounts ChainIt WebDAV VFS directly as Z:\ in Windows Explorer
 │   └── unmount-z-drive.ps1         # Cleanly unmounts Z:\
@@ -123,9 +133,30 @@ In Sibling Mode on Windows, phone files are accessible **both ways simultaneousl
 1. **Real Windows `Z:\` Drive in `explorer.exe`**:
    - **Tier 1 — Native WinFsp Volume (`crates/chainit-windows`)**: Mounts `Z:\` (`Galaxy S24 [ChainIt Sibling]`) via `WinFsp` (`FspFileSystem`), translating `ReadDirectory`, `Read` (byte-range streaming), `Write`, `Rename`, and `Cleanup/Delete` directly into CHNP/1.0 VFS RPCs with an LRU metadata cache.
    - **Tier 2 — Zero-Driver Local WebDAV Loopback (`/dav` + `scripts/mount-z-drive.ps1`)**: Runs an RFC 4918 compliant WebDAV server on `127.0.0.1` and maps it to `Z:\` via Windows' built-in `WebClient` redirector (`net use Z: http://127.0.0.1:4173/dav`). Supports `PROPFIND`, HTTP `Range` streaming, `PUT`, `MKCOL`, `MOVE`, `COPY`, and `DELETE` out of the box with zero kernel drivers.
-2. **Dedicated ChainIt File Manager App**:
-   - Dual-pane (`C:\` PC $\leftrightarrow$ `Z:\` Phone) and Single-Pane Explorer views.
-   - Native keyboard shortcuts (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `F2`, `Del`, `Ctrl+A`), drag-and-drop across drives or directly from Windows Desktop, inline file preview/editing, and live chunked transfer speed telemetry.
+   - **Drive labelling**: Explorer derives a network drive's display name from
+     `HKCU" + BS + "Software" + BS + "Microsoft" + BS + "Windows" + BS + "CurrentVersion" + BS + "Explorer" + BS + "MountPoints2" + BS + "<key>" + BS + "_LabelFromReg`,
+     so `setZDriveLabelInExplorer()` writes `<phone name> (ChainIt)` there after `net use` and re-applies it on a
+     short back-off (Explorer only creates the key on first browse). The `127.0.0.1:4173` loopback URL is never
+     shown as the drive name.
+3. **Dedicated ChainIt File Manager App**:
+   - Dual-pane (`C:\` PC $\leftrightarrow$ `Z:\` Phone) and Single-Pane Explorer views, list *and* grid.
+   - Explorer-grade columns (**Name / Size / Type / Modified**), click-to-sort headers, folders-first toggle,
+     live filtering, and a status bar with item count, selection size and the active sort chip. The sort model
+     (`app/client/utils/sort.ts`, persisted as `chainit.sort.v1`) is shared by both panes.
+   - Native keyboard shortcuts (`Enter` open, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `F2`, `Del`, `Ctrl+A`, `F5` refresh,
+     `Backspace`/`Alt+ArrowUp` up, `Ctrl+Shift+N` new folder, `Ctrl+E` filter, `Esc` clear), drag-and-drop across
+     drives or directly from Windows Desktop, inline file preview/editing, a right-click menu with
+     *Download to this PC*, and live chunked transfer speed telemetry.
+4. **Native ChainIt hub window (taskbar identity + mini form)**:
+   - The File Manager renders in Edge app-mode, whose taskbar button belongs to the *browser* process. ChainIt
+     therefore creates a real top-level `ChainItHubWindowClass` window whose class icon is resource #1 of the
+     exe, and pins one taskbar identity with
+     `SetCurrentProcessExplicitAppUserModelID(L"ChainIt.Sibling.Hub")` - so the taskbar, Alt-Tab and the tray all
+     show the chain-link mark rather than a generic globe.
+   - The same window is the app's **mini form**: link state, transport, `Z:\` status and integrity counters with
+     keycap buttons for *Open File Manager*, *Open `Z:\`*, *Mount / Refresh `Z:\`*, *Create Desktop Icon*,
+     *Check for Updates* and *Quit*. It is the first tray menu entry and the tray double-click action; closing it
+     keeps ChainIt resident. The browser route `/mini` renders the equivalent panel for remote use.
 
 ## 5. Building the Shipped Binaries From Source
 
@@ -143,6 +174,80 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
    `windows/res/chainit.rc`, which embeds `windows/res/chainit.ico` (generated from the Android launcher
    vector by `windows/res/make_icon.py`) as icon resource #1 — used by the exe file icon, the window class,
    the tray icon and desktop shortcuts.
-3. **Release manifest** — `python3 scripts/publish_release_manifest.py` rewrites
-   `releases/version.txt` (version + SHA-256 of both binaries). The Windows in-place updater and the
+3. **Windows installer** — `./installer/build-installer.sh`
+   compiles `windows/src/chainit_installer.cpp` with `zig c++` (icon + `VERSIONINFO` from
+   `windows/res/chainit_installer.rc`), then `installer/pack_installer.py` appends the finished
+   `ChainIt-Windows.exe` and a **52-byte trailer**: `"CHAINIT1" | payload size (u64) | SHA-256 (32 B) |
+   trailer size (u32)`. At run time the stub reads the trailer back out of its own image, recomputes the
+   digest, and only then writes the payload - so the distributed setup file is self-verifying with no external
+   packaging tool. Install is per-user (`%LOCALAPPDATA%\Programs\ChainIt`, no UAC prompt) and in-place:
+   re-running setup overwrites the same file, asking the running instance to exit first if it holds a lock.
+   Flags: `/S` silent, `/UNINSTALL` remove.
+4. **Release manifest** — `python3 scripts/publish_release_manifest.py` rewrites
+   `releases/version.txt` (version + SHA-256 of all three artifacts). The Windows in-place updater and the
    Android `UpdateManager` both trust this file to decide "up to date" vs "replace in place".
+
+---
+
+## 6. Fast, Reliable Transfers: Parallel Chunking + End-to-End Integrity
+
+Files are the product, so the transport is designed around two rules: **go fast** and **never hand either
+device a file that is not byte-identical to the original**.
+
+### 6.1 Parallel chunk pipeline (Windows $\leftarrow$ phone)
+
+```text
+downloadPhonePathToLocal(phoneIp, /DCIM/IMG_0001.jpg, C:\Users\me\Downloads)
+  1. GET /chainit/raw?path=...   Range: bytes=0-0
+        -> 206, Content-Range: bytes 0-0/18_874_368
+           X-ChainIt-File-Sha256: <digest of the WHOLE file>
+  2. N workers (4 over USB/Wi-Fi/hotspot, 1 over Bluetooth RFCOMM)
+        loop: off = atomic cursor.fetch_add(2 MiB)
+              GET Range: bytes=off-(off+len-1)
+              X-ChainIt-Chunk-Sha256 == SHA256(body) ?  -> keep : abort
+              WriteFile(hPart, body, OVERLAPPED{Offset=off})   # no seeking, no interleaving
+  3. whole-file gate:  SHA256(<dst>.chainit-part) == X-ChainIt-File-Sha256
+  4. MoveFileExW(part, dst, MOVEFILE_REPLACE_EXISTING)          # atomic, in-place
+  any failure -> DeleteFileW(part) and fall back to one verified single-stream GET
+```
+
+* **Chunk size 2 MiB**, `kTransferChunkBytes`; **4 workers**, `kTransferWorkersLan`. Work is claimed through an
+  atomic cursor, so workers never overlap and a slow worker simply takes fewer chunks.
+* **Bluetooth stays single-stream on purpose.** RFCOMM serializes one link (`gBtRfcommClientMtx`); extra
+  workers over the radio would only queue behind each other and add contention.
+* **Writes use `OVERLAPPED` offsets**, so the reassembly buffer needs no shared file pointer and no locking.
+* **Chunking is transport-only and invisible.** The buffer is created with
+  `FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY`, so it never appears in Explorer, on the Desktop or in any
+  ChainIt listing; it is renamed over the destination only after the whole-file hash matches, and deleted on
+  any failure. A file is therefore either complete and correct, or it does not exist - never half-written.
+* Counters `gIntegrityChunksOk` / `gIntegrityFailures` are published in `/api/state` under `security` and shown
+  on the Connectivity view's *Sibling security & transfer integrity* card.
+
+### 6.2 Cross-device isolation (a compromised device must not poison the other)
+
+| Control | Where | Behaviour |
+| :--- | :--- | :--- |
+| **Mandatory Pairing Key** | `PhoneHttpAndWebDavServer.checkSiblingAuth` | Every VFS/WebDAV request must carry the shared key; missing or wrong $\rightarrow$ `401`. Previously an absent key was tolerated. |
+| **Brute-force brake** | same | 5 failed keys inside 60 s locks the VFS port for 30 s and answers `429 Too Many Requests`. |
+| **Published digests** | `streamFileResponse` | Every served range advertises `X-ChainIt-File-Sha256` (whole file) and `X-ChainIt-Chunk-Sha256` (that range), so the receiver can prove what it got. |
+| **Inbound verification** | WebDAV `PUT`, `/chainit/upload` | The body is hashed and compared with the sender's `x-chainit-file-sha256`; on mismatch the partial file is **deleted** and the request answered `409 Conflict`. |
+| **Receiver-side gate** | `downloadPhonePathToLocal` | Per-chunk hash, then a whole-file hash, then the atomic rename. A tampered or truncated transfer cannot reach the user's disk. |
+| **Sender-side gate** | `uploadLocalPathToPhone` | Sends `X-ChainIt-File-Sha256` and treats `409` as a hard failure rather than a silent success. |
+
+The point is not to *scan* for malware on the PC - it is to make the link incapable of silently altering a
+file, and to make every refusal visible instead of failing quietly.
+
+### 6.3 Windows identity & shortcut guarantees
+
+* `windows/res/chainit.rc` embeds `windows/res/chainit.ico` (rendered from the Android launcher vector by
+  `make_icon.py`: 16/20/24/32/40/48/64/128/256 px) as icon resource **#1**, plus `VERSIONINFO`
+  (*ChainIt Sibling*, 1.3.0.0). Nine `RT_ICON` images and one `RT_GROUP_ICON` are verified in the built PE.
+* `createDesktopShortcut()` writes `ChainIt.lnk` via `IShellLinkW`, **verifies the file exists**, and if the
+  shell refused, writes the documented MS-SHLLINK binary layout itself (`writeShellLinkFile`: 76-byte header,
+  `LINKINFO` with `VolumeID` + ANSI `LocalBasePath`, then `NAME`/`WORKING_DIR`/`ICON_LOCATION` string data).
+  It probes the known Desktop folder, `%USERPROFILE%\Desktop` and the OneDrive Desktop, also writes a Start
+  Menu entry, flushes the shell notification queue, and returns the exact verified path.
+* `ChainIt-Windows.exe /uninstall` (registered as the Apps & features uninstaller by the setup program)
+  unmaps `Z:\`, removes both shortcuts, deletes the uninstall registry key and the saved settings in
+  `%APPDATA%\ChainIt`, then hands its own file and folder to a detached `cmd.exe` - a running exe cannot
+  delete itself.
