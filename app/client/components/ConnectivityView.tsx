@@ -96,6 +96,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
   };
 
   const activeTransport = snapshot.transports.find((t) => t.isActive) || null;
+  const bt = snapshot.bluetooth;
 
   return (
     <div className="space-y-6">
@@ -290,8 +291,8 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
             icon={<Radio className="w-4 h-4" />}
           />
           <EnvSwitchCard
-            title="Bluetooth (BLE + RFCOMM)"
-            subtitle="Ultra-low-power Sibling beacon & bootstrap channel"
+            title="Bluetooth (Native RFCOMM + PAN)"
+            subtitle="Direct Bluetooth socket for Z:\ browsing & offline file transfer"
             active={snapshot.environment.bluetoothEnabled}
             onClick={() => void toggleEnv('bluetoothEnabled')}
             icon={<Bluetooth className="w-4 h-4" />}
@@ -327,7 +328,7 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
         )}
       </div>
 
-      {/* Direct Phone IP Link (Fallback when Router AP-Isolation or Online VPN/Tailscale is used) */}
+      {/* Direct Phone IP / Bluetooth Link (Fallback when Router AP-Isolation, Bluetooth MAC, or Online VPN is used) */}
       <form
         onSubmit={async (e) => {
           e.preventDefault();
@@ -335,9 +336,9 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
           try {
             const next = await api.connectPhoneIp(phoneIp.trim(), siblingKey.trim());
             onSnapshot(next);
-            notify(`Linked directly to Android Phone at ${phoneIp.trim()}:49180!`, 'success');
+            notify(`Linked directly to Android Phone (${phoneIp.trim()})!`, 'success');
           } catch (err) {
-            notify(err instanceof Error ? err.message : 'Direct IP connect failed', 'error');
+            notify(err instanceof Error ? err.message : 'Direct connect failed', 'error');
           }
         }}
         className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
@@ -345,11 +346,12 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
         <div className="space-y-1">
           <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
             <Link2 className="w-4 h-4 text-emerald-400" />
-            Direct Android Phone IP Link (Optional — Auto-Discovery Runs Automatically)
+            Direct Phone IP or Bluetooth MAC Link (Optional — Auto-Discovery Scans Paired Bluetooth & LAN Automatically)
           </h3>
           <p className="text-xs text-slate-400">
-            If your Wi-Fi router blocks UDP broadcasts (e.g. campus/hotel Wi-Fi or Online Tailscale VPN), enter the IP
-            shown inside <strong className="text-slate-200">ChainIt Sibling</strong> on your phone.
+            Paired Bluetooth phones & LAN phones connect automatically. You can also enter a Phone IP (e.g.{' '}
+            <code className="text-slate-200">192.168.43.1</code>) or Bluetooth address (e.g.{' '}
+            <code className="text-slate-200">bt://AA:BB:CC:DD:EE:FF</code>).
           </p>
         </div>
 
@@ -357,8 +359,8 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
           <input
             value={phoneIp}
             onChange={(e) => setPhoneIp(e.target.value)}
-            placeholder="Phone IP (e.g. 192.168.43.1)"
-            className="w-48 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-400"
+            placeholder="IP or bt://AA:BB:CC:DD:EE:FF"
+            className="w-56 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-400"
           />
           <input
             value={siblingKey}
@@ -370,10 +372,64 @@ export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify
             type="submit"
             className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition"
           >
-            Connect Phone IP
+            Connect Link
           </button>
         </div>
       </form>
+
+      {/* Native Bluetooth RFCOMM Engine Status (real AF_BTH sockets on Windows, BluetoothServerSocket on Android) */}
+      {bt && (
+        <div className="rounded-2xl border border-sky-900/60 bg-sky-950/25 p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+              <Bluetooth className="w-4 h-4 text-sky-400" />
+              Native Bluetooth RFCOMM Engine (Zero Wi-Fi • Zero Hotspot • Zero USB)
+            </h3>
+            <span
+              className={`px-2.5 py-1 rounded-full text-[11px] font-bold ${
+                bt.activeLink
+                  ? 'bg-emerald-500/20 text-emerald-300'
+                  : bt.radioPresent
+                    ? 'bg-sky-500/20 text-sky-300'
+                    : 'bg-slate-700/40 text-slate-400'
+              }`}
+            >
+              {bt.activeLink ? 'RFCOMM LINK LIVE' : bt.radioPresent ? 'ARMED • SCANNING PAIRED DEVICES' : 'RADIO OFF'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2.5 text-[11px]">
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 px-3 py-2">
+              <div className="text-slate-500">PC Receiver (SDP published)</div>
+              <div className="font-mono text-slate-200">
+                {bt.receiverListening ? `LISTENING • RFCOMM ch ${bt.receiverRfcommChannel || '?'}` : 'OFFLINE'}
+              </div>
+            </div>
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 px-3 py-2">
+              <div className="text-slate-500">Phone Server UUID</div>
+              <div className="font-mono text-sky-300 break-all">{bt.phoneServerUuid}</div>
+            </div>
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 px-3 py-2">
+              <div className="text-slate-500">PC Receiver UUID</div>
+              <div className="font-mono text-sky-300 break-all">{bt.pcReceiverUuid}</div>
+            </div>
+            <div className="rounded-xl bg-slate-950/70 border border-slate-800 px-3 py-2">
+              <div className="text-slate-500">Paired devices discovered</div>
+              <div className="font-mono text-slate-200 break-all">
+                {bt.pairedDevices.length > 0 ? bt.pairedDevices.join('  ') : 'Pair phone + PC once in Bluetooth settings'}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            ChainIt opens <code className="text-slate-200">socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM)</code> on Windows and{' '}
+            <code className="text-slate-200">listenUsingRfcommWithServiceRecord()</code> on Android, then runs the exact same
+            VFS + WebDAV protocol over that stream — so <strong className="text-slate-200">Z:\</strong> in File Explorer, the
+            dual-pane File Manager, inline previews and Phone → PC pushes (files land on your Windows Desktop) all keep working
+            with Wi-Fi, Hotspot, mobile data and the USB cable completely off.
+          </p>
+        </div>
+      )}
     </div>
   );
 };

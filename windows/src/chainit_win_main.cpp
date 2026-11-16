@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <ws2bth.h>
 #include <shellapi.h>
 #include <wincrypt.h>
 
@@ -40,6 +41,166 @@ static const int PHONE_VFS_PORT = 49180;
 #define ID_TRAY_OPEN_Z 4002
 #define ID_TRAY_REMOUNT_Z 4003
 #define ID_TRAY_EXIT 4004
+
+// --- Native Bluetooth RFCOMM (ws2bth.h / AF_BTH) ---
+// These service UUIDs MUST match android/.../net/BluetoothRfcommTransport.kt so the phone
+// and this PC find each other with a real SDP lookup (no Wi-Fi, no Hotspot, no USB needed).
+static const GUID kChainItPhoneUuid = {0xc4a1b170, 0x0001, 0x4000, {0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb}};
+static const GUID kChainItPcUuid = {0xc4a1b170, 0x0002, 0x4000, {0x80, 0x00, 0x00, 0x80, 0x5f, 0x9b, 0x34, 0xfb}};
+
+// An RFCOMM link is one serialized byte stream, so phone requests over Bluetooth are queued here.
+static std::mutex gBtRfcommClientMtx;
+
+// Live Bluetooth runtime status (radio presence, published PC receiver channel, paired device list)
+static std::atomic<bool> gBtRadioPresent{false};
+static std::atomic<bool> gBtServerListening{false};
+static std::atomic<int> gBtServerChannel{0};
+static std::mutex gBtPairedMtx;
+static std::vector<std::string> gBtPairedDevices;
+
+static std::string kChainItPhoneUuidStr = "c4a1b170-0001-4000-8000-00805f9b34fb";
+static std::string kChainItPcUuidStr = "c4a1b170-0002-4000-8000-00805f9b34fb";
+
+static bool isBtEndpoint(const std::string& ep) {
+    return ep.rfind("bt://", 0) == 0;
+}
+
+static std::string btAddrToString(BTH_ADDR a) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                  static_cast<unsigned>((a >> 40) & 0xFF), static_cast<unsigned>((a >> 32) & 0xFF),
+                  static_cast<unsigned>((a >> 24) & 0xFF), static_cast<unsigned>((a >> 16) & 0xFF),
+                  static_cast<unsigned>((a >> 8) & 0xFF), static_cast<unsigned>(a & 0xFF));
+    return std::string(buf);
+}
+
+// Accepts AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF or AABBCCDDEEFF
+static bool parseBtMac(const std::string& in, BTH_ADDR* out) {
+    std::string s;
+    s.reserve(12);
+    for (char c : in) {
+        if (c == ':' || c == '-' || c == ' ') continue;
+        s.push_back(c);
+    }
+    if (s.size() != 12) return false;
+    BTH_ADDR v = 0;
+    for (size_t i = 0; i < 12; i += 2) {
+        char pair[3] = {s[i], s[i + 1], 0};
+        char* endp = nullptr;
+        unsigned long b = std::strtoul(pair, &endp, 16);
+        if (endp != pair + 2) return false;
+        v = (v << 8) | (static_cast<BTH_ADDR>(b) & 0xFF);
+    }
+    if (v == 0) return false;
+    *out = v;
+    return true;
+}
+
+// Parses "bt://AA:BB:CC:DD:EE:FF", "bt://AA:BB:CC:DD:EE:FF:12" or a bare MAC into addr + optional RFCOMM channel.
+static bool parseBtEndpoint(const std::string& ep, BTH_ADDR* addr, ULONG* port) {
+    std::string s = isBtEndpoint(ep) ? ep.substr(5) : ep;
+    for (char& c : s) {
+        if (c == '-' || c == '/') c = ':';
+    }
+    *addr = 0;
+    *port = 0;
+    int colons = 0;
+    for (char c : s) {
+        if (c == ':') colons++;
+    }
+    if (colons == 6) {
+        size_t cut = s.find_last_of(':');
+        std::string p = s.substr(cut + 1);
+        if (p.empty() || p.find_first_not_of("0123456789") != std::string::npos) return false;
+        unsigned long v = std::strtoul(p.c_str(), nullptr, 10);
+        if (v < BT_PORT_MIN || v > BT_PORT_MAX) return false;
+        *port = static_cast<ULONG>(v);
+        s = s.substr(0, cut);
+    } else if (colons != 5 && colons != 0) {
+        return false;
+    }
+    return parseBtMac(s, addr);
+}
+
+// Turns "AA:BB:CC:DD:EE:FF" / "bt://aa-bb-cc-dd-ee-ff" into canonical "bt://AA:BB:CC:DD:EE:FF".
+// Returns "" for plain IPv4 addresses so manual connect never confuses an IP with a MAC.
+static std::string normalizeBtEndpoint(const std::string& in) {
+    bool explicitBt = isBtEndpoint(in);
+    std::string s = explicitBt ? in.substr(5) : in;
+    while (!s.empty() && (s.front() == '/' || s.front() == ' ')) s.erase(s.begin());
+    while (!s.empty() && (s.back() == '/' || s.back() == ' ')) s.pop_back();
+    if (!explicitBt && s.find(':') == std::string::npos && s.find('-') == std::string::npos) return "";
+    if (s.size() != 12 && !explicitBt && s.find_first_of("gGxX.") != std::string::npos && s.find(':') == std::string::npos) return "";
+    BTH_ADDR addr = 0;
+    ULONG port = 0;
+    if (!parseBtEndpoint(s, &addr, &port)) return "";
+    if (port != 0) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "bt://%s:%lu", btAddrToString(addr).c_str(), static_cast<unsigned long>(port));
+        return std::string(buf);
+    }
+    return "bt://" + btAddrToString(addr);
+}
+
+// Opens a native RFCOMM socket to the phone's ChainIt service (SDP resolved by the Windows stack).
+static SOCKET btRfcommConnect(const std::string& endpoint, int timeoutMs) {
+    BTH_ADDR addr = 0;
+    ULONG port = 0;
+    if (!parseBtEndpoint(endpoint, &addr, &port)) return INVALID_SOCKET;
+
+    SOCKADDR_BTH sa{};
+    sa.addressFamily = AF_BTH;
+    sa.btAddr = addr;
+    if (port != 0) {
+        sa.port = port;
+    } else {
+        sa.serviceClassId = kChainItPhoneUuid;
+        sa.port = BT_PORT_ANY; // let the stack run the SDP query for kChainItPhoneUuid
+    }
+
+    SOCKET s = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    u_long nonBlock = 1;
+    ioctlsocket(s, FIONBIO, &nonBlock);
+    int cr = connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+    if (cr == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            fd_set wfds, efds;
+            FD_ZERO(&wfds);
+            FD_SET(s, &wfds);
+            FD_ZERO(&efds);
+            FD_SET(s, &efds);
+            timeval tv{};
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            int sel = select(0, nullptr, &wfds, &efds, &tv);
+            if (sel <= 0 || FD_ISSET(s, &efds)) {
+                closesocket(s);
+                return INVALID_SOCKET;
+            }
+        } else {
+            closesocket(s);
+            // Some Bluetooth stacks reject non-blocking connect: retry once in blocking mode.
+            SOCKET s2 = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+            if (s2 == INVALID_SOCKET) return INVALID_SOCKET;
+            if (connect(s2, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) {
+                closesocket(s2);
+                return INVALID_SOCKET;
+            }
+            s = s2;
+        }
+    }
+
+    nonBlock = 0;
+    ioctlsocket(s, FIONBIO, &nonBlock);
+    DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
+    return s;
+}
+
 
 // --- Minimal JSON String Escaping & Field Extraction Helpers ---
 
@@ -282,6 +443,12 @@ struct GlobalState {
     std::vector<LogItem> logs;
     std::vector<SOCKET> wsClients;
 
+    // Native Bluetooth (AF_BTH / RFCOMM) runtime info surfaced to the UI
+    bool btRadioPresent = false;
+    bool btReceiverListening = false;
+    int btReceiverChannel = 0;
+    std::vector<std::string> btPairedDevices;
+
     fs::path pcRoot;
     fs::path fallbackPhoneRoot;
 };
@@ -370,37 +537,50 @@ static HttpReply httpRequestToPhone(
     HttpReply rep;
     auto t0 = std::chrono::steady_clock::now();
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return rep;
+    // Native Bluetooth RFCOMM (AF_BTH) links are addressed as "bt://AA:BB:CC:DD:EE:FF" and carry
+    // exactly the same HTTP/WebDAV protocol as the TCP transports, so Z:\ and the File Manager work
+    // with Wi-Fi / Hotspot / USB all switched OFF.
+    const bool viaBluetooth = isBtEndpoint(ip);
+    std::unique_lock<std::mutex> btLk(gBtRfcommClientMtx, std::defer_lock);
+    SOCKET s = INVALID_SOCKET;
 
-    u_long nonBlock = 1;
-    ioctlsocket(s, FIONBIO, &nonBlock);
+    if (viaBluetooth) {
+        btLk.lock(); // one serialized RFCOMM stream at a time
+        s = btRfcommConnect(ip, timeoutMs);
+        if (s == INVALID_SOCKET) return rep;
+    } else {
+        s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return rep;
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<u_short>(port));
-    if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
-        closesocket(s);
-        return rep;
+        u_long nonBlock = 1;
+        ioctlsocket(s, FIONBIO, &nonBlock);
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<u_short>(port));
+        if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+            closesocket(s);
+            return rep;
+        }
+
+        connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        if (select(0, nullptr, &wfds, nullptr, &tv) <= 0) {
+            closesocket(s);
+            return rep;
+        }
+
+        nonBlock = 0;
+        ioctlsocket(s, FIONBIO, &nonBlock);
+        DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
     }
-
-    connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(s, &wfds);
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    if (select(0, nullptr, &wfds, nullptr, &tv) <= 0) {
-        closesocket(s);
-        return rep;
-    }
-
-    nonBlock = 0;
-    ioctlsocket(s, FIONBIO, &nonBlock);
-    DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
 
     std::string keyCopy;
     {
@@ -410,7 +590,12 @@ static HttpReply httpRequestToPhone(
 
     std::ostringstream req;
     req << method << " " << targetPath << " HTTP/1.1\r\n";
-    req << "Host: " << ip << ":" << port << "\r\n";
+    if (viaBluetooth) {
+        req << "Host: chainit-bluetooth\r\n";
+        req << "X-ChainIt-Transport: bluetooth-rfcomm\r\n";
+    } else {
+        req << "Host: " << ip << ":" << port << "\r\n";
+    }
     req << "X-ChainIt-Key: " << keyCopy << "\r\n";
     req << "Content-Length: " << body.size() << "\r\n";
     req << "Connection: close\r\n";
@@ -619,7 +804,9 @@ static std::string buildStateSnapshotJson() {
     int64_t now = nowMs();
     bool hasRealAny = false;
     for (auto it = gState.phoneEndpoints.begin(); it != gState.phoneEndpoints.end();) {
-        if (now - it->second.lastOkMs > 12000) {
+        // Native Bluetooth RFCOMM probes are slower (page/SDP), so keep the link warm for longer.
+        int64_t ttl = (it->first == "bluetooth") ? 35000 : 12000;
+        if (now - it->second.lastOkMs > ttl) {
             it = gState.phoneEndpoints.erase(it);
         } else {
             hasRealAny = true;
@@ -663,8 +850,12 @@ static std::string buildStateSnapshotJson() {
         {"local_hotspot", "Local Hotspot (Router-Free)", "Local Hotspot", "Direct Offline",
          h.first ? (h.second.second.empty() ? "5 GHz Direct SoftAP active" : ("Connected via Hotspot (" + h.second.second + ")")) : "Turn on Phone Hotspot or Windows Mobile Hotspot (100% offline)",
          true, h.first, 72.4, h.second.first, 28.0, h.second.second},
-        {"bluetooth", "Bluetooth (PAN / BLE)", "Bluetooth", "WPAN Offline",
-         b.first ? "Ultra-low-power standby & fallback link" : "Bluetooth offline",
+        {"bluetooth", "Bluetooth (Native RFCOMM + PAN)", "Bluetooth", "WPAN Offline",
+         b.first
+             ? (isBtEndpoint(b.second.second)
+                    ? ("Native RFCOMM link live -> " + b.second.second + " (zero Wi-Fi / zero USB)")
+                    : "Ultra-low-power Bluetooth PAN fallback link")
+             : ("Pair phone + PC once in Bluetooth settings; native RFCOMM then auto-links (UUID " + kChainItPhoneUuidStr + ")"),
          true, b.first, 2.1, b.second.first, 8.0, b.second.second},
         {"online_p2p", "Online P2P / VPN", "Online P2P", "Pluggable Online",
          o.first ? ("Connected via remote IP " + o.second.second) : "Enter Tailscale/WireGuard IP below for remote internet access",
@@ -753,6 +944,29 @@ static std::string buildStateSnapshotJson() {
         << "\"phoneScreenLocked\":" << (gState.phoneScreenLocked ? "true" : "false") << ","
         << "\"phoneBatteryPct\":" << gState.phoneBatteryPct << "},";
 
+    // Native Bluetooth (AF_BTH / RFCOMM) live status
+    gState.btRadioPresent = gBtRadioPresent.load();
+    gState.btReceiverListening = gBtServerListening.load();
+    gState.btReceiverChannel = gBtServerChannel.load();
+    {
+        std::lock_guard<std::mutex> lk(gBtPairedMtx);
+        gState.btPairedDevices = gBtPairedDevices;
+    }
+    oss << "\"bluetooth\":{"
+        << "\"nativeRfcomm\":true,"
+        << "\"radioPresent\":" << (gState.btRadioPresent ? "true" : "false") << ","
+        << "\"receiverListening\":" << (gState.btReceiverListening ? "true" : "false") << ","
+        << "\"receiverRfcommChannel\":" << gState.btReceiverChannel << ","
+        << "\"phoneServerUuid\":\"" << kChainItPhoneUuidStr << "\","
+        << "\"pcReceiverUuid\":\"" << kChainItPcUuidStr << "\","
+        << "\"activeLink\":\"" << jsonEscape(isBtEndpoint(gState.activePhoneIp) ? gState.activePhoneIp : std::string("")) << "\","
+        << "\"pairedDevices\":[";
+    for (size_t i = 0; i < gState.btPairedDevices.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << "\"" << jsonEscape(gState.btPairedDevices[i]) << "\"";
+    }
+    oss << "]},";
+
     bool connected = !gState.activeTransportId.empty() && gState.siblingEnabled;
     oss << "\"sibling\":{"
         << "\"enabled\":" << (gState.siblingEnabled ? "true" : "false") << ","
@@ -820,15 +1034,18 @@ static std::string buildStateSnapshotJson() {
 
 // --- Probe & Register Real Android Phone Endpoint ---
 
-static bool probePhoneIp(const std::string& ip, const std::string& kindHint) {
-    HttpReply rep = httpRequestToPhone(ip, PHONE_VFS_PORT, "GET", "/chainit/ping", "", {}, 1500);
+static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int timeoutMs = 0) {
+    // Native Bluetooth RFCOMM needs a longer budget (SDP lookup + ACL page + pairing check).
+    if (timeoutMs <= 0) timeoutMs = isBtEndpoint(ip) ? 9000 : 1500;
+    HttpReply rep = httpRequestToPhone(ip, PHONE_VFS_PORT, "GET", "/chainit/ping", "", {}, timeoutMs);
     if (rep.status != 200 || rep.body.find("\"ok\":true") == std::string::npos) {
         return false;
     }
 
     std::string kind = kindHint;
     if (kind.empty()) {
-        if (ip == "127.0.0.1" || ip.rfind("192.168.42.", 0) == 0) kind = "usb_rndis";
+        if (isBtEndpoint(ip)) kind = "bluetooth";
+        else if (ip == "127.0.0.1" || ip.rfind("192.168.42.", 0) == 0) kind = "usb_rndis";
         else if (ip.rfind("192.168.43.", 0) == 0 || ip.rfind("192.168.49.", 0) == 0 || ip.rfind("192.168.137.", 0) == 0) kind = "local_hotspot";
         else if (ip.rfind("192.168.44.", 0) == 0) kind = "bluetooth";
         else if (ip.rfind("100.", 0) == 0) kind = "online_p2p";
@@ -849,7 +1066,13 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint) {
         gState.phoneUsedBytes = static_cast<uint64_t>(jsonExtractInt(rep.body, "usedBytes", static_cast<int64_t>(gState.phoneUsedBytes)));
 
         if (newlyConnected) {
-            addLogLocked("SIBLING", "Auto-Connected to " + gState.peerDeviceName + " (" + ip + ")", "Verified ChainIt-Android.apk on port 49180; Z:\\ live storage ready.");
+            std::string link = isBtEndpoint(ip)
+                                   ? ("native Bluetooth RFCOMM " + ip)
+                                   : ("IP " + ip + ":49180");
+            addLogLocked("SIBLING", "Auto-Connected to " + gState.peerDeviceName + " (" + link + ")",
+                         isBtEndpoint(ip)
+                             ? "Verified ChainIt-Android.apk over AF_BTH RFCOMM (UUID " + kChainItPhoneUuidStr + "); Z:\\ live storage ready with zero Wi-Fi."
+                             : "Verified ChainIt-Android.apk on port 49180; Z:\\ live storage ready.");
         }
     }
 
@@ -946,6 +1169,228 @@ static void discoveryLoop() {
     }
 
     closesocket(sock);
+}
+
+// --- Native Bluetooth Threads (AF_BTH / ws2bth.h) ---
+
+static void handleHttpClient(SOCKET client); // fwd-decl: the RFCOMM listener reuses the whole HTTP+WebDAV engine
+
+// Enumerates remembered / paired Bluetooth devices straight from the Windows Bluetooth namespace.
+// LUP_CONTAINERS reads the stack cache, so this costs no 12-second inquiry scan and no user prompt.
+static std::vector<std::string> enumeratePairedBluetoothDevices() {
+    std::vector<std::string> found;
+
+    WSAQUERYSETW qs{};
+    qs.dwSize = sizeof(WSAQUERYSETW);
+    qs.dwNameSpace = NS_BTH;
+
+    HANDLE hLookup = nullptr;
+    if (WSALookupServiceBeginW(&qs, LUP_CONTAINERS | LUP_RETURN_NAME | LUP_RETURN_ADDR, &hLookup) != 0) {
+        gBtRadioPresent.store(false);
+        return found;
+    }
+    gBtRadioPresent.store(true);
+
+    size_t bufSize = 8192;
+    std::vector<char> buf(bufSize);
+    while (gRunning.load()) {
+        DWORD bufLen = static_cast<DWORD>(buf.size());
+        auto* res = reinterpret_cast<WSAQUERYSETW*>(buf.data());
+        int r = WSALookupServiceNextW(hLookup, 0, &bufLen, res);
+        if (r != 0) {
+            if (WSAGetLastError() == WSAEFAULT && buf.size() < 131072) {
+                buf.resize(buf.size() * 2);
+                continue;
+            }
+            break;
+        }
+        if (res->dwNumberOfCsAddrs < 1 || !res->lpcsaBuffer) continue;
+        auto* sa = reinterpret_cast<SOCKADDR_BTH*>(res->lpcsaBuffer->RemoteAddr.lpSockaddr);
+        if (!sa || sa->addressFamily != AF_BTH || sa->btAddr == BTH_ADDR_NULL) continue;
+        std::string ep = "bt://" + btAddrToString(sa->btAddr);
+        if (std::find(found.begin(), found.end(), ep) == found.end()) found.push_back(ep);
+    }
+    WSALookupServiceEnd(hLookup);
+    return found;
+}
+
+// Keeps a native RFCOMM link to the phone warm: paired devices are probed until ChainIt-Android answers
+// on UUID c4a1b170-0001-4000-8000-00805f9b34fb, then the endpoint is refreshed every cycle so the
+// transport engine can fail over to Bluetooth instantly (Wi-Fi / Hotspot / USB all OFF).
+static void bluetoothDiscoveryLoop() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+    int tick = 0;
+    bool btWasUp = false;
+    bool loggedNoRadio = false;
+
+    while (gRunning.load()) {
+        std::string liveBt;
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            auto it = gState.phoneEndpoints.find("bluetooth");
+            if (it != gState.phoneEndpoints.end() && isBtEndpoint(it->second.ip)) liveBt = it->second.ip;
+        }
+
+        std::vector<std::string> candidates;
+        if (!liveBt.empty()) candidates.push_back(liveBt);
+
+        if (liveBt.empty() || tick % 8 == 0) {
+            std::vector<std::string> paired = enumeratePairedBluetoothDevices();
+            {
+                std::lock_guard<std::mutex> lk(gBtPairedMtx);
+                gBtPairedDevices = paired;
+            }
+            if (!gBtRadioPresent.load()) {
+                if (!loggedNoRadio) {
+                    loggedNoRadio = true;
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    addLogLocked("BLUETOOTH", "No usable Bluetooth radio detected",
+                                 "Enable Bluetooth on this PC (Settings > Bluetooth & devices) to arm the native RFCOMM transport.");
+                }
+            } else if (loggedNoRadio) {
+                loggedNoRadio = false;
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("BLUETOOTH", "Bluetooth radio is back online", "Arming native RFCOMM transport (AF_BTH) for Sibling Mode.");
+            }
+            for (const auto& p : paired) {
+                if (p != liveBt && std::find(candidates.begin(), candidates.end(), p) == candidates.end()) {
+                    candidates.push_back(p);
+                }
+            }
+        }
+
+        size_t limit = std::min<size_t>(candidates.size(), 6);
+        for (size_t i = 0; i < limit && gRunning.load(); ++i) {
+            if (probePhoneIp(candidates[i], "bluetooth", 4000)) break;
+        }
+
+        bool upNow = false;
+        std::string upEp;
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            auto it = gState.phoneEndpoints.find("bluetooth");
+            if (it != gState.phoneEndpoints.end() && isBtEndpoint(it->second.ip)) {
+                upNow = true;
+                upEp = it->second.ip;
+            }
+        }
+        if (upNow && !btWasUp) {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            addLogLocked("BLUETOOTH", "Native Bluetooth RFCOMM link up -> " + upEp,
+                         "AF_BTH socket bound to phone UUID " + kChainItPhoneUuidStr + ". Z:\\ and the File Manager now run on Bluetooth alone (zero Wi-Fi, zero USB).");
+        } else if (!upNow && btWasUp) {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            addLogLocked("BLUETOOTH", "Bluetooth RFCOMM link lost",
+                         "Phone left range or ChainIt-Android was closed; the engine fails over to the next best transport automatically.");
+        }
+        btWasUp = upNow;
+
+        tick++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+    }
+}
+
+// Publishes the PC-side RFCOMM service (UUID c4a1b170-0002-4000-8000-00805f9b34fb) so the Android app can
+// push files to this PC over Bluetooth alone. Accepted sockets are handed to the regular HTTP engine, so
+// "POST /api/vfs/pc/upload?dir=/Desktop" from the phone lands straight on the Windows Desktop.
+static void bluetoothServerLoop() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+    while (gRunning.load()) {
+        SOCKET srv = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+        if (srv == INVALID_SOCKET) {
+            gBtServerListening.store(false);
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            continue;
+        }
+
+        SOCKADDR_BTH sa{};
+        sa.addressFamily = AF_BTH;
+        sa.btAddr = BTH_ADDR_NULL;          // local radio
+        sa.serviceClassId = kChainItPcUuid;
+        sa.port = BT_PORT_ANY;              // stack assigns a free RFCOMM channel
+
+        if (bind(srv, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR || listen(srv, 4) == SOCKET_ERROR) {
+            closesocket(srv);
+            gBtServerListening.store(false);
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            continue;
+        }
+
+        SOCKADDR_BTH bound = sa;
+        int boundLen = sizeof(bound);
+        if (getsockname(srv, reinterpret_cast<sockaddr*>(&bound), &boundLen) == 0 && bound.port != 0 && bound.port != BT_PORT_ANY) {
+            gBtServerChannel.store(static_cast<int>(bound.port));
+        } else {
+            bound = sa;
+            gBtServerChannel.store(0);
+        }
+
+        SOCKADDR_BTH remote{};
+        remote.addressFamily = AF_BTH;
+        remote.btAddr = BTH_ADDR_NULL;
+        remote.serviceClassId = kChainItPcUuid;
+        remote.port = BT_PORT_ANY;
+
+        CSADDR_INFO csai{};
+        csai.iSocketType = SOCK_STREAM;
+        csai.iProtocol = BTHPROTO_RFCOMM;
+        csai.LocalAddr.iSockaddrLength = sizeof(SOCKADDR_BTH);
+        csai.LocalAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&bound);
+        csai.RemoteAddr.iSockaddrLength = sizeof(SOCKADDR_BTH);
+        csai.RemoteAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&remote);
+
+        GUID svcId = kChainItPcUuid;
+        WSAQUERYSETW wsq{};
+        wsq.dwSize = sizeof(WSAQUERYSETW);
+        wsq.dwNameSpace = NS_BTH;
+        wsq.lpServiceClassId = &svcId;
+        wsq.lpszServiceInstanceName = const_cast<LPWSTR>(L"ChainIt PC Receiver");
+        wsq.lpszComment = const_cast<LPWSTR>(L"ChainIt Sibling Bluetooth inbox - pushes from Android land on the Windows Desktop");
+        wsq.dwNumberOfCsAddrs = 1;
+        wsq.lpcsaBuffer = &csai;
+
+        bool published = (WSASetServiceW(&wsq, RNRSERVICE_REGISTER, 0) == 0);
+        gBtServerListening.store(true);
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            addLogLocked("BLUETOOTH",
+                         published ? ("Bluetooth PC Receiver published (RFCOMM channel " + std::to_string(gBtServerChannel.load()) + ")")
+                                   : "Bluetooth receiver socket open (SDP publish blocked)",
+                         published ? ("Paired Android phones resolve UUID " + kChainItPcUuidStr + " and their Bluetooth pushes land in C:\\Users\\<you>\\Desktop.")
+                                   : ("Listening on AF_BTH RFCOMM; pair this PC with the phone so Android can resolve UUID " + kChainItPcUuidStr + "."));
+        }
+
+        while (gRunning.load()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(srv, &rfds);
+            timeval tv{};
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            if (select(0, &rfds, nullptr, nullptr, &tv) <= 0) continue;
+
+            SOCKET client = accept(srv, nullptr, nullptr);
+            if (client == INVALID_SOCKET) continue;
+
+            DWORD t = 180000;
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
+
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("BLUETOOTH", "Incoming Bluetooth RFCOMM session accepted",
+                             "Phone -> PC push over AF_BTH; file is written to the Desktop and logged as a completed transfer.");
+            }
+            std::thread(handleHttpClient, client).detach();
+        }
+
+        gBtServerListening.store(false);
+        WSASetServiceW(&wsq, RNRSERVICE_DELETE, 0);
+        closesocket(srv);
+        if (gRunning.load()) std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
 }
 
 // --- Recursive Cross-Device Copy / Move Helper ---
@@ -1275,10 +1720,29 @@ static void handleHttpClient(SOCKET client) {
             std::lock_guard<std::mutex> lk(gState.mtx);
             gState.siblingKey = key;
         }
-        if (ip.empty() || !probePhoneIp(ip, "")) {
-            sendJsonStr(client, 400, "{\"error\":\"Could not reach ChainIt Sibling on " + jsonEscape(ip) + ":49180. Make sure ChainIt-Android.apk is open/active on your phone.\"}");
+
+        // Accept a plain IP, a "bt://AA:BB:CC:DD:EE:FF" link, or a bare Bluetooth MAC address.
+        std::string btLink = normalizeBtEndpoint(ip);
+        if (!btLink.empty()) ip = btLink;
+        bool isBt = isBtEndpoint(ip);
+
+        if (ip.empty() || !probePhoneIp(ip, isBt ? "bluetooth" : "", isBt ? 12000 : 0)) {
+            std::string hint = isBt
+                                   ? ("Could not open a native RFCOMM link to " + jsonEscape(ip) + ". Pair the phone with this PC in Windows Bluetooth settings, keep ChainIt-Android.apk running, and make sure Bluetooth is ON on both devices.")
+                                   : ("Could not reach ChainIt Sibling on " + jsonEscape(ip) + ":49180. Make sure ChainIt-Android.apk is open/active on your phone.");
+            if (isBt) {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("BLUETOOTH", "Manual Bluetooth link failed -> " + ip, hint);
+            }
+            sendJsonStr(client, 400, "{\"error\":\"" + hint + "\"}");
             closesocket(client);
             return;
+        }
+
+        if (isBt) {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            addLogLocked("BLUETOOTH", "Manual Bluetooth link pinned -> " + ip,
+                         "Native AF_BTH RFCOMM session verified against UUID " + kChainItPhoneUuidStr + "; Z:\\ is now served over Bluetooth.");
         }
         sendJsonStr(client, 200, buildStateSnapshotJson());
         closesocket(client);
@@ -1679,17 +2143,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ofs << "# Waiting for ChainIt Sibling on Your Android Phone\n\n"
             << "1. Install **ChainIt-Android.apk** on your Android phone and open it once.\n"
             << "2. Tap **Grant All-Files Access** and **Allow Screen-Off Standby**.\n"
-            << "3. Connect both devices to the same Wi-Fi, OR turn on **Phone Hotspot / Windows Mobile Hotspot** (100% offline!), OR plug in **USB + USB Tethering**.\n"
-            << "4. ChainIt-Windows.exe will automatically discover your phone in <2 seconds and switch this **Z:\\** view live to your phone's real storage—even with your phone screen locked!\n";
+            << "3. Connect both devices to the same Wi-Fi, OR turn on **Phone Hotspot / Windows Mobile Hotspot** (100% offline!), OR plug in **USB + USB Tethering**,\n"
+            << "   OR pair them once in **Bluetooth** settings — ChainIt then opens a native RFCOMM socket link that works with Wi-Fi, Hotspot and USB all switched OFF.\n"
+            << "4. ChainIt-Windows.exe will automatically discover your phone in <2 seconds and switch this **Z:\\** view live to your phone's real storage—even with your phone screen locked!\n"
+            << "5. Bluetooth-only mode: pair once, keep the ChainIt app running on the phone, and Z:\\ stays mounted over RFCOMM (slower, but zero Wi-Fi / zero data / zero cables).\n";
     }
 
     {
         std::lock_guard<std::mutex> lk(gState.mtx);
-        addLogLocked("SIBLING", "ChainIt Windows Native Daemon Started", "Listening on 0.0.0.0:4173 & broadcasting UDP Sibling discovery on port 49179.");
+        addLogLocked("SIBLING", "ChainIt Windows Native Daemon Started",
+                     "Listening on 0.0.0.0:4173, broadcasting UDP Sibling discovery on port 49179, and arming native Bluetooth RFCOMM (AF_BTH) sockets: phone UUID " +
+                         kChainItPhoneUuidStr + " / PC receiver UUID " + kChainItPcUuidStr + ".");
     }
 
     std::thread(httpServerLoop).detach();
     std::thread(discoveryLoop).detach();
+    std::thread(bluetoothDiscoveryLoop).detach();
+    std::thread(bluetoothServerLoop).detach();
     mountZDriveAsync();
 
     // Create Win32 System Tray Icon

@@ -84,50 +84,57 @@ class PhoneHttpAndWebDavServer(
     private fun handleClient(socket: Socket) {
         socket.use { sock ->
             sock.soTimeout = 30_000
-            val input = BufferedInputStream(sock.getInputStream())
-            val output = BufferedOutputStream(sock.getOutputStream())
+            handleStreamSession(sock.getInputStream(), sock.getOutputStream(), viaBluetooth = false)
+        }
+    }
 
-            val reqLine = readAsciiLine(input) ?: return
-            val parts = reqLine.split(" ")
-            if (parts.size < 2) return
-            val method = parts[0].uppercase(Locale.US)
-            val rawTarget = parts[1]
+    fun handleStreamSession(rawInput: InputStream, rawOutput: OutputStream, viaBluetooth: Boolean) {
+        val input = BufferedInputStream(rawInput)
+        val output = BufferedOutputStream(rawOutput)
 
-            val headers = mutableMapOf<String, String>()
-            while (true) {
-                val line = readAsciiLine(input) ?: break
-                if (line.isEmpty()) break
-                val colon = line.indexOf(':')
-                if (colon > 0) {
-                    val k = line.substring(0, colon).trim().lowercase(Locale.US)
-                    val v = line.substring(colon + 1).trim()
-                    headers[k] = v
-                }
+        val reqLine = readAsciiLine(input) ?: return
+        val parts = reqLine.split(" ")
+        if (parts.size < 2) return
+        val method = parts[0].uppercase(Locale.US)
+        val rawTarget = parts[1]
+
+        val headers = mutableMapOf<String, String>()
+        while (true) {
+            val line = readAsciiLine(input) ?: break
+            if (line.isEmpty()) break
+            val colon = line.indexOf(':')
+            if (colon > 0) {
+                val k = line.substring(0, colon).trim().lowercase(Locale.US)
+                val v = line.substring(colon + 1).trim()
+                headers[k] = v
             }
+        }
 
-            if (method == "OPTIONS" && !rawTarget.startsWith("/dav")) {
-                sendSimpleResponse(output, 204, "No Content", "text/plain", ByteArray(0))
-                return
+        if (method == "OPTIONS" && !rawTarget.startsWith("/dav")) {
+            sendSimpleResponse(output, 204, "No Content", "text/plain", ByteArray(0))
+            return
+        }
+
+        if (!checkSiblingAuth(headers)) {
+            val err = JSONObject().put("error", "Sibling Mode is paused or Pairing Key mismatch on Android phone.").toString()
+            sendSimpleResponse(output, 403, "Forbidden", "application/json", err.toByteArray(Charsets.UTF_8))
+            return
+        }
+
+        val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
+
+        try {
+            if (rawTarget == "/dav" || rawTarget.startsWith("/dav/") || rawTarget.startsWith("/dav?")) {
+                handleWebDav(method, rawTarget, headers, contentLength, input, output)
+            } else {
+                handleChainItApi(method, rawTarget, headers, contentLength, input, output)
             }
-
-            if (!checkSiblingAuth(headers)) {
-                val err = JSONObject().put("error", "Sibling Mode is paused or Pairing Key mismatch on Android phone.").toString()
-                sendSimpleResponse(output, 403, "Forbidden", "application/json", err.toByteArray(Charsets.UTF_8))
-                return
+            if (viaBluetooth) {
+                lastActivitySummary = "[Bluetooth RFCOMM] $lastActivitySummary"
             }
-
-            val contentLength = headers["content-length"]?.toLongOrNull() ?: 0L
-
-            try {
-                if (rawTarget == "/dav" || rawTarget.startsWith("/dav/") || rawTarget.startsWith("/dav?")) {
-                    handleWebDav(method, rawTarget, headers, contentLength, input, output)
-                } else {
-                    handleChainItApi(method, rawTarget, headers, contentLength, input, output)
-                }
-            } catch (e: Exception) {
-                val msg = JSONObject().put("error", e.message ?: "Phone VFS error").toString()
-                sendSimpleResponse(output, 400, "Bad Request", "application/json", msg.toByteArray(Charsets.UTF_8))
-            }
+        } catch (e: Exception) {
+            val msg = JSONObject().put("error", e.message ?: "Phone VFS error").toString()
+            sendSimpleResponse(output, 400, "Bad Request", "application/json", msg.toByteArray(Charsets.UTF_8))
         }
     }
 

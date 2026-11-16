@@ -88,13 +88,57 @@ app.post('/api/transport/mode', (req, res) => {
   }
 });
 
+const normalizeBtLink = (raw: string): string | null => {
+  let value = raw.trim();
+  const explicit = value.toLowerCase().startsWith('bt://');
+  if (explicit) value = value.slice(5);
+  value = value.replace(/[\/\s]+/g, '').replace(/-/g, ':');
+  if (!explicit && !value.includes(':')) return null;
+
+  const withChannel = value.match(/^((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}):(\d{1,5})$/);
+  const macOnly = value.match(/^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$/);
+  const compact = value.match(/^[0-9a-fA-F]{12}$/);
+
+  let mac: string | null = null;
+  let channel = 0;
+  if (withChannel) {
+    mac = withChannel[1].toUpperCase();
+    channel = Number(withChannel[2]);
+  } else if (macOnly) {
+    mac = value.toUpperCase();
+  } else if (compact) {
+    mac = value.toUpperCase().match(/.{2}/g)!.join(':');
+  }
+  if (!mac || channel < 0 || channel > 0xffff) return null;
+  return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
+};
+
 app.post('/api/transport/connect-ip', (req, res) => {
-  const { phoneIp } = (req.body || {}) as { phoneIp?: string; siblingKey?: string };
+  const { phoneIp, siblingKey } = (req.body || {}) as { phoneIp?: string; siblingKey?: string };
   if (!phoneIp || !phoneIp.trim()) {
-    res.status(400).json({ error: 'Phone IP is required' });
+    res.status(400).json({ error: 'Phone IP or Bluetooth address is required' });
     return;
   }
+  if (siblingKey && siblingKey.trim()) engine.siblingKey = siblingKey.trim();
+
+  const btLink = normalizeBtLink(phoneIp);
+  if (btLink) {
+    // Native Bluetooth RFCOMM needs no Wi-Fi, no Hotspot and no USB at all.
+    engine.environment.bluetoothEnabled = true;
+    engine.manualPhoneEndpoint = btLink;
+    engine.recomputeState();
+    engine.addLog(
+      'BLUETOOTH',
+      `Native Bluetooth RFCOMM link pinned -> ${btLink}`,
+      'AF_BTH socket to phone UUID c4a1b170-0001-4000-8000-00805f9b34fb; Z:\\ VFS + WebDAV now run over Bluetooth alone.'
+    );
+    engine.broadcast('snapshot');
+    res.json(engine.getSnapshot());
+    return;
+  }
+
   engine.environment.sharedWifiAvailable = true;
+  engine.manualPhoneEndpoint = phoneIp.trim();
   engine.recomputeState();
   engine.addLog(
     'TRANSPORT',

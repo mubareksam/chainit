@@ -27,6 +27,7 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import com.chainit.android.net.BluetoothRfcommTransport
 import com.chainit.android.service.SiblingDaemonService
 import java.net.HttpURLConnection
 import java.net.URL
@@ -35,7 +36,8 @@ import java.net.URLEncoder
 class MainActivity : Activity() {
 
     companion object {
-        private const val REQ_PICK_FILE = 2001
+        private const val REQ_PICK_FILE_AUTO = 2001
+        private const val REQ_PICK_FILE_BT_ONLY = 2003
         private const val REQ_PERMS = 2002
     }
 
@@ -43,6 +45,7 @@ class MainActivity : Activity() {
     private lateinit var statusBadgeText: TextView
     private lateinit var storageBtn: Button
     private lateinit var batteryBtn: Button
+    private lateinit var btPermBtn: Button
     private lateinit var endpointsText: TextView
     private lateinit var pcStatusText: TextView
     private lateinit var pcIpInput: EditText
@@ -60,7 +63,7 @@ class MainActivity : Activity() {
         window.statusBarColor = Color.parseColor("#090D16")
         window.navigationBarColor = Color.parseColor("#090D16")
 
-        requestNotificationAndLegacyPermissionsIfNeeded()
+        requestInitialRuntimePermissions()
 
         val prefs = getSharedPreferences("chainit_prefs", Context.MODE_PRIVATE)
         val siblingEnabled = prefs.getBoolean("sibling_enabled", true)
@@ -112,7 +115,6 @@ class MainActivity : Activity() {
             setPadding(dp(18), dp(22), dp(18), dp(28))
         }
 
-        // Title Header
         val title = TextView(this).apply {
             text = "ChainIt Sibling"
             textSize = 24f
@@ -120,7 +122,7 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
         }
         val subtitle = TextView(this).apply {
-            text = "Seamless Windows Z:\\ Virtual Drive & Auto-Connect File Link"
+            text = "USB • Wi-Fi • Hotspot • Bluetooth — Seamless Windows Z:\\ Drive"
             textSize = 13f
             setTextColor(Color.parseColor("#94A3B8"))
             setPadding(0, dp(4), 0, dp(14))
@@ -161,7 +163,7 @@ class MainActivity : Activity() {
         rowSwitch.addView(masterSwitch)
 
         val statusDesc = TextView(this).apply {
-            text = "When ON, your Windows PC auto-connects over USB, Wi-Fi, or Hotspot and browses Z:\\ even while your phone screen is locked in your pocket."
+            text = "Your Windows PC auto-connects over USB, Wi-Fi, Hotspot, or Bluetooth and mounts Z:\\ even while your phone screen is locked."
             textSize = 12f
             setTextColor(Color.parseColor("#D1FAE5"))
             setPadding(0, dp(6), 0, 0)
@@ -172,7 +174,7 @@ class MainActivity : Activity() {
             bottomMargin = dp(14)
         })
 
-        // One-Time Setup Permissions Card
+        // Setup Checklist Card
         val permCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = cardBg()
@@ -204,20 +206,31 @@ class MainActivity : Activity() {
             background = buttonBg("#1E293B")
             setOnClickListener { requestBatteryExemption() }
         }
-        permCard.addView(batteryBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        permCard.addView(batteryBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(8)
+        })
+
+        btPermBtn = Button(this).apply {
+            isAllCaps = false
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            background = buttonBg("#1E293B")
+            setOnClickListener { requestBluetoothPermissionsExplicitly() }
+        }
+        permCard.addView(btPermBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         root.addView(permCard, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = dp(14)
         })
 
-        // Live Transports & Phone IPs Card
+        // Active Links Card (USB / Wi-Fi / Hotspot / Bluetooth)
         val netCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = cardBg()
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
         netCard.addView(TextView(this).apply {
-            text = "Active Links & Sibling Discovery"
+            text = "Active Transports (IP & Native Bluetooth)"
             textSize = 15f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -230,7 +243,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(8), 0, dp(8))
         }
         pcStatusText = TextView(this).apply {
-            text = "Waiting for ChainIt-Windows.exe on PC..."
+            text = "Waiting for ChainIt-Windows.exe..."
             textSize = 12.5f
             setTextColor(Color.parseColor("#CBD5E1"))
         }
@@ -240,14 +253,14 @@ class MainActivity : Activity() {
             bottomMargin = dp(14)
         })
 
-        // Instant Send File Phone -> PC & Browse PC Card
+        // Instant Share Card
         val actionCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = cardBg()
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
         actionCard.addView(TextView(this).apply {
-            text = "Instant Share with Windows PC"
+            text = "Instant Share to Windows PC"
             textSize = 15f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -255,7 +268,7 @@ class MainActivity : Activity() {
         })
 
         pcIpInput = EditText(this).apply {
-            hint = "Windows PC IP (auto-filled on discovery, e.g. 192.168.1.25)"
+            hint = "Optional PC IP (blank = Auto Discovery / Bluetooth)"
             setText(prefs.getString("last_pc_ip", ""))
             setHintTextColor(Color.parseColor("#64748B"))
             setTextColor(Color.WHITE)
@@ -268,16 +281,29 @@ class MainActivity : Activity() {
             bottomMargin = dp(10)
         })
 
-        val sendBtn = Button(this).apply {
-            text = "Send File(s) Instantly to Windows PC Desktop"
+        val sendAutoBtn = Button(this).apply {
+            text = "Send File to PC (Auto: Fast Wi-Fi / Hotspot / Bluetooth)"
             isAllCaps = false
-            textSize = 13.5f
+            textSize = 13f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.parseColor("#020617"))
             background = buttonBg("#06B6D4")
-            setOnClickListener { pickAndSendFileToPc() }
+            setOnClickListener { pickFile(REQ_PICK_FILE_AUTO) }
         }
-        actionCard.addView(sendBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+        actionCard.addView(sendAutoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = dp(8)
+        })
+
+        val sendBtBtn = Button(this).apply {
+            text = "Send File via Bluetooth Only (Works with Wi-Fi OFF)"
+            isAllCaps = false
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            background = buttonBg("#2563EB")
+            setOnClickListener { pickFile(REQ_PICK_FILE_BT_ONLY) }
+        }
+        actionCard.addView(sendBtBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             bottomMargin = dp(8)
         })
 
@@ -290,7 +316,7 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val ip = resolveTargetPcIp()
                 if (ip.isBlank()) {
-                    Toast.makeText(this@MainActivity, "Start ChainIt-Windows.exe on PC or enter PC IP above", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Connect Wi-Fi/Hotspot or enter PC IP above to open Web Explorer", Toast.LENGTH_LONG).show()
                 } else {
                     startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://$ip:4173/mobile")))
                 }
@@ -356,7 +382,7 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("chainit_prefs", Context.MODE_PRIVATE)
         val enabled = prefs.getBoolean("sibling_enabled", true)
         statusBadgeText.text = if (enabled && SiblingDaemonService.isRunning) {
-            "Sibling Mode: ACTIVE (Port 49180)"
+            "Sibling Mode: ACTIVE"
         } else {
             "Sibling Mode: PAUSED"
         }
@@ -378,18 +404,32 @@ class MainActivity : Activity() {
             "2. Tap to Allow Screen-Off Background Standby"
         }
 
-        val eps = SiblingDaemonService.getEndpoints(this)
-        if (eps.isEmpty()) {
-            endpointsText.text = "No Wi-Fi / Hotspot / USB Tether active.\nTip: Turn on Wi-Fi, Phone Hotspot, or USB Tethering!"
+        val btPermOk = BluetoothRfcommTransport.hasBluetoothPermission(this)
+        val btAdapterOn = BluetoothRfcommTransport.getLocalAdapter(this)?.isEnabled == true
+        btPermBtn.text = when {
+            !btPermOk -> "3. Tap to Allow Bluetooth Connectivity"
+            !btAdapterOn -> "3. Bluetooth Radio is OFF (Turn ON for Bluetooth Mode)"
+            else -> "✓ 3. Bluetooth Sibling Socket Ready (RFCOMM Active)"
+        }
+        btPermBtn.background = buttonBg(if (btPermOk && btAdapterOn) "#065F46" else "#1E293B")
+
+        val lines = mutableListOf<String>()
+        for (ep in SiblingDaemonService.getEndpoints(this)) {
+            lines.add("• [${ep.transportKind}] ${ep.ip}:49180 (${ep.ifaceName})")
+        }
+        if (SiblingDaemonService.isBluetoothListening()) {
+            val btPeer = SiblingDaemonService.getLastBluetoothPeer()
+            lines.add("• [bluetooth] RFCOMM Listening${if (btPeer != null) " (Linked: $btPeer)" else " (Paired PC Ready)"}")
+        }
+        endpointsText.text = if (lines.isEmpty()) {
+            "Turn on Wi-Fi, Hotspot, USB Tethering, or Bluetooth to connect!"
         } else {
-            endpointsText.text = eps.joinToString("\n") { ep ->
-                "• [${ep.transportKind}] ${ep.ip}:49180 (${ep.ifaceName})"
-            }
+            lines.joinToString("\n")
         }
 
         val pc = SiblingDaemonService.getDiscoveredPc()
         if (pc != null) {
-            pcStatusText.text = "Connected Sibling PC: ${pc.pcName} (${pc.ip}:${pc.httpPort})\nLast Z:\\ Activity: ${SiblingDaemonService.getLastVfsSummary()}"
+            pcStatusText.text = "Connected PC: ${pc.pcName} (${pc.ip}:${pc.httpPort})\nLast Z:\\ Activity: ${SiblingDaemonService.getLastVfsSummary()}"
             if (pcIpInput.text.toString().isBlank()) {
                 pcIpInput.setText(pc.ip)
                 prefs.edit().putString("last_pc_ip", pc.ip).apply()
@@ -409,36 +449,51 @@ class MainActivity : Activity() {
         return SiblingDaemonService.getDiscoveredPc()?.ip ?: ""
     }
 
-    private fun pickAndSendFileToPc() {
-        val ip = resolveTargetPcIp()
-        if (ip.isBlank()) {
-            Toast.makeText(this, "Run ChainIt-Windows.exe on your PC first (or type PC IP)", Toast.LENGTH_LONG).show()
-            return
-        }
+    private fun pickFile(requestCode: Int) {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
         }
-        startActivityForResult(intent, REQ_PICK_FILE)
+        startActivityForResult(intent, requestCode)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQ_PICK_FILE && resultCode == RESULT_OK && data?.data != null) {
+        if (resultCode == RESULT_OK && data?.data != null) {
             val uri = data.data!!
-            val ip = resolveTargetPcIp()
-            uploadUriToPc(uri, ip)
+            var fileName = "phone_file_${System.currentTimeMillis()}"
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && cursor.moveToFirst()) {
+                    fileName = cursor.getString(idx) ?: fileName
+                }
+            }
+
+            if (requestCode == REQ_PICK_FILE_BT_ONLY) {
+                sendOverBluetoothThread(uri, fileName)
+            } else if (requestCode == REQ_PICK_FILE_AUTO) {
+                val ip = resolveTargetPcIp()
+                if (ip.isBlank()) {
+                    // No IP available -> automatically send via Bluetooth RFCOMM!
+                    sendOverBluetoothThread(uri, fileName)
+                } else {
+                    uploadUriToPcWithBtFallback(uri, fileName, ip)
+                }
+            }
         }
     }
 
-    private fun uploadUriToPc(uri: Uri, pcIp: String) {
-        var fileName = "phone_file_${System.currentTimeMillis()}"
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            if (idx >= 0 && cursor.moveToFirst()) {
-                fileName = cursor.getString(idx) ?: fileName
+    private fun sendOverBluetoothThread(uri: Uri, fileName: String) {
+        Toast.makeText(this, "Sending $fileName over Bluetooth...", Toast.LENGTH_SHORT).show()
+        Thread {
+            val (ok, msg) = BluetoothRfcommTransport.sendUriOverBluetoothToPairedPc(this, uri, fileName)
+            uiHandler.post {
+                Toast.makeText(this, msg, if (ok) Toast.LENGTH_LONG else Toast.LENGTH_LONG).show()
             }
-        }
+        }.start()
+    }
+
+    private fun uploadUriToPcWithBtFallback(uri: Uri, fileName: String, pcIp: String) {
         Toast.makeText(this, "Sending $fileName to PC...", Toast.LENGTH_SHORT).show()
         Thread {
             try {
@@ -447,7 +502,7 @@ class MainActivity : Activity() {
                 val conn = (url.openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
                     doOutput = true
-                    connectTimeout = 8000
+                    connectTimeout = 4000
                     readTimeout = 60000
                     setChunkedStreamingMode(64 * 1024)
                     setRequestProperty("Content-Type", "application/octet-stream")
@@ -458,17 +513,18 @@ class MainActivity : Activity() {
                     }
                 }
                 val code = conn.responseCode
-                uiHandler.post {
-                    if (code in 200..299) {
+                if (code in 200..299) {
+                    uiHandler.post {
                         Toast.makeText(this, "✓ Sent $fileName to Windows Desktop!", Toast.LENGTH_LONG).show()
-                    } else {
-                        Toast.makeText(this, "Upload error: HTTP $code", Toast.LENGTH_LONG).show()
                     }
+                    return@Thread
                 }
-            } catch (e: Exception) {
-                uiHandler.post {
-                    Toast.makeText(this, "Failed to reach PC ($pcIp): ${e.message}", Toast.LENGTH_LONG).show()
-                }
+            } catch (_: Exception) {
+                // High-speed IP link unreachable -> Automatically fall back to Bluetooth RFCOMM!
+            }
+            val (_, btMsg) = BluetoothRfcommTransport.sendUriOverBluetoothToPairedPc(this, uri, fileName)
+            uiHandler.post {
+                Toast.makeText(this, btMsg, Toast.LENGTH_LONG).show()
             }
         }.start()
     }
@@ -504,12 +560,35 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun requestNotificationAndLegacyPermissionsIfNeeded() {
+    private fun requestBluetoothPermissionsExplicitly() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_ADVERTISE
+                ),
+                REQ_PERMS
+            )
+        } else {
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+        }
+    }
+
+    private fun requestInitialRuntimePermissions() {
         val perms = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                perms.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
         }
         if (Build.VERSION.SDK_INT <= 29 &&
             checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED

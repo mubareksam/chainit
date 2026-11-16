@@ -103,9 +103,21 @@ export interface TransferRecord {
 export interface ProtocolLogEntry {
   id: string;
   timestampMs: number;
-  layer: 'SIBLING' | 'TRANSPORT' | 'VFS' | 'WEBDAV';
+  layer: 'SIBLING' | 'TRANSPORT' | 'VFS' | 'WEBDAV' | 'BLUETOOTH';
   summary: string;
   detail: string;
+}
+
+/** Live status of the native Bluetooth RFCOMM transport (Windows AF_BTH <-> Android BluetoothServerSocket). */
+export interface BluetoothLinkInfo {
+  nativeRfcomm: boolean;
+  radioPresent: boolean;
+  receiverListening: boolean;
+  receiverRfcommChannel: number;
+  phoneServerUuid: string;
+  pcReceiverUuid: string;
+  activeLink: string;
+  pairedDevices: string[];
 }
 
 export interface SystemSnapshot {
@@ -124,4 +136,5 @@ export interface SystemSnapshot {
   logs: ProtocolLogEntry[];
   lanAddresses: string[];
   serverPort: number;
+  bluetooth?: BluetoothLinkInfo;
 }

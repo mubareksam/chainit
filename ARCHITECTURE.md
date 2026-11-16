@@ -45,7 +45,7 @@ ChainIt treats network transports as interchangeable byte-stream pipes beneath a
 | **1** | `usb_rndis` | Offline (Wired) | **320–480 MB/s** | `< 0.8 ms` | No | USB Tethering / ADB forward; fastest bulk transfers + charges phone |
 | **2** | `wifi_lan` | Offline (LAN) | **45–115 MB/s** | `2–6 ms` | Local Wi-Fi AP | mDNS (`_chainit._tcp.local.`) over shared 5 GHz / 6 GHz Wi-Fi |
 | **3** | `local_hotspot` | Offline (Direct) | **35–85 MB/s** | `3–8 ms` | **No (100% Offline)** | Android `LocalOnlyHotspot` / Wi-Fi Direct bootstrapped over BLE |
-| **4** | `bluetooth` | Offline (WPAN) | **1.8–2.4 MB/s** | `15–28 ms` | **No (100% Offline)** | BLE always-on wakeup beacon + RFCOMM metadata/small-file fallback |
+| **4** | `bluetooth` | Offline (WPAN) | **0.3–2.4 MB/s** | `40–180 ms` | **No (100% Offline)** | **Native RFCOMM sockets** (Windows `AF_BTH` / `ws2bth.h` ↔ Android `BluetoothServerSocket`) carrying the full VFS + WebDAV protocol, plus BLE wakeup beacon |
 | **5** | `online_p2p` | Online (Pluggable) | **5–50 MB/s** | `20–90 ms` | Internet | Pluggable `TransportAdapter` trait (QUIC/WebRTC + DERP relay) |
 
 ### 2.2 Smart Auto-Selection Scoring Formula
@@ -64,10 +64,29 @@ Where:
 ### 2.3 Dynamic BLE $\rightarrow$ 5 GHz Local Hotspot Promotion (Zero-Router Offline Speed)
 
 When you are away from a Wi-Fi router (on a plane, campus, café without Wi-Fi, or power outage):
-1. Laptop and Phone maintain a near-zero-power **BLE Sibling Link** (`bluetooth`). Small directory listings (`Z:\` `readdir`) work immediately over RFCOMM/BLE L2CAP.
+1. Laptop and Phone maintain a near-zero-power **native Bluetooth RFCOMM Sibling Link** (`bluetooth`). Small directory listings (`Z:\` `readdir`) work immediately over that socket even with Wi-Fi fully off (see §2.4).
 2. As soon as a file read/write $\ge 1\text{ MB}$ starts (or `Z:\` streams media), `SmartTransportSelector` sends an encrypted `PromoteLocalHotspot` command over BLE GATT.
 3. Android calls `WifiManager.startLocalOnlyHotspot()` in the background (screen stays off!) and returns the ephemeral 5 GHz `SSID` + `WPA2/WPA3 Passphrase` + local IP over the encrypted BLE channel.
 4. Windows connects its Wi-Fi Direct / WLAN virtual adapter to the ephemeral hotspot and **seamlessly migrates the in-flight transfer at the next 1 MB chunk boundary** without restarting or corrupting the copy!
+
+### 2.4 Native Bluetooth RFCOMM Transport (Implemented — Zero Wi-Fi / Zero USB)
+
+Bluetooth is a **first-class transport**, not an OBEX file-push workaround: both ends open real RFCOMM byte streams and speak the identical `CHNP/1.0` HTTP + WebDAV protocol used on TCP, so `Z:\`, the File Manager, previews and transfers behave exactly the same with every radio except Bluetooth switched off.
+
+| Role | UUID | Implementation |
+| :--- | :--- | :--- |
+| **Phone Server** (serves `Z:\` + File Manager to the PC) | `c4a1b170-0001-4000-8000-00805f9b34fb` | Android `BluetoothAdapter.listenUsingRfcommWithServiceRecord("ChainItSibling", CHAINIT_PHONE_UUID)` → `PhoneHttpAndWebDavServer.handleStreamSession(in, out, viaBluetooth = true)` |
+| **PC Receiver** (accepts Phone → PC pushes) | `c4a1b170-0002-4000-8000-00805f9b34fb` | Windows `socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM)` → `bind(BT_PORT_ANY)` → `listen` → `WSASetServiceW(NS_BTH, RNRSERVICE_REGISTER)` publishes the SDP record → accepted sockets are handed to the regular HTTP engine, so `POST /api/vfs/pc/upload?dir=/Desktop` writes to `C:\Users\<user>\Desktop` |
+
+**Windows client side (`windows/src/chainit_win_main.cpp`)**
+- A Bluetooth endpoint is addressed as `bt://AA:BB:CC:DD:EE:FF` (optional `:channel` suffix). `normalizeBtEndpoint()` accepts bare MACs (`AA-BB-CC-DD-EE-FF`, `AABBCCDDEEFF`) from the Manual-Connect box and never mistakes an IPv4 address for a MAC.
+- `httpRequestToPhone()` branches on that prefix: `SOCKADDR_BTH{AF_BTH, btAddr, serviceClassId = kChainItPhoneUuid, port = BT_PORT_ANY}` lets the Windows stack run the SDP query and resolve the RFCOMM channel, then a non-blocking `connect` + `select` enforces the timeout (with a blocking retry for stacks that reject non-blocking `AF_BTH` connects).
+- Because one RFCOMM link is a single serialized stream, all Bluetooth requests are queued on `gBtRfcommClientMtx`; TCP transports stay fully parallel.
+
+**Discovery & failover**
+- `bluetoothDiscoveryLoop()` calls `WSALookupServiceBeginW(NS_BTH, LUP_CONTAINERS | LUP_RETURN_NAME | LUP_RETURN_ADDR)` to read the stack's *remembered/paired* device cache — no 12-second inquiry scan, no user prompt — then probes each device's `bt://` endpoint with `GET /chainit/ping`.
+- The Bluetooth endpoint TTL is **35 s** (vs 12 s for TCP) since page/SDP latency is higher, so the link never flickers out of the scored transport list; Automatic Mode fails over to it the instant USB/Wi-Fi/Hotspot disappear, and Manual Mode can pin `bluetooth` outright.
+- Bluetooth needs **no firewall rule** and survives router AP-isolation, captive portals and corporate LAN lockdowns.
 
 ---
 

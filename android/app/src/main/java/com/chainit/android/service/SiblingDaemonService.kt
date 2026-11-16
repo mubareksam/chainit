@@ -12,6 +12,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import com.chainit.android.net.BluetoothRfcommTransport
 import com.chainit.android.net.DiscoveredPcInfo
 import com.chainit.android.net.LocalLinkEndpoint
 import com.chainit.android.net.PhoneHttpAndWebDavServer
@@ -36,6 +37,9 @@ class SiblingDaemonService : Service() {
         @Volatile
         private var activeDiscovery: UdpSiblingDiscovery? = null
 
+        @Volatile
+        private var activeBluetooth: BluetoothRfcommTransport? = null
+
         fun getLastVfsSummary(): String =
             activeServer?.lastActivitySummary ?: "Service stopped"
 
@@ -44,11 +48,18 @@ class SiblingDaemonService : Service() {
 
         fun getDiscoveredPc(): DiscoveredPcInfo? =
             activeDiscovery?.lastDiscoveredPc
+
+        fun isBluetoothListening(): Boolean =
+            activeBluetooth?.isListeningRfcomm == true
+
+        fun getLastBluetoothPeer(): String? =
+            activeBluetooth?.lastBtPeerName
     }
 
     private lateinit var vfs: AndroidStorageVfsProvider
     private lateinit var httpServer: PhoneHttpAndWebDavServer
     private lateinit var discovery: UdpSiblingDiscovery
+    private lateinit var btTransport: BluetoothRfcommTransport
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -64,8 +75,9 @@ class SiblingDaemonService : Service() {
 
         httpServer = PhoneHttpAndWebDavServer(applicationContext, vfs, 49180)
         discovery = UdpSiblingDiscovery(applicationContext, 49180, 49179)
+        btTransport = BluetoothRfcommTransport(applicationContext, httpServer)
 
-        val notification = buildForegroundNotification("Sibling Auto-Connect Active • Screen-off Z:\\ Ready")
+        val notification = buildForegroundNotification("Sibling Active • Wi-Fi, Hotspot, USB & Bluetooth Ready")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -75,9 +87,11 @@ class SiblingDaemonService : Service() {
         acquireScreenOffLocks()
         httpServer.start()
         discovery.start()
+        btTransport.start()
 
         activeServer = httpServer
         activeDiscovery = discovery
+        activeBluetooth = btTransport
         isRunning = true
     }
 
@@ -145,6 +159,8 @@ class SiblingDaemonService : Service() {
         isRunning = false
         activeServer = null
         activeDiscovery = null
+        activeBluetooth = null
+        btTransport.stop()
         httpServer.stop()
         discovery.stop()
         try {

@@ -54,6 +54,9 @@ class ChainItEngine {
   transfers: TransferRecord[] = [];
   logs: ProtocolLogEntry[] = [];
   serverPort = 4173;
+  siblingKey = 'CHAINIT-SIBLING';
+  /** Manually pinned endpoint: an IPv4 address or a native Bluetooth link such as bt://AA:BB:CC:DD:EE:FF */
+  manualPhoneEndpoint = '';
 
   private wsClients = new Set<WebSocket>();
 
@@ -207,7 +210,7 @@ class ChainItEngine {
       },
       {
         id: 'bluetooth',
-        name: 'Bluetooth (BLE Wake + RFCOMM)',
+        name: 'Bluetooth (Native RFCOMM + PAN)',
         shortName: 'Bluetooth',
         category: 'WPAN Offline',
         isOffline: true,
@@ -219,8 +222,8 @@ class ChainItEngine {
         signalPct: 92,
         powerCostIndex: 8,
         statusNote: env.bluetoothEnabled
-          ? 'Ultra-low power Sibling beacon + metadata/fallback channel'
-          : 'Bluetooth radio disabled',
+          ? 'Native RFCOMM sockets (AF_BTH <-> BluetoothServerSocket) carrying Z:\\ VFS + WebDAV with zero Wi-Fi'
+          : 'Bluetooth radio disabled — pair once to arm native RFCOMM',
       },
       {
         id: 'online_p2p',
@@ -536,6 +539,16 @@ class ChainItEngine {
       logs: [...this.logs],
       lanAddresses: this.getLanAddresses(),
       serverPort: this.serverPort,
+      bluetooth: {
+        nativeRfcomm: true,
+        radioPresent: this.environment.bluetoothEnabled,
+        receiverListening: this.environment.bluetoothEnabled,
+        receiverRfcommChannel: this.environment.bluetoothEnabled ? 12 : 0,
+        phoneServerUuid: 'c4a1b170-0001-4000-8000-00805f9b34fb',
+        pcReceiverUuid: 'c4a1b170-0002-4000-8000-00805f9b34fb',
+        activeLink: this.manualPhoneEndpoint.startsWith('bt://') ? this.manualPhoneEndpoint : '',
+        pairedDevices: this.manualPhoneEndpoint.startsWith('bt://') ? [this.manualPhoneEndpoint] : [],
+      },
     };
   }
 }
