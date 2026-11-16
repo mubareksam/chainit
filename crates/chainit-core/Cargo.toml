@@ -1,0 +1,17 @@
+[package]
+name = "chainit-core"
+version.workspace = true
+edition.workspace = true
+description = "Shared Rust core for ChainIt: multi-transport selector, Sibling trust protocol, and VFS chunk engine"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

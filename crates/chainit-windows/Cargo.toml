@@ -1,0 +1,20 @@
+[package]
+name = "chainit-windows"
+version.workspace = true
+edition.workspace = true
+description = "ChainIt Windows Sibling Daemon & Z:\\ Virtual Drive Mounter (WinFsp + WebDAV)"
+
+[dependencies]
+chainit-core = { path = "../chainit-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WNet",
+    "Win32_Storage_FileSystem",
+] }

@@ -1,0 +1,29 @@
+# Node / Frontend / Runnable Prototype
+node_modules/
+app/node_modules/
+app/dist/
+.vite/
+
+# Runtime sandbox drives & ephemeral logs
+.runtime/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+*.apk
+*.aab
+*.idsig
+!releases/ChainIt-Android.apk
+!releases/ChainIt-Windows.exe
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.log

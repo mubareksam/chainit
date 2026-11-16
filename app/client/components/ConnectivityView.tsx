@@ -1,0 +1,417 @@
+import React, { useState } from 'react';
+import {
+  Bluetooth,
+  Cable,
+  CheckCircle2,
+  Cpu,
+  Globe,
+  Link2,
+  Lock,
+  Radio,
+  Sliders,
+  Sparkles,
+  Wifi,
+  WifiOff,
+  Zap,
+} from 'lucide-react';
+import { SystemSnapshot, TransportId, TransportTelemetry } from '../../shared/types';
+import { api } from '../api/client';
+
+interface Props {
+  snapshot: SystemSnapshot;
+  onSnapshot: (s: SystemSnapshot) => void;
+  notify: (msg: string, kind?: 'success' | 'error' | 'info') => void;
+}
+
+export const ConnectivityView: React.FC<Props> = ({ snapshot, onSnapshot, notify }) => {
+  const [phoneIp, setPhoneIp] = useState('');
+  const [siblingKey, setSiblingKey] = useState('CHAINIT-SIBLING');
+  const renderTransportIcon = (id: TransportId) => {
+    switch (id) {
+      case 'usb_rndis':
+        return <Cable className="w-5 h-5" />;
+      case 'wifi_lan':
+        return <Wifi className="w-5 h-5" />;
+      case 'local_hotspot':
+        return <Radio className="w-5 h-5" />;
+      case 'bluetooth':
+        return <Bluetooth className="w-5 h-5" />;
+      case 'online_p2p':
+        return <Globe className="w-5 h-5" />;
+    }
+  };
+
+  const handleModeSwitch = async (mode: 'auto' | 'manual', manualId?: TransportId) => {
+    try {
+      const next = await api.setTransportMode(mode, manualId);
+      onSnapshot(next);
+      notify(
+        mode === 'auto'
+          ? 'Switched to Automatic Smart Link selection'
+          : `Pinned Manual transport: ${manualId}`,
+        'info'
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Mode update failed', 'error');
+    }
+  };
+
+  const toggleEnv = async (key: keyof SystemSnapshot['environment']) => {
+    const current = snapshot.environment[key];
+    if (typeof current !== 'boolean') return;
+    try {
+      const next = await api.updateEnvironment({ [key]: !current });
+      onSnapshot(next);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Simulation update failed', 'error');
+    }
+  };
+
+  const runRouterlessHotspotBoostDemo = async () => {
+    try {
+      // 1. Ensure Auto mode, unplug USB & turn off shared Wi-Fi router, start with Hotspot off & Bluetooth on
+      await api.setTransportMode('auto');
+      await api.updateEnvironment({
+        usbPlugged: false,
+        sharedWifiAvailable: false,
+        localHotspotActive: false,
+        bluetoothEnabled: true,
+      });
+      // 2. Perform a file transfer -> triggers BLE -> 5 GHz Local Hotspot auto-promotion!
+      const res = await api.transfer({
+        op: 'copy',
+        fromTarget: 'pc',
+        fromPaths: ['/Pictures/Architecture_Diagram_Card.svg'],
+        toTarget: 'phone',
+        toDir: '/ChainIt_Inbox',
+      });
+      onSnapshot(res.snapshot);
+      notify(
+        'Routerless Demo: Wi-Fi router OFF -> BLE woke Android 5 GHz Local Hotspot (72.4 MB/s) automatically!',
+        'success'
+      );
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Demo failed', 'error');
+    }
+  };
+
+  const activeTransport = snapshot.transports.find((t) => t.isActive) || null;
+
+  return (
+    <div className="space-y-6">
+      {/* Top Mode Banner */}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <Cpu className="w-4 h-4 text-cyan-400" />
+            <h2 className="text-base font-semibold text-slate-100">
+              Multi-Transport Engine — Offline-First + Pluggable Online
+            </h2>
+          </div>
+          <p className="text-xs text-slate-400 max-w-2xl leading-relaxed">
+            In <strong className="text-slate-200">Automatic</strong> mode, ChainIt continuously scores bandwidth,
+            RTT latency, signal stability, and battery cost (with +6.0 hysteresis to prevent link flapping), and
+            transparently promotes Bluetooth to a router-free 5 GHz Local Hotspot for bulk transfers.
+          </p>
+        </div>
+
+        {/* Segmented Control */}
+        <div className="inline-flex rounded-xl border border-slate-800 bg-slate-950 p-1 shrink-0 self-start">
+          <button
+            onClick={() => void handleModeSwitch('auto')}
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition ${
+              snapshot.selectionMode === 'auto'
+                ? 'bg-emerald-500 text-slate-950 shadow'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            Automatic (Smart Select)
+          </button>
+          <button
+            onClick={() =>
+              void handleModeSwitch('manual', snapshot.activeTransportId || snapshot.manualTransportId)
+            }
+            className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold transition ${
+              snapshot.selectionMode === 'manual'
+                ? 'bg-cyan-500 text-slate-950 shadow'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sliders className="w-3.5 h-3.5" />
+            Manual (Pinned Link)
+          </button>
+        </div>
+      </div>
+
+      {/* Transport Scorecards Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+        {snapshot.transports.map((t: TransportTelemetry) => {
+          const isPinnedManual =
+            snapshot.selectionMode === 'manual' && snapshot.manualTransportId === t.id;
+          return (
+            <div
+              key={t.id}
+              className={`rounded-2xl border p-4 flex flex-col justify-between transition ${
+                t.isActive
+                  ? 'border-emerald-500/70 bg-emerald-950/20 shadow-lg shadow-emerald-950/30'
+                  : 'border-slate-800 bg-slate-900/80 hover:border-slate-700'
+              }`}
+            >
+              <div>
+                <div className="flex items-start justify-between gap-2 mb-3">
+                  <div
+                    className={`p-2.5 rounded-xl ${
+                      t.isActive
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : t.available
+                          ? 'bg-slate-800 text-cyan-300'
+                          : 'bg-slate-800/60 text-slate-500'
+                    }`}
+                  >
+                    {renderTransportIcon(t.id)}
+                  </div>
+                  <div className="flex flex-col items-end gap-1">
+                    <span
+                      className={`text-[10px] font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                        t.isOffline
+                          ? 'bg-slate-800 text-slate-300'
+                          : 'bg-purple-500/15 text-purple-300 border border-purple-500/30'
+                      }`}
+                    >
+                      {t.isOffline ? '100% Offline' : 'Pluggable Online'}
+                    </span>
+                    {t.isActive && (
+                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> Active Pipe
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <h3 className="text-sm font-semibold text-slate-100">{t.shortName}</h3>
+                <p className="text-[11px] text-slate-400 mt-0.5 min-h-[32px]">{t.statusNote}</p>
+
+                {/* Metrics */}
+                <div className="mt-4 pt-3 border-t border-slate-800/80 grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase">Throughput</div>
+                    <div className="font-mono font-semibold text-slate-200">{t.speedMBps} MB/s</div>
+                  </div>
+                  <div>
+                    <div className="text-[10px] text-slate-500 uppercase">Latency</div>
+                    <div className="font-mono font-semibold text-slate-200">{t.rttMs} ms</div>
+                  </div>
+                </div>
+
+                {/* Score Bar */}
+                <div className="mt-3">
+                  <div className="flex items-center justify-between text-[11px] mb-1">
+                    <span className="text-slate-400">Smart Link Score</span>
+                    <span className="font-mono font-bold text-slate-100">{t.score} / 100</span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-300 ${
+                        t.isActive
+                          ? 'bg-emerald-400'
+                          : t.available
+                            ? 'bg-cyan-400'
+                            : 'bg-slate-700'
+                      }`}
+                      style={{ width: `${Math.max(4, t.score)}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <button
+                onClick={() => void handleModeSwitch('manual', t.id)}
+                className={`mt-4 w-full py-1.5 rounded-lg text-xs font-semibold transition ${
+                  isPinnedManual
+                    ? 'bg-cyan-500 text-slate-950'
+                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                }`}
+              >
+                {isPinnedManual ? 'Pinned (Manual)' : 'Pin Manually'}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Physical Scenario Lab */}
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-100">
+              Interactive Hardware & Network Environment Simulator
+            </h3>
+            <p className="text-xs text-slate-400">
+              Toggle cables, routers, or phone screen lock below to watch ChainIt fail over and adapt in real time.
+            </p>
+          </div>
+
+          <button
+            onClick={() => void runRouterlessHotspotBoostDemo()}
+            className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-950 font-semibold text-xs hover:opacity-95 transition shadow"
+          >
+            <Zap className="w-4 h-4" />
+            Test Routerless Offline Transfer (BLE → 5GHz Hotspot Boost)
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          <EnvSwitchCard
+            title="USB-C Cable Plugged In"
+            subtitle="Simulates USB RNDIS / ADB wired connection (420 MB/s)"
+            active={snapshot.environment.usbPlugged}
+            onClick={() => void toggleEnv('usbPlugged')}
+            icon={<Cable className="w-4 h-4" />}
+          />
+          <EnvSwitchCard
+            title="Shared Wi-Fi Router Online"
+            subtitle="Turn OFF to test 100% routerless offline connectivity"
+            active={snapshot.environment.sharedWifiAvailable}
+            onClick={() => void toggleEnv('sharedWifiAvailable')}
+            icon={
+              snapshot.environment.sharedWifiAvailable ? (
+                <Wifi className="w-4 h-4" />
+              ) : (
+                <WifiOff className="w-4 h-4" />
+              )
+            }
+          />
+          <EnvSwitchCard
+            title="5 GHz Local Hotspot Active"
+            subtitle="Direct Android SoftAP (auto-starts over BLE when needed)"
+            active={snapshot.environment.localHotspotActive}
+            onClick={() => void toggleEnv('localHotspotActive')}
+            icon={<Radio className="w-4 h-4" />}
+          />
+          <EnvSwitchCard
+            title="Bluetooth (BLE + RFCOMM)"
+            subtitle="Ultra-low-power Sibling beacon & bootstrap channel"
+            active={snapshot.environment.bluetoothEnabled}
+            onClick={() => void toggleEnv('bluetoothEnabled')}
+            icon={<Bluetooth className="w-4 h-4" />}
+          />
+          <EnvSwitchCard
+            title="Phone Screen OFF (Locked in Pocket)"
+            subtitle="Proves Z:\ browsing works without touching the phone"
+            active={snapshot.environment.phoneScreenLocked}
+            onClick={() => void toggleEnv('phoneScreenLocked')}
+            icon={<Lock className="w-4 h-4" />}
+          />
+          <EnvSwitchCard
+            title="Pluggable Online P2P Module"
+            subtitle="Simulates remote internet QUIC/WebRTC tunnel"
+            active={snapshot.environment.onlineP2pEnabled}
+            onClick={() => void toggleEnv('onlineP2pEnabled')}
+            icon={<Globe className="w-4 h-4" />}
+          />
+        </div>
+
+        {activeTransport && (
+          <div className="rounded-xl bg-slate-950/80 border border-slate-800 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span className="text-slate-300">
+              Current Winning Link:{' '}
+              <strong className="text-emerald-400">{activeTransport.name}</strong> (
+              {activeTransport.speedMBps} MB/s • {activeTransport.rttMs} ms RTT)
+            </span>
+            <span className="font-mono text-slate-400">
+              Mode: {snapshot.selectionMode.toUpperCase()} • Z:\ VFS:{' '}
+              {snapshot.sibling.zDriveMounted ? 'MOUNTED' : 'STANDBY'}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Direct Phone IP Link (Fallback when Router AP-Isolation or Online VPN/Tailscale is used) */}
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (!phoneIp.trim()) return;
+          try {
+            const next = await api.connectPhoneIp(phoneIp.trim(), siblingKey.trim());
+            onSnapshot(next);
+            notify(`Linked directly to Android Phone at ${phoneIp.trim()}:49180!`, 'success');
+          } catch (err) {
+            notify(err instanceof Error ? err.message : 'Direct IP connect failed', 'error');
+          }
+        }}
+        className="rounded-2xl border border-slate-800 bg-slate-900/90 p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+      >
+        <div className="space-y-1">
+          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <Link2 className="w-4 h-4 text-emerald-400" />
+            Direct Android Phone IP Link (Optional — Auto-Discovery Runs Automatically)
+          </h3>
+          <p className="text-xs text-slate-400">
+            If your Wi-Fi router blocks UDP broadcasts (e.g. campus/hotel Wi-Fi or Online Tailscale VPN), enter the IP
+            shown inside <strong className="text-slate-200">ChainIt Sibling</strong> on your phone.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <input
+            value={phoneIp}
+            onChange={(e) => setPhoneIp(e.target.value)}
+            placeholder="Phone IP (e.g. 192.168.43.1)"
+            className="w-48 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-400"
+          />
+          <input
+            value={siblingKey}
+            onChange={(e) => setSiblingKey(e.target.value)}
+            placeholder="Sibling Key"
+            className="w-40 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-emerald-300 focus:outline-none focus:border-emerald-400"
+          />
+          <button
+            type="submit"
+            className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition"
+          >
+            Connect Phone IP
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+const EnvSwitchCard: React.FC<{
+  title: string;
+  subtitle: string;
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+}> = ({ title, subtitle, active, onClick, icon }) => (
+  <button
+    onClick={onClick}
+    className={`text-left p-3.5 rounded-xl border transition flex items-start justify-between gap-3 ${
+      active
+        ? 'border-cyan-500/40 bg-cyan-950/20'
+        : 'border-slate-800 bg-slate-950/50 hover:border-slate-700'
+    }`}
+  >
+    <div className="flex items-start gap-2.5">
+      <div
+        className={`p-2 rounded-lg mt-0.5 ${
+          active ? 'bg-cyan-500/20 text-cyan-300' : 'bg-slate-800 text-slate-500'
+        }`}
+      >
+        {icon}
+      </div>
+      <div>
+        <div className="text-xs font-semibold text-slate-100">{title}</div>
+        <div className="text-[11px] text-slate-400 mt-0.5">{subtitle}</div>
+      </div>
+    </div>
+    <span
+      className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${
+        active ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-800 text-slate-500'
+      }`}
+    >
+      {active ? 'ON' : 'OFF'}
+    </span>
+  </button>
+);
