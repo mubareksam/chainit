@@ -155,6 +155,9 @@ In Sibling Mode on Windows, phone files are accessible **both ways simultaneousl
      `SetCurrentProcessExplicitAppUserModelID(L"ChainIt.Sibling.Hub")` - so the taskbar, Alt-Tab and the tray all
      show the chain-link mark rather than a generic globe. Since v1.5.0 the File Manager window shares that same
      identity, so every ChainIt window groups under one button (§8.1).
+   - It is created at startup but **stays hidden**: since v1.5.0 the native File Manager is the window that owns
+     the taskbar button, so showing both would just stack two ChainIt windows. The hub remains one tray
+     double-click away, and the Link tab has a *Show mini hub panel* button.
    - The same window is the app's **mini form**: link state, transport, `Z:\` status and integrity counters with
      keycap buttons for *Open File Manager*, *Open `Z:\`*, *Mount / Refresh `Z:\`*, *Create Desktop Icon*,
      *Check for Updates* and *Quit*. It is the first tray menu entry and the tray double-click action; closing it

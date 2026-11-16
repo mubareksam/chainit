@@ -6330,13 +6330,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wcsncpy_s(gNid.szTip, L"ChainIt Sibling — Auto-Connect & Z:\\ Drive", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &gNid);
 
-    // Native hub window first: it owns ChainIt's taskbar button and shows the
-    // chain-link icon while the app is running.
+    // The mini hub is created up front (it registers its class and pins the
+    // process AppUserModelID) but stays hidden: the native File Manager is now
+    // the window that owns ChainIt's taskbar button, so showing both at startup
+    // would just stack two ChainIt windows on top of each other. The hub remains
+    // one tray double-click away, and the Link tab has a button for it too.
     HWND hub = createHubWindow(hInstance, gNid.hIcon);
-    if (hub) {
-        ShowWindow(hub, SW_SHOWNORMAL);
-        UpdateWindow(hub);
-    }
+    (void)hub;
 
     // The HTTP server keeps running for Z:\, the phone and the WebSocket clients,
     // but the File Manager the user sees is this process's own native window.
