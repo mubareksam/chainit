@@ -126,3 +126,23 @@ In Sibling Mode on Windows, phone files are accessible **both ways simultaneousl
 2. **Dedicated ChainIt File Manager App**:
    - Dual-pane (`C:\` PC $\leftrightarrow$ `Z:\` Phone) and Single-Pane Explorer views.
    - Native keyboard shortcuts (`Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `F2`, `Del`, `Ctrl+A`), drag-and-drop across drives or directly from Windows Desktop, inline file preview/editing, and live chunked transfer speed telemetry.
+
+## 5. Building the Shipped Binaries From Source
+
+Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no Visual Studio):
+
+1. **Android** — `./android/build-apk.sh`
+   `aapt2` (resources) → generated `R.kt` → `kotlinc -Xlambdas=class -Xsam-conversions=class` (Kotlin 2.x
+   must not emit `invokedynamic`: `dx` cannot lower it for API 26) → `android/tools/verify_dex_safety.py`
+   (stage 1: 68 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
+   stage 3: no source calls an indy-emulated stdlib method; stage 4: no runtime color parsing) →
+   `dx --dex` → zipalign-style packer → `apksigner` (v2+v3) with `android/keystore/chainit-release.p12`.
+2. **Windows** — `./windows/build.sh`
+   `npm run build` (vite) → `scripts/gen_embedded_assets.py` (embeds `app/dist` as a C header) →
+   `zig c++ -target x86_64-windows-gnu` over `windows/src/chainit_win_main.cpp` **and**
+   `windows/res/chainit.rc`, which embeds `windows/res/chainit.ico` (generated from the Android launcher
+   vector by `windows/res/make_icon.py`) as icon resource #1 — used by the exe file icon, the window class,
+   the tray icon and desktop shortcuts.
+3. **Release manifest** — `python3 scripts/publish_release_manifest.py` rewrites
+   `releases/version.txt` (version + SHA-256 of both binaries). The Windows in-place updater and the
+   Android `UpdateManager` both trust this file to decide "up to date" vs "replace in place".

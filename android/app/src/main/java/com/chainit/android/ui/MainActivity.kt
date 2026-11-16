@@ -394,11 +394,11 @@ class MainActivity : Activity() {
     }
 
     private fun buildCrashCard(): LinearLayout {
-        val card = Ds.card(this, 18f, Color.parseColor("#1A0F14"), Color.parseColor("#4C1D2A"))
+        val card = Ds.card(this, 18f, 0xFF1A0F14.toInt(), 0xFF4C1D2A.toInt())
         card.visibility = View.GONE
 
-        card.addView(Ds.text(this, "Recovered from a crash", 13.5f, Color.parseColor("#FDA4AF"), bold = true))
-        crashText = Ds.text(this, "", 10.5f, Color.parseColor("#FECDD3"), mono = true)
+        card.addView(Ds.text(this, "Recovered from a crash", 13.5f, 0xFFFDA4AF.toInt(), bold = true))
+        crashText = Ds.text(this, "", 10.5f, 0xFFFECDD3.toInt(), mono = true)
         crashText.setPadding(0, Ds.dp(this, 8f), 0, Ds.dp(this, 10f))
         crashText.setTextIsSelectable(true)
         card.addView(crashText)
@@ -437,7 +437,7 @@ class MainActivity : Activity() {
                 this,
                 "VFS :49180   Discovery :49179   Phone UUID c4a1b170-0001-…34fb   PC UUID c4a1b170-0002-…34fb",
                 9.5f,
-                Color.parseColor("#475569"),
+                0xFF475569.toInt(),
                 mono = true
             ).apply {
                 gravity = Gravity.CENTER
@@ -459,8 +459,8 @@ class MainActivity : Activity() {
             layoutParams = Ds.lp(this@MainActivity, topDp = 8f)
             setLineSpacing(0f, 1.3f)
         })
-        val box = Ds.text(this, error, 11f, Color.parseColor("#FDA4AF"), mono = true).apply {
-            background = Ds.surface(this@MainActivity, Ds.surfaceSunken, Color.parseColor("#4C1D2A"), 14f)
+        val box = Ds.text(this, error, 11f, 0xFFFDA4AF.toInt(), mono = true).apply {
+            background = Ds.surface(this@MainActivity, Ds.surfaceSunken, 0xFF4C1D2A.toInt(), 14f)
             setPadding(Ds.dp(this@MainActivity, 12f), Ds.dp(this@MainActivity, 12f), Ds.dp(this@MainActivity, 12f), Ds.dp(this@MainActivity, 12f))
             setTextIsSelectable(true)
             layoutParams = Ds.lp(this@MainActivity, topDp = 12f)
@@ -641,7 +641,7 @@ class MainActivity : Activity() {
                 updateButton.text = "Check for update"
                 updateButton.alpha = 1f
                 updateStatus.text = "Update failed: ${state.message}"
-                updateStatus.setTextColor(Color.parseColor("#FDA4AF"))
+                updateStatus.setTextColor(0xFFFDA4AF.toInt())
             }
             UpdateManager.State.Idle -> {}
         }

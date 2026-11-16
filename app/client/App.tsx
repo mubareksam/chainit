@@ -10,6 +10,7 @@ import {
   HardDrive,
   Link2,
   Lock,
+  MonitorDown,
   PanelLeft,
   Radio,
   RefreshCw,
@@ -23,6 +24,7 @@ import {
 import { DriveTarget, SystemSnapshot, VfsItem } from '../shared/types';
 import { api } from './api/client';
 import { LogoBadge } from './components/Brand';
+import { SortState, loadSortPref, saveSortPref } from './utils/sort';
 import { ConnectivityView } from './components/ConnectivityView';
 import { DownloadsModal } from './components/DownloadsModal';
 import { ClipboardState, DrivePane } from './components/DrivePane';
@@ -65,6 +67,11 @@ export const App: React.FC = () => {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [showTelemetry, setShowTelemetry] = useState(true);
   const [showDownloads, setShowDownloads] = useState(false);
+  const [sort, setSort] = useState<SortState>(() => loadSortPref());
+  const handleSortChange = useCallback((next: SortState) => {
+    setSort(next);
+    saveSortPref(next);
+  }, []);
   const [engineVersion, setEngineVersion] = useState<string>(APP_VERSION);
   const [engineRuntime, setEngineRuntime] = useState<string>('');
   const [updating, setUpdating] = useState(false);
@@ -103,6 +110,20 @@ export const App: React.FC = () => {
       notify(err instanceof Error ? err.message : 'Update check failed', 'error');
     } finally {
       setUpdating(false);
+    }
+  }, [notify]);
+
+  const [shortcutBusy, setShortcutBusy] = useState(false);
+  /** Asks ChainIt-Windows.exe to drop a chain-link .lnk on the user's Desktop. */
+  const runDesktopShortcut = useCallback(async () => {
+    setShortcutBusy(true);
+    try {
+      const res = await api.createDesktopShortcut();
+      notify(res.message, res.ok ? 'success' : 'info');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : 'Could not create the desktop icon', 'error');
+    } finally {
+      setShortcutBusy(false);
     }
   }, [notify]);
 
@@ -384,6 +405,18 @@ export const App: React.FC = () => {
               <span className="hidden sm:inline">Phone View</span>
             </button>
 
+            {/* Create a desktop icon on this PC */}
+            <button
+              type="button"
+              onClick={() => void runDesktopShortcut()}
+              disabled={shortcutBusy}
+              className="ci-btn-ghost"
+              title="Create a ChainIt desktop icon on this PC"
+            >
+              <MonitorDown className={`w-3.5 h-3.5 text-[var(--ci-accent)] ${shortcutBusy ? 'animate-pulse' : ''}`} />
+              <span className="hidden lg:inline">{shortcutBusy ? 'Working…' : 'Desktop icon'}</span>
+            </button>
+
             {/* Replace the installed build with the newest one */}
             <button
               type="button"
@@ -531,6 +564,8 @@ export const App: React.FC = () => {
                 onOpenFile={(target, item) => setPreviewFile({ target, item })}
                 onQuickEnableSibling={() => void handleQuickEnableSibling()}
                 notify={notify}
+                sort={sort}
+                onSortChange={handleSortChange}
               />
 
               <DrivePane
@@ -551,6 +586,8 @@ export const App: React.FC = () => {
                 onOpenFile={(target, item) => setPreviewFile({ target, item })}
                 onQuickEnableSibling={() => void handleQuickEnableSibling()}
                 notify={notify}
+                sort={sort}
+                onSortChange={handleSortChange}
               />
             </div>
           ) : (
@@ -655,6 +692,8 @@ export const App: React.FC = () => {
                   onOpenFile={(target, item) => setPreviewFile({ target, item })}
                   onQuickEnableSibling={() => void handleQuickEnableSibling()}
                   notify={notify}
+                  sort={sort}
+                  onSortChange={handleSortChange}
                 />
               </div>
             </div>

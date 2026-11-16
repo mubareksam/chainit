@@ -30,14 +30,29 @@ Both standalone, zero-dependency binaries are compiled and ready to use right no
    Those calls were replaced by `com.chainit.android.vfs.FileOps`. `ChainItApp` also installs an
    uncaught-exception handler that writes `chainit-crash.log` and shows it on the next launch instead of
    failing silently.
+   A *second* startup crash (`IllegalArgumentException: Unknown color`) came from a pill building its
+   background with `Color.parseColor(alphaHex + fgHex)` at runtime. Every color in the app is now a
+   compile-time literal (`0xFFRRGGBB.toInt()`) or `Ds.withAlpha()`, and `verify_dex_safety.py` stage 4
+   fails the build if any runtime color parsing ever returns.
 2. **One identity for both apps.** The emerald + cyan chain-link launcher icon is unchanged on Android and is
    now the brand mark everywhere else too: browser favicon, desktop UI header, and
    `app/client/components/Brand.tsx`.
-3. **Redesigned interfaces.** The Windows/browser UI now runs on a token-based `.ci-*` design system
-   (`app/client/index.css`: cards, navigation pills, buttons, inputs, file rows, breadcrumbs, toasts, modals),
-   and the Android app on `ui/DesignSystem.kt` + a rewritten `MainActivity` — one clean, organized visual
-   language on both sides.
-4. **Real in-place updates, never a second copy.**
+3. **Redesigned, icon-led interfaces.** The Windows/browser UI runs on a token-based `.ci-*` design system
+   (`app/client/index.css`: cards, navigation pills, buttons, inputs, file rows, breadcrumbs, toasts, modals,
+   tool groups, sort menus), and the Android app on `ui/DesignSystem.kt` + a rewritten `MainActivity` — one
+   clean, organized visual language on both sides. Toolbars are icon-first with tooltips, so long labels
+   disappear where an icon says it better.
+4. **Explorer-grade sorting.** Both drive panes sort by *Name, Size, Date modified or Type*, ascending or
+   descending, with a *folders-first* toggle; the list column headers are clickable sort toggles and the
+   choice is remembered in `localStorage`.
+5. **One icon everywhere.** `windows/res/chainit.ico` is generated from the exact Android launcher vector by
+   `windows/res/make_icon.py` and compiled into the exe (`windows/res/chainit.rc`), so the file icon, the
+   running window, the tray icon and desktop shortcuts all show the chain-link mark. The same artwork is the
+   browser favicon and the desktop header logo.
+6. **Desktop icon creation.** Tray → *Create desktop icon*, or the header *Desktop icon* button, asks the
+   engine for `POST /api/app/desktop-shortcut`, which writes a real `ChainIt.lnk` on the Desktop via
+   `IShellLinkW` (icon = the embedded chain-link mark) and notifies Explorer to refresh.
+7. **Real in-place updates, never a second copy.**
    - *Windows:* tray menu -> **Update ChainIt in place...**, or the header **Update** button, calls
      `POST /api/app/update`. The engine reads `releases/version.txt`, compares the published SHA-256 with the
      hash of the `.exe` currently running, downloads and hash-verifies the new binary into

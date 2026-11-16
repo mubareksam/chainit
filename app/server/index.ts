@@ -121,6 +121,16 @@ app.get('/api/app/version', (_req, res) => {
 
 // The Node server is only the live preview of the same UI the Windows binary embeds; the real
 // in-place self-replacement is implemented by ChainIt-Windows.exe (POST /api/app/update there).
+app.post('/api/app/desktop-shortcut', (_req, res) => {
+  res.json({
+    ok: false,
+    path: '',
+    message:
+      'Desktop shortcuts are created by ChainIt-Windows.exe (tray: "Create desktop icon"). ' +
+      'This browser preview cannot write to your Windows Desktop.',
+  });
+});
+
 app.post('/api/app/update', (_req, res) => {
   res.json({
     status: 'unsupported',

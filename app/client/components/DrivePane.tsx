@@ -1,8 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowDown as ArrowDownIcon,
   ArrowLeft,
+  ArrowLeftRight,
   ArrowRight,
   ArrowUp,
+  ArrowUp as ArrowUpIcon,
   Check,
   Clipboard,
   Copy,
@@ -29,6 +32,8 @@ import {
 import { DriveStats, DriveTarget, SystemSnapshot, VfsItem } from '../../shared/types';
 import { api } from '../api/client';
 import { formatBytes, isImageMime, toWindowsDisplayPath } from '../utils/format';
+import { SortState, sortItems } from '../utils/sort';
+import { SortMenu } from './SortMenu';
 
 export interface ClipboardState {
   op: 'copy' | 'move';
@@ -61,6 +66,8 @@ interface Props {
   onOpenFile: (target: DriveTarget, item: VfsItem) => void;
   onQuickEnableSibling: () => void;
   notify: (msg: string, kind?: 'success' | 'error' | 'info') => void;
+  sort: SortState;
+  onSortChange: (next: SortState) => void;
 }
 
 const PHONE_SHORTCUTS = [
@@ -100,6 +107,8 @@ export const DrivePane: React.FC<Props> = ({
   onOpenFile,
   onQuickEnableSibling,
   notify,
+  sort,
+  onSortChange,
 }) => {
   const [items, setItems] = useState<VfsItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -334,6 +343,14 @@ export const DrivePane: React.FC<Props> = ({
     search.trim() ? i.name.toLowerCase().includes(search.trim().toLowerCase()) : true
   );
 
+  /** Explorer-grade ordering (name / size / date / type, direction, folders first). */
+  const shownItems = useMemo(() => sortItems(filteredItems, sort), [filteredItems, sort]);
+
+  const toggleSortKey = (key: SortState['key']) =>
+    onSortChange(
+      sort.key === key ? { ...sort, desc: !sort.desc } : { ...sort, key, desc: false }
+    );
+
   const segments = currentDir.split('/').filter(Boolean);
   const shortcuts = target === 'phone' ? PHONE_SHORTCUTS : PC_SHORTCUTS;
   const isPhone = target === 'phone';
@@ -517,132 +534,192 @@ export const DrivePane: React.FC<Props> = ({
         })}
       </div>
 
-      {/* Action Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-1.5 px-3 py-2 border-b border-[var(--ci-border-soft)] bg-[rgba(10,15,25,0.6)] text-xs">
-        <div className="flex flex-wrap items-center gap-1">
-          <button
-            onClick={() => {
-              setCreatingFolder(true);
-              setNewFolderName('');
-            }}
-            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
-          >
-            <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
-            <span>New Folder</span>
-          </button>
+      {/* Action Toolbar — icon-first with tooltips */}
+      <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 border-b border-[var(--ci-border-soft)] bg-[rgba(10,15,25,0.6)]">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="ci-tool-group">
+            <button
+              type="button"
+              className="ci-btn-icon"
+              title="New folder (Ctrl+Shift+N)"
+              onClick={() => {
+                setCreatingFolder(true);
+                setNewFolderName('');
+              }}
+            >
+              <FolderPlus className="w-4 h-4 text-[var(--ci-amber)]" />
+            </button>
 
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              void handleExternalFilesUpload(e.target.files, currentDir);
-              e.target.value = '';
-            }}
-          />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
-            title="Drop or pick files from your computer"
-          >
-            <Upload className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Drop/Upload</span>
-          </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                void handleExternalFilesUpload(e.target.files, currentDir);
+                e.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              className="ci-btn-icon"
+              title="Upload files from this computer (or drop them on a folder)"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload className="w-4 h-4 text-[var(--ci-info)]" />
+            </button>
 
-          <button
-            disabled={selectedPaths.length === 0}
-            onClick={() => {
-              const names = items.filter((i) => selectedPaths.includes(i.path)).map((i) => i.name);
-              onSetClipboard({ op: 'copy', fromTarget: target, paths: selectedPaths, names });
-              notify(`Copied ${selectedPaths.length} item(s)`, 'info');
-            }}
-            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
-            title="Copy (Ctrl+C)"
-          >
-            <Copy className="w-3.5 h-3.5" />
-            <span>Copy</span>
-          </button>
+            <span className="ci-vdiv" />
 
-          <button
-            disabled={selectedPaths.length === 0}
-            onClick={() => {
-              const names = items.filter((i) => selectedPaths.includes(i.path)).map((i) => i.name);
-              onSetClipboard({ op: 'move', fromTarget: target, paths: selectedPaths, names });
-              notify(`Cut ${selectedPaths.length} item(s)`, 'info');
-            }}
-            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
-            title="Cut / Move (Ctrl+X)"
-          >
-            <Scissors className="w-3.5 h-3.5" />
-            <span>Cut</span>
-          </button>
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={selectedPaths.length === 0}
+              title="Copy (Ctrl+C)"
+              onClick={() => {
+                const names = items.filter((i) => selectedPaths.includes(i.path)).map((i) => i.name);
+                onSetClipboard({ op: 'copy', fromTarget: target, paths: selectedPaths, names });
+                notify(`Copied ${selectedPaths.length} item(s)`, 'info');
+              }}
+              style={selectedPaths.length === 0 ? { opacity: 0.35 } : undefined}
+            >
+              <Copy className="w-4 h-4" />
+            </button>
 
-          <button
-            disabled={!clipboard}
-            onClick={() => void onPasteInto(target, currentDir)}
-            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-medium transition ${
-              clipboard
-                ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40'
-                : 'bg-slate-800 opacity-35 text-slate-400'
-            }`}
-            title="Paste Here (Ctrl+V)"
-          >
-            <Clipboard className="w-3.5 h-3.5" />
-            <span>Paste{clipboard ? ` (${clipboard.paths.length})` : ''}</span>
-          </button>
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={selectedPaths.length === 0}
+              title="Cut / move (Ctrl+X)"
+              onClick={() => {
+                const names = items.filter((i) => selectedPaths.includes(i.path)).map((i) => i.name);
+                onSetClipboard({ op: 'move', fromTarget: target, paths: selectedPaths, names });
+                notify(`Cut ${selectedPaths.length} item(s)`, 'info');
+              }}
+              style={selectedPaths.length === 0 ? { opacity: 0.35 } : undefined}
+            >
+              <Scissors className="w-4 h-4" />
+            </button>
+
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={!clipboard}
+              title={`Paste here (Ctrl+V)${clipboard ? ` — ${clipboard.paths.length} item(s)` : ''}`}
+              onClick={() => void onPasteInto(target, currentDir)}
+              data-active={Boolean(clipboard)}
+              style={!clipboard ? { opacity: 0.35 } : undefined}
+            >
+              <Clipboard className={`w-4 h-4 ${clipboard ? 'text-[var(--ci-accent)]' : ''}`} />
+            </button>
+
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={selectedPaths.length !== 1}
+              title="Rename (F2)"
+              onClick={() => {
+                const picked = items.find((i) => i.path === selectedPaths[0]);
+                if (picked) {
+                  setRenamingPath(picked.path);
+                  setRenameValue(picked.name);
+                }
+              }}
+              style={selectedPaths.length !== 1 ? { opacity: 0.35 } : undefined}
+            >
+              <Edit3 className="w-4 h-4" />
+            </button>
+
+            <button
+              type="button"
+              className="ci-btn-icon hover:!text-[var(--ci-danger)]"
+              disabled={selectedPaths.length === 0}
+              title="Delete selected (Del)"
+              onClick={() => void handleDelete(selectedPaths)}
+              style={selectedPaths.length === 0 ? { opacity: 0.35 } : undefined}
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="ci-tool-group">
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={selectedPaths.length === 0}
+              title={`Copy selected to ${otherLabel}${otherCurrentDir.replace(/\//g, '\\')}`}
+              onClick={() =>
+                void onDirectTransfer({
+                  op: 'copy',
+                  fromTarget: target,
+                  fromPaths: selectedPaths,
+                  toTarget: otherTarget,
+                  toDir: otherCurrentDir,
+                })
+              }
+              style={selectedPaths.length === 0 ? { opacity: 0.35 } : undefined}
+            >
+              <ArrowLeftRight className={`w-4 h-4 ${isPhone ? 'text-[var(--ci-info)]' : 'text-[var(--ci-accent)]'}`} />
+            </button>
+            <button
+              type="button"
+              className="ci-btn-icon"
+              disabled={selectedPaths.length === 0}
+              title={`Move selected to ${otherLabel}`}
+              onClick={() =>
+                void onDirectTransfer({
+                  op: 'move',
+                  fromTarget: target,
+                  fromPaths: selectedPaths,
+                  toTarget: otherTarget,
+                  toDir: otherCurrentDir,
+                })
+              }
+              style={selectedPaths.length === 0 ? { opacity: 0.35 } : undefined}
+            >
+              <MoveRight className="w-4 h-4" />
+            </button>
+          </div>
+
+          {selectedPaths.length > 0 && (
+            <span className="ci-chip" data-on>
+              <Check className="w-3 h-3" />
+              {selectedPaths.length} selected
+            </span>
+          )}
         </div>
 
-        {/* Instant Cross-Drive Actions */}
-        <div className="flex items-center gap-1">
-          <button
-            disabled={selectedPaths.length === 0}
-            onClick={() =>
-              void onDirectTransfer({
-                op: 'copy',
-                fromTarget: target,
-                fromPaths: selectedPaths,
-                toTarget: otherTarget,
-                toDir: otherCurrentDir,
-              })
-            }
-            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-semibold disabled:opacity-35 transition ${
-              isPhone
-                ? 'bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 border border-cyan-500/30'
-                : 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-200 border border-emerald-500/30'
-            }`}
-            title={`Instantly copy selected items to ${otherLabel}${otherCurrentDir.replace(/\//g, '\\')}`}
-          >
-            {isPhone ? <ArrowLeft className="w-3.5 h-3.5" /> : null}
-            <span>Copy to {otherLabel}</span>
-            {!isPhone ? <ArrowRight className="w-3.5 h-3.5" /> : null}
-          </button>
+        <div className="flex items-center gap-2">
+          <SortMenu value={sort} onChange={onSortChange} />
+
+          <div className="ci-tool-group">
+            <button
+              type="button"
+              className="ci-btn-icon"
+              data-active={viewMode === 'list'}
+              title="List view"
+              onClick={() => setViewMode('list')}
+            >
+              <ListIcon className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              className="ci-btn-icon"
+              data-active={viewMode === 'grid'}
+              title="Grid view"
+              onClick={() => setViewMode('grid')}
+            >
+              <LayoutGrid className="w-4 h-4" />
+            </button>
+          </div>
 
           <button
-            disabled={selectedPaths.length === 0}
-            onClick={() =>
-              void onDirectTransfer({
-                op: 'move',
-                fromTarget: target,
-                fromPaths: selectedPaths,
-                toTarget: otherTarget,
-                toDir: otherCurrentDir,
-              })
-            }
-            className="ci-btn-quiet min-h-[30px] px-2.5 py-1 text-[11.5px]"
-            title={`Move selected items to ${otherLabel}`}
+            type="button"
+            className="ci-btn-icon"
+            title="Refresh this folder (F5)"
+            onClick={() => void loadDirectory()}
           >
-            <MoveRight className="w-3.5 h-3.5" />
-            <span>Move</span>
-          </button>
-
-          <button
-            disabled={selectedPaths.length === 0}
-            onClick={() => void handleDelete(selectedPaths)}
-            className="p-1 rounded-md bg-slate-800 hover:bg-rose-500/20 hover:text-rose-300 disabled:opacity-35 text-slate-300 transition"
-            title="Delete selected (Del)"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
@@ -699,7 +776,7 @@ export const DrivePane: React.FC<Props> = ({
               Enable Sibling Mode & Restore Zero-Touch Z:\
             </button>
           </div>
-        ) : filteredItems.length === 0 ? (
+        ) : shownItems.length === 0 ? (
           <div className="h-64 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <span className="ci-logo-mark w-14 h-14 opacity-70">
               <Folder className="w-6 h-6 text-[var(--ci-text-3)]" />
@@ -712,11 +789,26 @@ export const DrivePane: React.FC<Props> = ({
         ) : viewMode === 'list' ? (
           <div className="space-y-0.5">
             <div className="ci-section-label grid grid-cols-12 px-2.5 py-1.5 border-b border-[var(--ci-border-soft)]">
-              <div className="col-span-7">Name</div>
-              <div className="col-span-2 text-right">Size</div>
-              <div className="col-span-3 text-right">Type</div>
+              <div className="col-span-7">
+                <button type="button" className="ci-th" data-active={sort.key === 'name'} onClick={() => toggleSortKey('name')} title="Sort by name">
+                  <span>Name</span>
+                  {sort.key === 'name' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
+                </button>
+              </div>
+              <div className="col-span-2 flex justify-end">
+                <button type="button" className="ci-th" data-active={sort.key === 'size'} onClick={() => toggleSortKey('size')} title="Sort by size">
+                  <span>Size</span>
+                  {sort.key === 'size' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
+                </button>
+              </div>
+              <div className="col-span-3 flex justify-end pr-1">
+                <button type="button" className="ci-th" data-active={sort.key === 'type'} onClick={() => toggleSortKey('type')} title="Sort by type">
+                  <span>Type</span>
+                  {sort.key === 'type' && (sort.desc ? <ArrowDownIcon className="w-3 h-3" /> : <ArrowUpIcon className="w-3 h-3" />)}
+                </button>
+              </div>
             </div>
-            {filteredItems.map((item) => {
+            {shownItems.map((item) => {
               const selected = selectedPaths.includes(item.path);
               const isDropFolder = dragOverFolderPath === item.path;
               const isCut =
@@ -795,7 +887,7 @@ export const DrivePane: React.FC<Props> = ({
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-1">
-            {filteredItems.map((item) => {
+            {shownItems.map((item) => {
               const selected = selectedPaths.includes(item.path);
               const isImg = item.kind === 'file' && isImageMime(item.mimeType, item.ext);
               return (

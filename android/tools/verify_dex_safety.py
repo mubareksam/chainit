@@ -28,6 +28,7 @@ Usage:
 """
 
 import os
+import re
 import struct
 import sys
 
@@ -261,6 +262,37 @@ def main():
             print("          Prefer com.chainit.android.vfs.FileOps equivalents where possible.")
         else:
             print("    OK  first-party sources avoid every invokedynamic-emulated stdlib method")
+
+        # 4. UI safety lint. A shipped build once died at startup with
+        #    IllegalArgumentException: Unknown color, because a pill built its background from
+        #    Color.parseColor(alphaHex + fgHex) - runtime string parsing of a color. Colors must be
+        #    compile-time literals (0xFFRRGGBB.toInt()) or Ds.withAlpha(), never parsed strings.
+        color_re = re.compile(r"Color\.parseColor\s*\(")
+        literal_re = re.compile(r"0x([0-9A-Fa-f]+)\.toInt\(\)")
+        bad = []
+        for root, _, files in os.walk(sys.argv[4]):
+            for f in files:
+                if not f.endswith(".kt"):
+                    continue
+                path = os.path.join(root, f)
+                text = open(path, encoding="utf-8", errors="replace").read()
+                for lineno, line in enumerate(text.splitlines(), 1):
+                    stripped = line.strip()
+                    if stripped.startswith("*") or stripped.startswith("//"):
+                        continue
+                    if color_re.search(line):
+                        bad.append("%s:%d  Color.parseColor()  |  %s" % (path, lineno, stripped[:90]))
+                    for m in literal_re.finditer(line):
+                        if len(m.group(1)) not in (6, 8):
+                            bad.append("%s:%d  malformed color literal 0x%s  |  %s"
+                                       % (path, lineno, m.group(1), stripped[:80]))
+        if bad:
+            print("    FAIL  %d unsafe runtime color expression(s):" % len(bad))
+            for b in bad:
+                print("          " + b)
+            print("          Use 0xFFRRGGBB.toInt() literals or Ds.withAlpha(color, alpha).")
+            return 2
+        print("    OK  every color is a compile-time literal (no runtime color parsing)")
     return 0
 
 

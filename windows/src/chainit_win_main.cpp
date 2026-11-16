@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <ws2bth.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
 #include <wincrypt.h>
 #include <wininet.h>
 #include <urlmon.h>
@@ -44,6 +46,7 @@ static const int PHONE_VFS_PORT = 49180;
 #define ID_TRAY_REMOUNT_Z 4003
 #define ID_TRAY_EXIT 4004
 #define ID_TRAY_UPDATE 4005
+#define ID_TRAY_SHORTCUT 4006
 
 // --- Native Bluetooth RFCOMM (ws2bth.h / AF_BTH) ---
 // These service UUIDs MUST match android/.../net/BluetoothRfcommTransport.kt so the phone
@@ -1464,6 +1467,85 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
 // --- HTTP Response Helpers ---
 
 // ---------------------------------------------------------------------------
+// Desktop shortcut ("create desktop icon")
+//
+// Writes a real Windows .lnk on the user's Desktop that points at the running
+// ChainIt-Windows.exe and uses the chain-link icon embedded in this binary as its
+// icon, so the desktop icon matches the Android launcher icon exactly.
+// ---------------------------------------------------------------------------
+static std::wstring currentExePath();
+
+static const GUID kClsidShellLink = {0x00021401, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kIidIShellLinkW = {0x000214F9, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static const GUID kIidIPersistFile = {0x0000010B, 0x0000, 0x0000, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+struct ShortcutResult {
+    bool ok = false;
+    std::wstring path;
+    std::string message;
+};
+
+static ShortcutResult createDesktopShortcut() {
+    ShortcutResult result;
+    const std::wstring exe = currentExePath();
+    if (exe.empty()) {
+        result.message = "Could not resolve the running ChainIt-Windows.exe path.";
+        return result;
+    }
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool comOwned = SUCCEEDED(hr);
+
+    PWSTR desktopRaw = nullptr;
+    hr = SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktopRaw);
+    if (FAILED(hr) || !desktopRaw) {
+        if (comOwned) CoUninitialize();
+        result.message = "Windows did not report a Desktop folder for this account.";
+        return result;
+    }
+    std::wstring desktop(desktopRaw);
+    CoTaskMemFree(desktopRaw);
+
+    IShellLinkW* link = nullptr;
+    hr = CoCreateInstance(kClsidShellLink, nullptr, CLSCTX_INPROC_SERVER, kIidIShellLinkW,
+                          reinterpret_cast<void**>(&link));
+    if (FAILED(hr) || !link) {
+        if (comOwned) CoUninitialize();
+        result.message = "Windows refused to create a shortcut object.";
+        return result;
+    }
+
+    const std::wstring workDir = fs::path(exe).parent_path().wstring();
+    link->SetPath(exe.c_str());
+    link->SetWorkingDirectory(workDir.c_str());
+    link->SetIconLocation(exe.c_str(), 0); // the chain-link icon embedded in this exe
+    link->SetDescription(L"ChainIt - Android/Windows Sibling link, Z:\\ drive and File Manager");
+    link->SetShowCmd(SW_SHOWNORMAL);
+
+    IPersistFile* persist = nullptr;
+    hr = link->QueryInterface(kIidIPersistFile, reinterpret_cast<void**>(&persist));
+    if (SUCCEEDED(hr) && persist) {
+        const std::wstring lnk = desktop + L"\\ChainIt.lnk";
+        hr = persist->Save(lnk.c_str(), TRUE);
+        persist->Release();
+        if (SUCCEEDED(hr)) {
+            result.ok = true;
+            result.path = lnk;
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lnk.c_str(), nullptr);
+        }
+    }
+    link->Release();
+    if (comOwned) CoUninitialize();
+
+    if (result.ok) {
+        result.message = "Desktop icon created: ChainIt.lnk (it uses the same chain-link icon as the phone app).";
+    } else {
+        result.message = "Windows could not save ChainIt.lnk on the Desktop.";
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // In-place application update (a real replacement — never a second install)
 //
 // The published binary lives next to this source in releases/. The updater
@@ -2039,6 +2121,26 @@ static void handleHttpClient(SOCKET client) {
         sendJsonStr(client, 200, ss.str());
         return;
     }
+    if (urlPath == "/api/app/desktop-shortcut" && method == "POST") {
+        ShortcutResult sc = createDesktopShortcut();
+        const char kQuote = 0x22;   // "
+        const char kBack = 0x5C;    // backslash
+        auto esc = [kQuote, kBack](const std::string& in) {
+            std::string out;
+            for (char c : in) {
+                if (c == kQuote || c == kBack) out.push_back(kBack);
+                out.push_back(c);
+            }
+            return out;
+        };
+        std::string pathAnsi = ansiFromWide(sc.path);
+        std::ostringstream ss;
+        ss << "{\"ok\":" << (sc.ok ? "true" : "false")
+           << ",\"path\":\"" << esc(pathAnsi) << "\""
+           << ",\"message\":\"" << esc(sc.message) << "\"}";
+        sendJsonStr(client, 200, ss.str());
+        return;
+    }
     if (urlPath == "/api/app/update" && method == "POST") {
         AppUpdateResult result = performAppUpdate();
         sendJsonStr(client, 200, appUpdateJson(result));
@@ -2429,6 +2531,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_UI, L"Open ChainIt File Manager");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN_Z, L"Open Z:\\ Phone Drive in Explorer");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_REMOUNT_Z, L"Mount / Refresh Z:\\ Drive");
+            AppendMenuW(hMenu, MF_STRING, ID_TRAY_SHORTCUT, L"Create desktop icon");
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_UPDATE, L"Update ChainIt in place…");
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Unmount Z:\\ && Exit ChainIt");
@@ -2449,6 +2552,14 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             case ID_TRAY_REMOUNT_Z:
                 mountZDriveAsync();
                 break;
+            case ID_TRAY_SHORTCUT: {
+                std::thread([]() {
+                    ShortcutResult sc = createDesktopShortcut();
+                    MessageBoxW(nullptr, wideFromAnsi(sc.message).c_str(), L"ChainIt",
+                                MB_OK | (sc.ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+                }).detach();
+                break;
+            }
             case ID_TRAY_UPDATE: {
                 std::thread([]() {
                     AppUpdateResult r = performAppUpdate();
@@ -2530,10 +2641,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     mountZDriveAsync();
 
     // Create Win32 System Tray Icon
+    // The chain-link mark compiled into this exe as resource #1 (windows/res/chainit.rc) -
+    // the same artwork as the Android launcher icon, so both apps share one identity.
+    const HICON hAppIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
+
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = TrayWndProc;
     wc.hInstance = hInstance;
+    wc.hIcon = hAppIcon;
+    wc.hIconSm = hAppIcon;
+    wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
     wc.lpszClassName = L"ChainItTrayHiddenWindowClass";
     RegisterClassExW(&wc);
 
@@ -2544,7 +2662,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     gNid.uID = 1;
     gNid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     gNid.uCallbackMessage = WM_TRAYICON;
-    gNid.hIcon = LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(IDI_INFORMATION));
+    gNid.hIcon = hAppIcon ? hAppIcon : LoadIconW(nullptr, reinterpret_cast<LPCWSTR>(IDI_APPLICATION));
     wcsncpy_s(gNid.szTip, L"ChainIt Sibling — Auto-Connect & Z:\\ Drive", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &gNid);
 

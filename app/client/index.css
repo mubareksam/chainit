@@ -19,6 +19,7 @@
   --ci-text: #f1f5f9;
   --ci-text-2: #9aa7ba;
   --ci-text-3: #64748b;
+  --ci-text-4: #526079;
 
   --ci-accent: #10b981;
   --ci-accent-soft: #6ee7b7;
@@ -412,6 +413,93 @@
     @apply ci-card w-full overflow-hidden;
     box-shadow: var(--ci-shadow-lg);
     max-height: 90vh;
+  }
+
+  /* ---------- Toolbars, menus & sorting ---------- */
+  .ci-vdiv {
+    @apply self-stretch w-px mx-1 shrink-0;
+    background-color: var(--ci-border-soft);
+  }
+
+  .ci-tool-group {
+    @apply flex items-center gap-0.5 p-0.5 rounded-xl;
+    background-color: rgba(7, 11, 18, 0.55);
+    border: 1px solid var(--ci-border-soft);
+  }
+
+  .ci-menu-wrap {
+    @apply relative;
+  }
+
+  .ci-menu {
+    @apply absolute z-40 min-w-[190px] p-1.5 rounded-xl;
+    top: calc(100% + 6px);
+    right: 0;
+    background-color: var(--ci-surface-2);
+    border: 1px solid var(--ci-border-strong);
+    box-shadow: var(--ci-shadow-lg);
+    animation: ci-menu-in 120ms ease-out;
+  }
+
+  @keyframes ci-menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .ci-menu-item {
+    @apply w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-xs;
+    color: var(--ci-text-2);
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  .ci-menu-item:hover {
+    background-color: var(--ci-surface-3);
+    color: var(--ci-text);
+  }
+
+  .ci-menu-item[data-active='true'] {
+    background-color: rgba(16, 185, 129, 0.12);
+    color: var(--ci-accent-soft);
+  }
+
+  .ci-menu-label {
+    @apply px-2.5 pt-2 pb-1 text-[10px] font-bold uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ci-text-4);
+  }
+
+  .ci-th {
+    @apply flex items-center gap-1 cursor-pointer select-none;
+    color: var(--ci-text-4);
+    transition: color 120ms ease;
+  }
+
+  .ci-th:hover {
+    color: var(--ci-text-2);
+  }
+
+  .ci-th[data-active='true'] {
+    color: var(--ci-accent-soft);
+  }
+
+  .ci-chip {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium;
+    background-color: var(--ci-surface-3);
+    border: 1px solid var(--ci-border-soft);
+    color: var(--ci-text-2);
+  }
+
+  .ci-chip[data-on='true'] {
+    background-color: rgba(34, 211, 238, 0.14);
+    border-color: rgba(34, 211, 238, 0.4);
+    color: var(--ci-info);
   }
 
   /* ---------- Scrollbars ---------- */

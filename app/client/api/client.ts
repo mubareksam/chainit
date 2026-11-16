@@ -135,6 +135,12 @@ export const api = {
    * Downloads the newest release and replaces the running binary in place.
    * On Windows this swaps ChainIt-Windows.exe and relaunches it (nothing is installed twice).
    */
+  /** Asks the Windows engine to place a ChainIt.lnk (chain-link icon) on the Desktop. */
+  createDesktopShortcut: () =>
+    fetch('/api/app/desktop-shortcut', { method: 'POST' }).then((r) =>
+      parseJsonOrThrow<{ ok: boolean; path: string; message: string }>(r)
+    ),
+
   checkForUpdate: () =>
     fetch('/api/app/update', { method: 'POST' }).then((r) =>
       parseJsonOrThrow<{

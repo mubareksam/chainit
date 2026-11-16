@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Download, Laptop, RefreshCw, ShieldCheck, Smartphone, X } from 'lucide-react';
+import { CheckCircle2, Download, Laptop, MonitorDown, RefreshCw, ShieldCheck, Smartphone, X } from 'lucide-react';
 import { api } from '../api/client';
 
 interface Props {
@@ -14,6 +14,19 @@ export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
   useEffect(() => {
     api.appVersion().then(setVersion).catch(() => setVersion(null));
   }, []);
+
+  const [shortcutBusy, setShortcutBusy] = useState(false);
+  const runShortcut = async () => {
+    setShortcutBusy(true);
+    try {
+      const res = await api.createDesktopShortcut();
+      setUpdateMsg(res.message);
+    } catch (err) {
+      setUpdateMsg(err instanceof Error ? err.message : 'Could not create the desktop icon');
+    } finally {
+      setShortcutBusy(false);
+    }
+  };
 
   const runUpdate = async () => {
     setBusy(true);
@@ -121,10 +134,22 @@ export const DownloadsModal: React.FC<Props> = ({ onClose }) => {
                   {version ? `· ${version.runtime === 'windows-native' ? 'Windows native engine' : 'browser preview engine'}` : ''}
                 </p>
               </div>
-              <button type="button" className="ci-btn-ghost" onClick={() => void runUpdate()} disabled={busy}>
-                <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
-                {busy ? 'Working…' : 'Check for update'}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button type="button" className="ci-btn-ghost" onClick={() => void runUpdate()} disabled={busy}>
+                  <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
+                  {busy ? 'Working…' : 'Check for update'}
+                </button>
+                <button
+                  type="button"
+                  className="ci-btn-ghost"
+                  onClick={() => void runShortcut()}
+                  disabled={shortcutBusy}
+                  title="Place a ChainIt.lnk with the chain-link icon on the Windows Desktop"
+                >
+                  <MonitorDown className={`w-4 h-4 ${shortcutBusy ? 'animate-pulse' : ''}`} />
+                  {shortcutBusy ? 'Working…' : 'Create desktop icon'}
+                </button>
+              </div>
             </div>
             <p className="ci-body">
               Updates <strong className="text-[var(--ci-text)]">replace</strong> the existing app — the

@@ -24,25 +24,25 @@ import com.chainit.android.R
  */
 object Ds {
     // --- Palette (matches the Windows / web app exactly) ---
-    val bg = Color.parseColor("#070B12")
-    val surface = Color.parseColor("#0E1420")
-    val surfaceAlt = Color.parseColor("#131B29")
-    val surfaceSunken = Color.parseColor("#0A0F19")
-    val border = Color.parseColor("#1E293B")
-    val borderSoft = Color.parseColor("#18202F")
+    val bg = 0xFF070B12.toInt()
+    val surface = 0xFF0E1420.toInt()
+    val surfaceAlt = 0xFF131B29.toInt()
+    val surfaceSunken = 0xFF0A0F19.toInt()
+    val border = 0xFF1E293B.toInt()
+    val borderSoft = 0xFF18202F.toInt()
 
-    val textPrimary = Color.parseColor("#F1F5F9")
-    val textSecondary = Color.parseColor("#9AA7BA")
-    val textMuted = Color.parseColor("#64748B")
+    val textPrimary = 0xFFF1F5F9.toInt()
+    val textSecondary = 0xFF9AA7BA.toInt()
+    val textMuted = 0xFF64748B.toInt()
 
-    val accent = Color.parseColor("#10B981")      // emerald - primary brand
-    val accentSoft = Color.parseColor("#6EE7B7")
-    val info = Color.parseColor("#22D3EE")        // cyan - links / bluetooth
-    val blue = Color.parseColor("#3B82F6")
-    val amber = Color.parseColor("#F59E0B")
-    val danger = Color.parseColor("#F43F5E")
+    val accent = 0xFF10B981.toInt()      // emerald - primary brand
+    val accentSoft = 0xFF6EE7B7.toInt()
+    val info = 0xFF22D3EE.toInt()        // cyan - links / bluetooth
+    val blue = 0xFF3B82F6.toInt()
+    val amber = 0xFFF59E0B.toInt()
+    val danger = 0xFFF43F5E.toInt()
 
-    val onAccent = Color.parseColor("#04120C")
+    val onAccent = 0xFF04120C.toInt()
 
     // --- Metrics ---
     const val radiusCard = 22f
@@ -64,7 +64,7 @@ object Ds {
         }
 
     fun ripple(ctx: Context, bg: GradientDrawable): RippleDrawable {
-        val mask = ColorStateList.valueOf(Color.parseColor("#33FFFFFF"))
+        val mask = ColorStateList.valueOf(0x33FFFFFF.toInt())
         return RippleDrawable(mask, bg, bg)
     }
 
@@ -146,14 +146,20 @@ object Ds {
             setPadding(dp(ctx, padDp), dp(ctx, padDp - 2f), dp(ctx, padDp), dp(ctx, padDp - 2f))
         }
 
+    /**
+     * Tints a color with an alpha byte. Replaces the old `Color.parseColor(hex + hex)` trick:
+     * string color parsing throws IllegalArgumentException("Unknown color") on anything
+     * malformed, which took the whole interface down at startup. Integer math cannot throw.
+     */
+    fun withAlpha(color: Int, alpha: Int = 0x1A): Int =
+        Color.argb(alpha and 0xFF, Color.red(color), Color.green(color), Color.blue(color))
+
     /** Quiet status pill, e.g. READY / OFF / LIVE. */
-    fun pill(ctx: Context, label: String, fg: Int, bgAlphaHex: String = "1A"): TextView =
+    fun pill(ctx: Context, label: String, fg: Int, bgAlpha: Int = 0x1A): TextView =
         text(ctx, label.uppercase(), 10f, fg, bold = true, letterSpacing = 0.06f).apply {
-            background = surface(ctx, Color.parseColor(bgAlphaHex + fgHex(fg)), Color.TRANSPARENT, radiusPill, 0f)
+            background = surface(ctx, withAlpha(fg, bgAlpha), Color.TRANSPARENT, radiusPill, 0f)
             setPadding(dp(ctx, 9f), dp(ctx, 5f), dp(ctx, 9f), dp(ctx, 5f))
         }
-
-    private fun fgHex(c: Int): String = String.format("%06X", 0xFFFFFF and c)
 
     /** Filled primary / secondary / ghost button with a consistent 52dp touch height. */
     fun button(
