@@ -150,6 +150,41 @@ static PayloadInfo readPayloadInfo() {
     return info;
 }
 
+static const wchar_t* kTrayClass = L"ChainItTrayHiddenWindowClass";
+static const wchar_t* kEngineMutex = L"Local\\ChainItSiblingEngineSingleInstance";
+
+/**
+ * Close a running ChainIt before its exe is overwritten.
+ *
+ * Windows keeps a running executable's image file locked, so writing the payload
+ * over an active install fails outright. The previous attempt posted WM_CLOSE to
+ * the hub window, which only *hides* it - ChainIt is a resident service, so the
+ * engine kept running, kept the file locked, and every retry failed. Setup then
+ * aborted while the OLD build stayed installed and kept launching a browser.
+ *
+ * The window that actually stops the engine is the tray window, and because it is
+ * created with HWND_MESSAGE it is message-only: plain FindWindow() cannot see it,
+ * only FindWindowEx(HWND_MESSAGE, ...) can. Closing it makes the old process
+ * delete its tray icon and exit, releasing the file lock and the mutex.
+ */
+static bool stopRunningChainIt(int waitMs) {
+    HANDLE mtx = OpenMutexW(SYNCHRONIZE, FALSE, kEngineMutex);
+    HWND tray = FindWindowExW(HWND_MESSAGE, nullptr, kTrayClass, nullptr);
+    if (!mtx && !tray) return true;
+    if (tray) PostMessageW(tray, WM_CLOSE, 0, 0);
+    for (int waited = 0; waited < waitMs; waited += 150) {
+        Sleep(150);
+        if (!FindWindowExW(HWND_MESSAGE, nullptr, kTrayClass, nullptr)) break;
+    }
+    bool gone = true;
+    if (mtx) {
+        // The window can be gone a beat before the process releases the mutex.
+        gone = (WaitForSingleObject(mtx, 6000) == WAIT_OBJECT_0);
+        CloseHandle(mtx);
+    }
+    return gone;
+}
+
 static bool extractPayload(const PayloadInfo& info, const std::wstring& dest, std::string* err) {
     const std::wstring self = selfPath();
     HANDLE h = CreateFileW(self.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -186,17 +221,13 @@ static bool extractPayload(const PayloadInfo& info, const std::wstring& dest, st
     CreateDirectoryW(installDir().c_str(), nullptr);
     HANDLE out = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (out == INVALID_HANDLE_VALUE) {
-        // A running ChainIt holds the file open. Ask it to quit, then retry once.
-        HANDLE mtx = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\ChainItSiblingEngineSingleInstance");
-        if (mtx) {
-            HWND hub = FindWindowW(L"ChainItHubWindowClass", nullptr);
-            if (hub) PostMessageW(hub, WM_CLOSE, 0, 0);
-            CloseHandle(mtx);
-            for (int i = 0; i < 40; ++i) {
-                Sleep(150);
-                out = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (out != INVALID_HANDLE_VALUE) break;
-            }
+        // Still locked: close the engine through its message-only tray window and
+        // keep retrying the write until the image lock is really gone.
+        stopRunningChainIt(12000);
+        for (int i = 0; i < 60; ++i) {
+            out = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (out != INVALID_HANDLE_VALUE) break;
+            Sleep(150);
         }
     }
     if (out == INVALID_HANDLE_VALUE) { *err = "Windows refused to write " + narrow(dest) + " (is ChainIt still running?)"; return false; }
@@ -271,6 +302,16 @@ static int doInstall() {
         setStatus(wide(info.message));
         if (!gSilent) MessageBoxW(gWnd, wide(info.message).c_str(), L"ChainIt Setup", MB_OK | MB_ICONERROR);
         return 1;
+    }
+
+    setStatus(L"Closing the running ChainIt so its file can be replaced\u2026");
+    if (!stopRunningChainIt(12000)) {
+        const std::wstring warn =
+            L"ChainIt is still running and Windows will not let setup replace its file.\n\n"
+            L"Right-click the ChainIt icon in the system tray, choose\n"
+            L"\"Unmount Z:\\ && Exit ChainIt\", then run this setup again.";
+        setStatus(warn);
+        if (!gSilent) MessageBoxW(gWnd, warn.c_str(), L"ChainIt Setup", MB_OK | MB_ICONWARNING);
     }
 
     setStatus(L"Unpacking ChainIt-Windows.exe (" + std::to_wstring(info.size / 1024) + L" KB)\u2026");

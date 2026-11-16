@@ -347,6 +347,8 @@ Consequences that are now guaranteed by construction:
 | No runtime dependency | Plain Win32 + GDI: no Edge, WebView2, Chromium, .NET or PWA install |
 | No second UI from a double launch | `FindWindowW(kMainClass)` → restore + `PostMessage(WM_UI_REFRESH_ALL)` → exit |
 | Closing the window keeps the service | `WM_CLOSE` hides; the engine, tray icon and `Z:\` mount stay up |
+| One window on launch | The mini hub is created hidden; the File Manager is the only window shown |
+| A new build replaces an old one | `ChainItBuild` window property + `stopResidentChainIt()` (§8.7) |
 
 ### 8.2 Drawing model
 
@@ -417,3 +419,54 @@ or borrowing a browser `prompt()`.
 `app/dist` stays embedded and served: `/mobile` is the phone's companion page, `/mini` still renders for remote
 use, and `/dav` is the WebDAV surface Explorer mounts as `Z:\`. The difference is that **nothing in the
 Windows app opens them any more** — the desktop experience is entirely the native window.
+
+### 8.7 Replacing a build that is already running (v1.5.1)
+
+Removing the browser launch from the source is not sufficient on a machine where ChainIt is already resident, and
+two independent bugs let an **older** build keep serving the user after an update.
+
+**Bug 1 - setup could not overwrite a running exe.** Windows locks the image file of a running process, so
+`CreateFileW(GENERIC_WRITE)` on `ChainIt-Windows.exe` fails while the engine lives. The installer's fallback posted
+`WM_CLOSE` to `ChainItHubWindowClass`, but ChainIt is a resident service: the hub window and the File Manager both
+*hide* on `WM_CLOSE` and keep the engine alive. Every retry failed, setup aborted, and the previous build stayed
+installed - still launching a browser.
+
+The window that actually stops the engine is the **tray window**, whose `WM_DESTROY` sets `gRunning = false`, deletes
+the tray icon and posts `WM_QUIT`. It is created with `HWND_MESSAGE`, which makes it *message-only*: `FindWindow()`
+does not enumerate those, only `FindWindowEx(HWND_MESSAGE, ...)` does. `stopRunningChainIt()` therefore
+
+1. opens the single-instance mutex and finds the tray window through `HWND_MESSAGE`,
+2. posts it `WM_CLOSE` (`DefWindowProc` -> `DestroyWindow` -> `WM_DESTROY` -> clean exit),
+3. polls until the window is gone and then `WaitForSingleObject`s the mutex - the window can disappear a beat
+   before the process releases its handles, and it is the *mutex*, not the window, that proves the image unlocked,
+4. only then writes the payload, with a bounded retry as a backstop, and
+5. if the old instance still will not leave, reports exactly that instead of failing on a locked file.
+
+`/uninstall` runs the same shutdown first, so the delayed self-delete of the exe succeeds.
+
+**Bug 2 - a new launch handed the user back to the old process.** Only one engine can own port 4173 and `Z:\`, so a
+second launch defers to the resident instance. Deferring to an *older* build reproduced the old behaviour exactly,
+however many times the user reinstalled.
+
+Each build now publishes `kChainItBuildNumber` on its File Manager window with `SetPropW(hwnd, L"ChainItBuild", ...)`.
+Window properties live in the window object, so another process can read them with `GetPropW`. On startup:
+
+```
+CreateMutexW(Local\ChainItSiblingEngineSingleInstance) -> ERROR_ALREADY_EXISTS?
+  live  = FindWindowW(ChainItMainWindowClass)
+  build = live ? GetPropW(live, L"ChainItBuild") : 0        // 0 for any pre-1.5.0 build
+  build >= kChainItBuildNumber -> restore + WM_UI_REFRESH_ALL + exit   (hand off)
+  otherwise                    -> stopResidentChainIt() -> re-acquire  (take over)
+                                   still held -> explain how to quit it from the tray, and exit
+```
+
+Taking over is the correct default precisely because the property is missing on older builds: `GetPropW` returns 0,
+which is less than any current build number, so a pre-1.5.0 instance is always replaced rather than deferred to. The
+build number mirrors the APK `versionCode` and rises with every release.
+
+The **About tab shows `Version <x.y.z> (build <n>)`** so a user can confirm in one glance which binary is actually
+running instead of guessing from behaviour.
+
+**v1.5.1 is a Windows-only patch.** The APK stays at v1.5.0 / `versionCode 6`; the Android updater compares the
+*downloaded APK's own* `versionCode` with the installed one (`archive.second <= installedCode -> UpToDate`) and never
+reads the manifest's top-level `version`, so a mixed manifest cannot make the phone chase a no-op update.
