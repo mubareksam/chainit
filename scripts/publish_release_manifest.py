@@ -15,7 +15,15 @@ Explorer's Details tab shows the string, so the mistake is invisible in the UI w
 GetFileVersionInfo (and anything comparing versions numerically) still reports the old release.
 v1.7.0 shipped that way once; this check makes it a build failure instead.
 
-Usage:  python3 scripts/publish_release_manifest.py [--version 1.3.0] [--code 4]
+The version and the Android versionCode are *derived*, not remembered: `--version` defaults to
+`kChainItAppVersion` in windows/src/chainit_win_main.cpp and `--code` to `android:versionCode` in
+the Android manifest, so this script cannot publish a release that disagrees with the source it was
+built from. Passing either flag is an override, not a requirement. It also refuses to publish when
+`android:versionName` disagrees with the version being published, because Windows compares `version`
+and Android compares the versionCode inside the downloaded APK - a disagreement means the two
+platforms disagree about what "latest" is.
+
+Usage:  python3 scripts/publish_release_manifest.py [--version 1.8.0] [--code 9]
 """
 
 from __future__ import annotations
@@ -108,16 +116,80 @@ def check_pe_version(path: pathlib.Path, version: str) -> list[str]:
     return [f"  {label:<28} VERSIONINFO {want} ({len(found)} resource{'s' if len(found) > 1 else ''})"]
 
 
+CPP_MAIN = REPO / "windows" / "src" / "chainit_win_main.cpp"
+ANDROID_MANIFEST = REPO / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
+
+
+def source_version() -> str:
+    """The version the Windows engine actually reports (`kChainItAppVersion`)."""
+    text = CPP_MAIN.read_text(encoding="utf-8")
+    m = re.search(r'kChainItAppVersion\s*=\s*"([^"]+)"', text)
+    if not m:
+        raise SystemExit(f"ERROR: cannot find kChainItAppVersion in {CPP_MAIN}")
+    return m.group(1)
+
+
+def source_version_code() -> int:
+    """The versionCode the APK is built with, straight from the Android manifest."""
+    text = ANDROID_MANIFEST.read_text(encoding="utf-8")
+    m = re.search(r'android:versionCode="(\d+)"', text)
+    if not m:
+        raise SystemExit(f"ERROR: cannot find android:versionCode in {ANDROID_MANIFEST}")
+    return int(m.group(1))
+
+
+def source_version_name() -> str:
+    """The versionName the APK is built with, straight from the Android manifest."""
+    text = ANDROID_MANIFEST.read_text(encoding="utf-8")
+    m = re.search(r'android:versionName="([^"]+)"', text)
+    return m.group(1) if m else ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", default="1.3.0", help="human version label (versionName)")
-    parser.add_argument("--code", type=int, default=4, help="Android versionCode")
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="human version label (default: kChainItAppVersion in the Windows source)",
+    )
+    parser.add_argument(
+        "--code",
+        type=int,
+        default=None,
+        help="Android versionCode (default: android:versionCode in the Android manifest)",
+    )
     parser.add_argument("--channel", default="stable")
     args = parser.parse_args()
+
+    # The defaults used to be frozen literals (`--version 1.3.0 --code 4`), so every release had
+    # to remember to pass both flags. `windows/build.sh` calls this script with no arguments, which
+    # meant the documented reproducible build ended in "compiled with the wrong version resource"
+    # and advice to bump the .rc files - true-sounding, and exactly the wrong fix. Deriving both
+    # from the source of truth means the script cannot disagree with the code it is publishing, and
+    # an explicit flag is now an override rather than a requirement.
+    if args.version is None:
+        args.version = source_version()
+    if args.code is None:
+        args.code = source_version_code()
 
     missing = [p for p in (EXE, APK) if not p.exists()]
     if missing:
         print("ERROR: missing release binaries:", ", ".join(str(p) for p in missing), file=sys.stderr)
+        return 1
+
+    # Both updaters read this one manifest: Windows compares `version`, Android compares the
+    # versionCode inside the APK it downloads. If the APK's own versionName disagrees with the
+    # version being published, the two platforms disagree about what "latest" means - a phone could
+    # be told it is up to date while the PC downloads a different release.
+    manifest_name = source_version_name()
+    if manifest_name and manifest_name != args.version:
+        print(
+            f"ERROR: android:versionName is {manifest_name} but this manifest publishes "
+            f"{args.version}.\n"
+            f"       Bump android/app/src/main/AndroidManifest.xml and rebuild the APK "
+            f"(./android/build-apk.sh), or pass --version {manifest_name}.",
+            file=sys.stderr,
+        )
         return 1
 
     exe_hash, apk_hash = sha256(EXE), sha256(APK)
