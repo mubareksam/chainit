@@ -205,6 +205,39 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
    comparing versions numerically still report the previous release; v1.7.0 shipped that way once, and the check
    turns it into a build failure (`exit 1`, manifest left untouched) instead.
 
+5. **Release audit** — `python3 scripts/audit_release.py` re-derives every claim the release
+   table makes from the **published bytes**, with no SDK, no jars and no network. It exists because the
+   checks that used to cover this all depended on tools provisioned into `/tmp` (`apksigner.jar`, the
+   compiled `.class` tree for `verify_dex_safety.py`, a Windows SDK for the version resource), and `/tmp` is
+   wiped regularly — which turned "verified" into "silently not verified" rather than into a failure.
+
+   It parses the artifacts instead:
+
+   - `releases/version.txt` agrees with the bytes on disk (size + SHA-256 of all three).
+   - the exe and the installer carry the right **numeric** `VERSIONINFO`, the installer's 52-byte trailer
+     digest matches its appended payload, and that payload is byte-identical to the published exe (§5.4).
+   - the Windows binary contains no browser-launch string (`msedge`, `--app=`, `iexplore`, `chrome.exe`) —
+     the native-UI guarantee of §8 checked against the shipped file rather than the source.
+   - the APK's v2 **and** v3 signing blocks are *verified*, not just spotted: the signer certificate is the
+     pinned release key (what makes an upgrade install in place rather than fail with
+     `INSTALL_FAILED_UPDATE_INCOMPATIBLE`), the chunked content digest recomputed from the file — three
+     sections, 1 MiB chunks, `0xA5`/`0x5A` prefixes, with the EOCD's central-directory offset hashed as
+     though it pointed at the signing block — still matches what the signer committed to, and the
+     RSASSA-PKCS1-v1_5 signature over `signedData` verifies against the public key embedded in the block.
+     Both "signed by us" and "unchanged since signing" are therefore proved in pure Python.
+   - the **binary** `AndroidManifest.xml` really says the published `versionName`/`versionCode` (read out of
+     the AXML chunks, not out of the source file).
+   - no **first-party** class contains `invoke-custom`/`invoke-polymorphic`, scanned per code item at real
+     instruction boundaries. Sites inside prebuilt kotlin-stdlib classes are counted and reported but not
+     failed, which is precisely the distinction `verify_dex_safety.py` draws at build time (§5.1).
+
+   An operand word is not an opcode: testing every code unit's low byte reports ~1,100 phantom
+   `invoke-custom`s in this very APK, and getting the `move-wide` family's widths wrong (12x/22x/32x, not
+   2/3/5) still leaves ~80 — so the walk uses the real instruction-width table and steps over inline
+   switch/`fill-array-data` payloads. The checks were then proved to fail when they should: `--releases-dir`
+   points the audit at a copy, and a single flipped byte in a ZIP entry, in the central directory, inside
+   `signedData`, or inside the certificate is each caught by the corresponding check and no other.
+
 ---
 
 ## 6. Fast, Reliable Transfers: Parallel Chunking + End-to-End Integrity
