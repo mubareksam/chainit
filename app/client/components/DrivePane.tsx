@@ -576,11 +576,38 @@ export const DrivePane: React.FC<Props> = ({
               </button>
             );
           })}
-          <span className="text-[10px] text-slate-600 shrink-0 ml-1">
-            {allowOtherDrives
-              ? 'other drives reachable'
-              : 'profile folder only — widen it on the PC (Link tab)'}
-          </span>
+          <button
+            onClick={async () => {
+              // Widening what the PC shares is a real privacy decision, so it is a switch with a
+              // sentence behind it - and the state lives on the PC (persisted), not in this tab.
+              const next = !allowOtherDrives;
+              try {
+                const res = await api.setDriveScope(next);
+                setAllowOtherDrives(res.allowOtherDrives);
+                if (res.drives) setDrives(res.drives);
+                notify(
+                  res.allowOtherDrives
+                    ? `Other drives are reachable again (${res.drives?.length ?? drives.length} volume(s))`
+                    : `Only ${drives.find((d) => d.isPcRoot)?.letter ?? 'C'}: is reachable now`,
+                  'info'
+                );
+              } catch (err) {
+                notify(err instanceof Error ? err.message : 'Could not change drive reach', 'error');
+              }
+            }}
+            title={
+              allowOtherDrives
+                ? 'Every volume on this PC can be browsed. Click to share the profile folder only.'
+                : 'Only the profile folder is shared. Click to make D:, E:, card readers and mapped shares reachable.'
+            }
+            className={`px-2 py-0.5 rounded-md text-[10px] shrink-0 ml-1 border transition ${
+              allowOtherDrives
+                ? 'border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500'
+                : 'border-amber-500/40 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20'
+            }`}
+          >
+            {allowOtherDrives ? 'Other drives: reachable' : 'Other drives: blocked (C: only)'}
+          </button>
         </div>
       )}
 

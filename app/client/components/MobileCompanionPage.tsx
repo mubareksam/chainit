@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  BatteryCharging,
   Check,
   Download,
   FileText,
@@ -16,7 +17,7 @@ import {
 } from 'lucide-react';
 import { SystemSnapshot, VfsItem } from '../../shared/types';
 import { api } from '../api/client';
-import { formatBytes } from '../utils/format';
+import { batteryTint, batteryTooltip, chargeLabel, formatBytes } from '../utils/format';
 
 interface Props {
   snapshot: SystemSnapshot;
@@ -93,6 +94,36 @@ export const MobileCompanionPage: React.FC<Props> = ({
           </div>
 
           <div className="p-4 space-y-4">
+            {/* Battery: the number the PC draws, and whether it is a live report (v1.7.0) */}
+            <div
+              className="rounded-2xl border border-slate-800 bg-slate-950 p-3.5"
+              title={batteryTooltip(snapshot.environment)}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <BatteryCharging
+                    className={`w-4 h-4 ${batteryTint(snapshot.environment)}`}
+                  />
+                  <span className="text-xs font-semibold">Phone battery</span>
+                </div>
+                <span className={`text-sm font-mono ${batteryTint(snapshot.environment)}`}>
+                  {snapshot.environment.phoneBatteryPct}%
+                </span>
+              </div>
+              <div className="text-[10px] opacity-80 mt-1">
+                {chargeLabel(snapshot.environment)}
+                {typeof snapshot.environment.phoneTemperatureC === 'number' &&
+                snapshot.environment.phoneTemperatureC > 0
+                  ? ` · ${snapshot.environment.phoneTemperatureC.toFixed(1)} °C`
+                  : ''}
+                {snapshot.environment.phoneSeenMs
+                  ? snapshot.environment.phoneTelemetryLive === false
+                    ? ' · stale report'
+                    : ' · live'
+                  : ' · awaiting the phone\u2019s first report'}
+              </div>
+            </div>
+
             {/* Sibling & Screen State Controls */}
             <div className="grid grid-cols-2 gap-2.5">
               <button
