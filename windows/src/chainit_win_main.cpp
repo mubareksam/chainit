@@ -1164,6 +1164,27 @@ static std::string toVirtualPosix(const fs::path& root, const fs::path& full) {
     return s.front() == '/' ? s : ("/" + s);
 }
 
+// Real last-write time in Unix milliseconds.
+//
+// `modifiedMs` used to be `nowMs()`, so *every* row claimed to have been modified "just now": the
+// File Manager's Modified column showed the current time for all 400 entries, sorting by date was
+// meaningless, and the phone's native PC browser inherited the same lie over the API.
+//
+// GetFileAttributesExW rather than CreateFileW + GetFileTime: a listing opens no handles at all (400
+// rows per folder, refreshed on every navigation), it cannot be blocked by a sharing violation on a
+// file somebody else has open, and it works for directories without FILE_FLAG_BACKUP_SEMANTICS.
+// FILETIME is 100 ns ticks since 1601-01-01.
+static int64_t fileModifiedMs(const fs::path& full) {
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (!GetFileAttributesExW(full.c_str(), GetFileExInfoStandard, &info)) return 0;
+    ULARGE_INTEGER u{};
+    u.LowPart = info.ftLastWriteTime.dwLowDateTime;
+    u.HighPart = info.ftLastWriteTime.dwHighDateTime;
+    const unsigned long long kEpochShift100Ns = 116444736000000000ULL;  // 1601-01-01 -> 1970-01-01
+    if (u.QuadPart <= kEpochShift100Ns) return 0;
+    return static_cast<int64_t>((u.QuadPart - kEpochShift100Ns) / 10000ULL);
+}
+
 static std::string buildVfsItemJson(const fs::path& root, const fs::path& full) {
     std::error_code ec;
     bool isDir = fs::is_directory(full, ec);
@@ -1181,7 +1202,7 @@ static std::string buildVfsItemJson(const fs::path& root, const fs::path& full) 
         << "\"path\":\"" << jsonEscape(vpath) << "\","
         << "\"kind\":\"" << (isDir ? "directory" : "file") << "\","
         << "\"sizeBytes\":" << sz << ","
-        << "\"modifiedMs\":" << nowMs() << ","
+        << "\"modifiedMs\":" << fileModifiedMs(full) << ","
         << "\"mimeType\":\"" << jsonEscape(mime) << "\","
         << "\"ext\":\"" << jsonEscape(ext) << "\"}";
     return oss.str();
@@ -2306,12 +2327,12 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.5.1";
+static const char* const kChainItAppVersion = "1.6.0";
 /** Increases with every release (mirrors the APK versionCode). Published on the
  *  File Manager window as the "ChainItBuild" property so that a newly launched
  *  build can tell a *current* resident instance from an *older* one - and take
  *  over from the older one instead of politely handing the user back to it. */
-static const int kChainItBuildNumber = 7;
+static const int kChainItBuildNumber = 8;
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;

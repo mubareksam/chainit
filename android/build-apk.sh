@@ -260,6 +260,11 @@ echo "==> apksigner (v2 + v3) with the committed release key"
 
 # ------------------------------------------------------------------ verify
 echo "==> verifying"
+# The phone must never hand its own UI to a browser again: no ACTION_VIEW jump to the PC's web UI.
+if grep -rn 'ACTION_VIEW' "$SRC/java" | grep -v 'PcBrowserActivity.kt:.*content://' | grep -vE '^\s*\*' | grep -q '4173'; then
+  echo "FATAL: an Android source still opens http://<pc>:4173 in a browser. Use PcBrowserActivity." >&2
+  exit 1
+fi
 "$JAVA" -jar "$APKSIGNER" verify --verbose "$FINAL_APK" | sed 's/^/    /'
 "$AAPT2" dump badging "$FINAL_APK" | grep -E "^package|^application-label|uses-permission: name='android.permission.BLUETOOTH" | sed 's/^/    /'
 python3 - "$FINAL_APK" <<'PY'
@@ -273,7 +278,10 @@ assert info.compress_type == zipfile.ZIP_STORED, 'resources.arsc must be stored'
 dex = z.read('classes.dex')
 for cls in (b'Lcom/chainit/android/ChainItApp;',
             b'Lcom/chainit/android/ui/MainActivity;',
+            b'Lcom/chainit/android/ui/PcBrowserActivity;',
             b'Lcom/chainit/android/ui/Ds;',
+            b'Lcom/chainit/android/net/PcVfsClient;',
+            b'Lcom/chainit/android/net/ChainItFileProvider;',
             b'Lcom/chainit/android/service/SiblingDaemonService;',
             b'Lcom/chainit/android/net/BluetoothRfcommTransport;',
             b'Lcom/chainit/android/update/UpdateManager;',

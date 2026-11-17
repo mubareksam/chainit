@@ -113,7 +113,7 @@ const normalizeBtLink = (raw: string): string | null => {
   return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
 };
 
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.6.0';
 
 app.get('/api/app/version', (_req, res) => {
   res.json({ version: APP_VERSION, runtime: 'node-preview', channel: 'stable' });

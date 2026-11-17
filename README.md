@@ -10,19 +10,63 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.37 MB | **v1.5.1** — Portable `.exe`. **Fully native: the File Manager is a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. v1.5.1 additionally **replaces a build that is already running**: a new launch closes an older resident instance instead of handing the user back to it, which is what kept the browser-opening build alive after an update. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + About tabs. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.5.1.exe`](./releases/ChainIt-Setup-1.5.1.exe) | ~1.68 MB | **v1.5.1** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. It now **closes a running ChainIt properly before overwriting the exe** (Windows locks a running image, so the old build used to survive the install). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.5.0 (`versionCode 6`)** — unchanged by the v1.5.1 Windows fix, so there is no need to update your phone. V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.37 MB | **v1.6.0** — Portable `.exe`. **Fully native: the File Manager is a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. v1.6.0 fixes the **Modified** column: it used to stamp every row with the current time (`nowMs()`), so sorting by date was meaningless — it now reads each entry’s real last-write time. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + About tabs. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.6.0.exe`](./releases/ChainIt-Setup-1.6.0.exe) | ~1.68 MB | **v1.6.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. It now **closes a running ChainIt properly before overwriting the exe** (Windows locks a running image, so the old build used to survive the install). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~924 KB | **v1.6.0 (`versionCode 7`)** — **the phone now browses your PC’s folders natively.** “Browse PC files” used to fire an `ACTION_VIEW` intent at `http://<pc>:4173/mobile`, i.e. it sent you to Edge/Chrome; it now opens `PcBrowserActivity`, a screen ChainIt draws itself (list, sort, open, save, new folder, rename, delete, send-to-folder) that reaches the PC over **Wi-Fi or Bluetooth RFCOMM — no browser, no WebView**. V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.5.1.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.6.0.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
 
+### What is new in v1.6.0
+
+> **Both platforms.** Windows `1.6.0` (build 8) and Android `1.6.0` (`versionCode 7`).
+
+**The phone stopped borrowing a browser to show your PC’s files.** “Browse PC files (C:\)” fired
+`Intent(ACTION_VIEW, http://<pc>:4173/mobile)` — the exact mistake Windows made before v1.5.0. Consequences on a
+phone are worse than on a desktop: the files were drawn by Edge/Chrome, the recent-apps tile said *Chrome*, the UI
+needed Wi-Fi even when Bluetooth was paired and working, and nothing about the experience said ChainIt.
+
+1. **`PcBrowserActivity` — a native PC file browser drawn with the same `Ds` tokens as the rest of the app.**
+   Header with the live transport pill (WI-FI / BLUETOOTH / NO LINK), a path bar with **Up** and **Refresh**,
+   **New folder / Send file here / Sort**, tappable **Name · Size · Modified** column headers (folders first, four
+   sort modes, direction toggles), type badges instead of icon fonts, single- and multi-select, and a bottom action
+   sheet per item. Text and images open **inside ChainIt** (native `TextView` / `ImageView`); anything else can be
+   saved to Downloads and handed to another app through a `content://` URI from `ChainItFileProvider` — a file
+   viewer, never a browser hosting ChainIt’s own interface.
+2. **`PcVfsClient` — one client, two real transports.** It speaks the PC’s existing HTTP/1.1 API
+   (`/api/vfs/pc/list|raw|text|mkdir|rename|delete|upload`) over TCP to `<pcIp>:4173`, and when that link is gone it
+   dials the PC’s RFCOMM service `c4a1b170-0002-4000-8000-00805f9b34fb`, where the same API is served
+   (`bluetoothServerLoop()` hands every accepted socket to the HTTP handler). **Bluetooth is a full link here, not a
+   degraded fallback: browsing `C:\`-side folders works with Wi-Fi, hotspot and USB all switched off.** Bodies
+   stream — a download goes straight to disk and an upload straight from the content resolver — so a 2 GB video
+   never passes through the heap, and each transport attempt re-opens its own output file so a half-written Wi-Fi
+   download can never end up in front of the Bluetooth one.
+3. **Refusals stay honest.** No link, radio off, nothing paired, a 12 s dial timeout, a wrong Pairing Key (401),
+   Sibling Mode off on the PC (403), the 30 s lockout (429), a file that vanished (404), a truncated body — each
+   becomes one sentence that says what to do next, shown in the status line and on the empty-state card, which also
+   offers **Try again**, **Bluetooth settings** and **Wi-Fi settings**.
+4. **Windows: the Modified column now tells the truth.** `buildVfsItemJson()` emitted `"modifiedMs": nowMs()`, so
+   every one of up to 400 rows claimed to have been modified *this instant*: the column showed the current time
+   everywhere and “sort by date” shuffled arbitrarily. It now reads the real last-write time with `GetFileTime`
+   (`FILE_FLAG_BACKUP_SEMANTICS` so directories open too) and converts FILETIME’s 1601 epoch to Unix milliseconds.
+   The phone’s new date sort inherits the fix over the same API. `app/server/selftest.ts` gained a contract test for
+   exactly the calls the phone makes, so this shape cannot silently change again.
+5. **A build guard against regressing into a browser.** `android/build-apk.sh` now fails the build if any Android
+   source opens `http://…:4173` with `ACTION_VIEW`, and asserts `PcBrowserActivity`, `PcVfsClient` and
+   `ChainItFileProvider` are present in the final `classes.dex` (183 first-party classes, still
+   invokedynamic-free).
+
+**How to tell which build you are actually running:** on Windows open the **About** tab — v1.6.0 reads
+`Version 1.6.0 (build 8) · native Win32 · no browser, no runtime`. On the phone, **Browse PC files** must open a
+dark ChainIt screen whose header says **PC FILES**; if a browser opens instead, you are still on `versionCode 6` —
+install the new APK (it upgrades in place) and quit the old app from recents first.
+
 ### What is new in v1.5.1
 
-> **A Windows-only patch.** The phone app is untouched at v1.5.0 (`versionCode 6`) — there is nothing to update there.
+> **A Windows-only patch, since superseded by v1.6.0 on both platforms.**
 
 v1.5.0 removed every browser launch from the source, but a machine that already had ChainIt running could still end
 up looking at Edge. Two separate bugs, both of which let the **old** build stay in charge:
@@ -48,9 +92,9 @@ up looking at Edge. Two separate bugs, both of which let the **old** build stay 
    - If an old instance cannot be closed, ChainIt says exactly what to do rather than starting a second engine that
      cannot bind port 4173: *right-click the tray icon → “Unmount `Z:\` && Exit ChainIt”, then start again.*
 
-**How to tell which build you are actually running:** open the **About** tab. v1.5.1 reads
-`Version 1.5.1 (build 7) · native Win32 · no browser, no runtime`. If it says 1.5.0 or 1.4.0, the old process was
-still resident — quit it from the tray and start the new one.
+**How to tell you got it (at the time):** the About tab read `Version 1.5.1 (build 7) · native Win32 · no browser,
+no runtime`. If it said 1.5.0 or 1.4.0, the old process was still resident — quit it from the tray and start the new
+one. v1.6.0 supersedes this build.
 
 ### What is new in v1.5.0
 
@@ -279,6 +323,7 @@ still resident — quit it from the tray and start the new one.
    - Tap **`3. Tap to Allow Bluetooth Connectivity`** *(Android 12+)* and allow **Nearby devices / Bluetooth**. The line turns green — `✓ 3. Bluetooth Sibling Socket Ready (RFCOMM Active)` — when the native Bluetooth server is live. *(Only needed if you want Bluetooth mode.)*
    - **For Bluetooth-only use:** pair the phone with your PC **once** (Android *Settings → Bluetooth* ↔ Windows *Settings → Bluetooth & devices*). ChainIt reuses that pairing to open RFCOMM sockets automatically in the background — no re-pairing and no confirmation prompts.
 3. Leave the **Sibling Mode** switch **ON** *(default Sibling Key is `CHAINIT-SIBLING`)*. You can now lock your phone screen and put it away!
+4. **Browse your PC's folders from the phone (v1.6.0):** tap **`Browse PC files`** in the *PC files* card. ChainIt draws the listing itself — **no browser opens** — over Wi-Fi, hotspot or USB tethering, and over **Bluetooth RFCOMM with Wi-Fi completely off** once the phone and PC are paired. You can sort by name/size/type/date, open text and images inside ChainIt, save anything to `Downloads/ChainIt`, create folders, rename, delete, and send a phone file straight into the folder you are looking at. The PC shares your Windows **profile** folder as the root (`Desktop`, `Documents`, `Downloads`, `Pictures`, …), which is why the path bar reads `/` at the top rather than `C:\`.
 
 ### Part B — On Your Windows 10 / 11 Laptop
 1. Download **`ChainIt-Windows.exe`** (e.g., onto your Desktop) and double-click it.
@@ -306,12 +351,12 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.5.1.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.6.0.exe` (installer) & `ChainIt-Android.apk` (v1.6.0 / `versionCode 7`), plus `version.txt` |
 | [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
 | [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |
 | [`windows/src/chainit_win_main.cpp`](./windows/src/chainit_win_main.cpp) | Native Win32 C++17 single-binary source (**native hub window + AppUserModelID taskbar identity**, System Tray, UDP discovery, **`AF_BTH` RFCOMM client + published SDP receiver + `WSALookupService` paired-device discovery**, multipath WebDAV `Z:\` mounter with phone-name labelling, **parallel 2 MiB chunked transfers with per-chunk SHA-256**, verified desktop-shortcut writer with an MS-SHLLINK fallback, `/uninstall` mode, embedded UI server) |
-| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, **`PhoneHttpAndWebDavServer` with mandatory Pairing Key, brute-force lockout and SHA-256 range/upload verification**, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`) |
+| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, **`PhoneHttpAndWebDavServer` with mandatory Pairing Key, brute-force lockout and SHA-256 range/upload verification**, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`, **`ui/PcBrowserActivity` + `net/PcVfsClient` + `net/ChainItFileProvider` — the native PC file browser that replaced the old jump into a web browser**) |
 | [`crates/`](./crates) | Shared Rust core (`chainit-core`) & Windows library (`chainit-windows`) |
 | [`app/`](./app) | ChainIt File Manager React/TypeScript UI + Node live preview server |
 | [`scripts/`](./scripts) | PowerShell `Z:\` drive helpers (`mount-z-drive.ps1`, `unmount-z-drive.ps1`), asset embedder (`gen_embedded_assets.py`) & release manifest publisher |
