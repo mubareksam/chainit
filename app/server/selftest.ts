@@ -220,6 +220,16 @@ async function run() {
     assert.ok(Array.isArray(hist.items) && hist.items.length >= 1, '/api/history answers with entries');
     const entry = hist.items.find((t: { label?: string }) => t.label === 'history-probe.txt');
     assert.ok(entry, 'the upload the phone just pushed is in the history');
+    // The rate has to be *measured*: derivable from the bytes and duration the same entry
+    // reports. A nominal transport speed (the old `link.speedMBps || 85`) passes every other
+    // assertion while telling the user something that never happened.
+    assert.ok(entry.durationMs >= 1, 'the entry carries a real elapsed time');
+    const impliedMBps = entry.bytes / (1024 * 1024) / (entry.durationMs / 1000);
+    assert.ok(
+      Math.abs(entry.effectiveSpeedMBps - impliedMBps) <= Math.max(0.05, impliedMBps * 0.25),
+      `effectiveSpeedMBps ${entry.effectiveSpeedMBps} is not what ${entry.bytes} B in ` +
+        `${entry.durationMs} ms implies (${impliedMBps.toFixed(2)})`
+    );
     assert.equal(entry.source, 'phone-upload', 'and it says the phone pushed it');
     assert.equal(entry.direction, 'phone_to_pc', 'with the direction it travelled');
     assert.ok(entry.virtualPath && entry.virtualPath.endsWith('/history-probe.txt'), 'and where it landed');
@@ -236,6 +246,16 @@ async function run() {
       (t: { label?: string; source?: string }) => t.label === 'history-probe.txt' && t.source === 'phone-download'
     );
     assert.ok(pulled, 'an explicit save (download=1) is recorded as the phone pulling the file');
+    assert.ok(pulled.durationMs >= 1, 'the saved file carries a real elapsed time, not 0');
+    assert.ok(
+      pulled.effectiveSpeedMBps > 0,
+      'and a measured rate - a 0.0 MB/s entry renders in the Recent tab with no speed at all'
+    );
+    const pulledImplied = pulled.bytes / (1024 * 1024) / (pulled.durationMs / 1000);
+    assert.ok(
+      Math.abs(pulled.effectiveSpeedMBps - pulledImplied) <= Math.max(0.05, pulledImplied * 0.25),
+      `saved-file rate ${pulled.effectiveSpeedMBps} does not match ${pulled.bytes} B in ${pulled.durationMs} ms`
+    );
 
     const revealRes = await fetch(`${BASE}/api/pc/reveal`, {
       method: 'POST',

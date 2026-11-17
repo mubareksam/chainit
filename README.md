@@ -40,7 +40,10 @@ report older than three minutes reads `last reported 12 min ago`, and a PC that 
 **2. Recent shared files — a history, not a session log.**
 Every file that actually moves is recorded per file (not one aggregate row per batch) with its direction, the transport
 that carried it, a **measured** rate instead of the old hard-coded `88.5 MB/s` and `durationMs: 8`, the PC-side path it
-landed on, its VFS path, and **who started it**: `ui` (File Manager), `api` (a client call), `phone-upload` or
+landed on, its VFS path, and **who started it**. "Measured" is enforced, not intended: every recording path derives the
+rate from the bytes and elapsed time it reports, and the contract test fails the build if an entry's rate is not
+reproducible from its own fields — which caught two paths that were quoting the transport's *nominal* speed (a 44-byte
+upload claiming 94.5 MB/s) and one that recorded `0.0`, leaving the Recent tab with no rate and no duration at all: `ui` (File Manager), `api` (a client call), `phone-upload` or
 `phone-download` (the phone itself — which is how a share made with the screen off shows up later). The list is capped at
 60 entries, written to `%APPDATA%\ChainIt\transfer-history.json` and loaded at startup, so it survives a restart and an
 in-place update; the uninstaller already removes that directory.

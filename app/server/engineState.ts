@@ -461,8 +461,12 @@ class ChainItEngine {
     const transportUsed = this.activeTransportId || 'wifi_lan';
     const transports = this.buildTransportTelemetry();
     const linkInfo = transports.find((t) => t.id === transportUsed);
-    const linkSpeed = linkInfo?.speedMBps || 85;
     const elapsedMs = Math.max(1, Math.round(performance.now() - started));
+    // Measured, not nominal. linkInfo.speedMBps is what the transport *claims* it can do, so
+    // quoting it next to a 64 KB copy makes a 2 ms operation read as a 94 MB/s one - the same
+    // dishonesty as the old hard-coded 88.5 MB/s, just wearing the transport's number.
+    const measuredMBps = result.totalBytes / (1024 * 1024) / (elapsedMs / 1000);
+    const effectiveSpeedMBps = Number.isFinite(measuredMBps) ? Number(measuredMBps.toFixed(2)) : 0;
 
     const direction: TransferRecord['direction'] =
       params.fromTarget === 'pc' && params.toTarget === 'phone'
@@ -487,7 +491,7 @@ class ChainItEngine {
       promotedHotspot,
       bytes: result.totalBytes,
       durationMs: elapsedMs,
-      effectiveSpeedMBps: linkSpeed,
+      effectiveSpeedMBps,
       status: 'completed',
       timestampMs: Date.now(),
       // Provenance: an entry is only actionable if a client knows who moved it and where it landed.
@@ -503,7 +507,7 @@ class ChainItEngine {
     this.addLog(
       'VFS',
       `${params.op === 'move' ? 'Moved' : 'Copied'} ${label} (${direction.replace(/_/g, ' ')})`,
-      `Via ${linkInfo?.shortName || transportUsed} at ~${linkSpeed} MB/s • Phone screen ${
+      `Via ${linkInfo?.shortName || transportUsed} at ${effectiveSpeedMBps} MB/s measured • Phone screen ${
         this.environment.phoneScreenLocked ? 'remained OFF' : 'awake'
       }.`
     );

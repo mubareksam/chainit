@@ -3871,22 +3871,30 @@ static void handleHttpClient(SOCKET client) {
                 closesocket(client);
                 return;
             }
+            // Timed across the read *and* the send, because that is the interval the phone
+            // actually waited through. Recording 0.0 here used to make historyJsonLocked derive
+            // durationMs 0, so a saved file showed up in the Recent tab with no rate and no
+            // duration at all - an honest zero, but an incomplete one.
+            const int64_t dlStarted = nowMs();
             std::ifstream ifs(full, std::ios::binary);
             std::ostringstream ss;
             ss << ifs.rdbuf();
             std::string data = ss.str();
             std::map<std::string, std::string> extra;
             if (dl) extra["Content-Disposition"] = "attachment; filename=\"" + urlEncode(full.filename().u8string()) + "\"";
+            sendHttpResponse(client, 200, "OK", guessMime(full.filename().u8string()), data.data(), data.size(), extra);
             // Only an explicit save is a share. The phone also fetches /raw to preview images, and
             // recording those would bury the files the user actually took.
             if (dl && !isPhone) {
+                const int64_t elapsed = (std::max)(static_cast<int64_t>(1), nowMs() - dlStarted);
+                const double mbps = (static_cast<double>(data.size()) / (1048576.0)) /
+                                    (static_cast<double>(elapsed) / 1000.0);
                 std::string transport;
                 { std::lock_guard<std::mutex> lk(gState.mtx); transport = gState.activeTransportId; }
                 recordTransfer("download", "pc_to_phone", full.filename().u8string(),
-                               static_cast<int64_t>(data.size()), 0.0, transport, "phone-download",
+                               static_cast<int64_t>(data.size()), mbps, transport, "phone-download",
                                full.generic_u8string());
             }
-            sendHttpResponse(client, 200, "OK", guessMime(full.filename().u8string()), data.data(), data.size(), extra);
             closesocket(client);
             return;
         }

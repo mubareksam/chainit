@@ -714,6 +714,22 @@ a client-side preference either:
 An image **preview** (`/raw` without `download=1`) is deliberately not recorded: opening a thumbnail is not sharing a
 file, and a history full of previews would bury the real transfers.
 
+**Every recording path measures.** That took a second pass, because "not hard-coded" is not the same as "measured":
+
+- the Windows `/raw?download=1` path recorded `0.0` MB/s. Since `TransferItem` stores a *rate* and
+  `historyJsonLocked()` derives `durationMs` from it (`bytes / rate`), a zero rate produced `durationMs: 0` too, so a
+  saved file reached the Recent tab with no rate **and** no duration. It is now timed across the read *and* the send -
+  the interval the phone actually waited through - and recorded after the response goes out.
+- the node preview's upload route quoted the transport's nominal `speedMBps` (94.5), so a 44-byte upload claimed
+  94.5 MB/s while the download of the same file correctly measured 0.02 MB/s. Its transfer path did the same with
+  `linkSpeed || 85`. Both now derive the rate from the bytes and elapsed time they already had.
+
+A nominal speed is the same lie as the old constant, just wearing the transport's number. The contract test therefore
+asserts the rate is **reproducible from the entry's own fields** - `|effectiveSpeedMBps - bytes/durationMs|` within
+tolerance, and `durationMs >= 1` - for both a phone upload and an explicit save, so a nominal rate fails the build
+instead of reaching a user. (Checked by reverting one line: the assertion reports
+`effectiveSpeedMBps 72.4 is not what 21 B in 1 ms implies (0.02)`.)
+
 Persistence is plain JSON with a schema number (`{"schema":2,"transfers":[…]}`), loaded at startup before the first
 snapshot, bounded at 60 entries, and written on every append. The uninstaller already removes `%APPDATA%\ChainIt`,
 so a clean uninstall leaves no history behind.
@@ -771,6 +787,7 @@ wire shapes with the same semantics and its own limits stated rather than faked:
 `virtualPath` is `/`; `/api/drives` names the root letter; an absent volume answers with `items: []`, a non-empty
 `error` **and** the volume list; flipping the reach switch off changes the refusal sentence and back on restores it;
 an upload then appears in `/api/history` with `source: "phone-upload"`, `direction: "phone_to_pc"` and a `virtualPath`
-that ends with the filename; an explicit `raw?download=1` adds a `phone-download` entry; `/api/pc/reveal` resolves a
+that ends with the filename, and a rate consistent with its own `bytes`/`durationMs`; an explicit `raw?download=1` adds
+a `phone-download` entry whose duration is real and non-zero; `/api/pc/reveal` resolves a
 real path and 404s on a missing one; `history/clear` reports how many entries went and leaves the list empty; and the
 snapshot carries the five battery fields, `pcVolumes[]` and `allowOtherDrives`.
