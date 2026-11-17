@@ -196,9 +196,20 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
    `releases/version.txt` (version + SHA-256 of all three artifacts). The Windows in-place updater and the
    Android `UpdateManager` both trust this file to decide "up to date" vs "replace in place".
 
+   **Neither the version nor the versionCode is a remembered literal.** `--version` defaults to
+   `kChainItAppVersion` in `windows/src/chainit_win_main.cpp` and `--code` to `android:versionCode` in the
+   Android manifest, so the script cannot publish a release that disagrees with the source it was built from;
+   passing either flag is an override rather than a requirement. Both used to default to frozen literals
+   (`1.3.0` / `4`), which meant every release had to remember to pass them - and `windows/build.sh` calls this
+   script with **no arguments**, so the documented reproducible build ended in "compiled with the wrong version
+   resource" plus advice to bump the `.rc` files: true-sounding, and exactly the wrong fix. It also refuses to
+   publish when `android:versionName` disagrees with the version being published, because Windows compares
+   `version` while Android compares the versionCode inside the APK it downloads - a disagreement leaves the two
+   platforms with different ideas of what "latest" means.
+
    Before writing anything it **reads the compiled `VERSIONINFO` back out of the binaries** and refuses to
    publish unless every `VS_FIXEDFILEINFO` in the exe and in the installer (the packed setup carries two: its
-   own stub resource plus the appended payload's) matches `--version`, and unless the UTF-16 `FileVersion`
+   own stub resource plus the appended payload's) matches the version, and unless the UTF-16 `FileVersion`
    string is present too. `windows/res/*.rc` state the version twice — numeric `FILEVERSION`/`PRODUCTVERSION`
    and the `FileVersion`/`ProductVersion` strings — and a hand bump can update one without the other. Explorer's
    *Details* tab shows the string, so that mistake is invisible in the UI while `GetFileVersionInfo` and anything
