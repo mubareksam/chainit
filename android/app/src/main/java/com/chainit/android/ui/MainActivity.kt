@@ -572,7 +572,11 @@ class MainActivity : Activity() {
         val battOk = runCatching { pm.isIgnoringBatteryOptimizations(packageName) }.getOrDefault(false)
         setRow(rowBattery, battOk, "Unrestricted", "Tap to allow")
 
-        val btPermOk = BluetoothRfcommTransport.hasBluetoothPermission(this)
+        // Both permissions matter: CONNECT to dial, ADVERTISE to publish the RFCOMM service the
+        // PC looks up. A phone with CONNECT only looks "Ready" here while its listener cannot be
+        // found at all - the exact shape of "Bluetooth still didn't connect".
+        val btPermOk = BluetoothRfcommTransport.hasBluetoothPermission(this) &&
+            BluetoothRfcommTransport.hasBluetoothAdvertisePermission(this)
         val btAdapterOn = runCatching { BluetoothRfcommTransport.getLocalAdapter(this)?.isEnabled == true }.getOrDefault(false)
         val btOk = btPermOk && btAdapterOn
         setRow(
@@ -677,11 +681,21 @@ class MainActivity : Activity() {
             val open = SiblingDaemonService.openVfsSessions()
             val beats = SiblingDaemonService.heartbeatsSurvived()
             val err = SiblingDaemonService.bluetoothLastError()
+            val channel = SiblingDaemonService.bluetoothChannel()
+            val selfAddr = BluetoothRfcommTransport.localAddress(this)
             val text = when {
                 listening -> buildString {
                     append("Bluetooth RFCOMM: LIVE (")
                     append(mode)
-                    append(" channel)  •  ")
+                    append(" channel")
+                    // Naming the channel and this phone's address is what makes the offline link
+                    // debuggable: the PC dials "bt://<address>:<channel>" directly, and a user can
+                    // type that into the Link tab instead of waiting on a paired-device sweep.
+                    if (channel > 0) {
+                        append(" ")
+                        append(channel)
+                    }
+                    append(")  •  ")
                     append(sessions)
                     append(" session(s) accepted  •  ")
                     append(open)
@@ -690,8 +704,16 @@ class MainActivity : Activity() {
                     append(served)
                     append("  •  Doze heartbeats survived: ")
                     append(beats)
+                    if (selfAddr != null) {
+                        append("\nPC dials: bt://")
+                        append(selfAddr)
+                        if (channel > 0) {
+                            append(":")
+                            append(channel)
+                        }
+                    }
                 }
-                err != null -> "Bluetooth RFCOMM: re-arming — $err"
+                err != null -> "Bluetooth RFCOMM: not listening — $err"
                 else -> "Bluetooth RFCOMM: $mode"
             }
             tv.text = text
@@ -852,6 +874,11 @@ class MainActivity : Activity() {
             if (Build.VERSION.SDK_INT >= 31) {
                 if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) perms.add(Manifest.permission.BLUETOOTH_CONNECT)
                 if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) perms.add(Manifest.permission.BLUETOOTH_SCAN)
+                // ADVERTISE is not optional for ChainIt: the RFCOMM listener publishes an SDP
+                // record, and publishing needs this permission on Android 12+. Without it the
+                // listener opens, looks healthy in the UI, and the PC's lookup finds nothing -
+                // which is the "Bluetooth still didn't connect" case this release fixes.
+                if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) perms.add(Manifest.permission.BLUETOOTH_ADVERTISE)
             }
             if (Build.VERSION.SDK_INT <= 29 &&
                 checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED

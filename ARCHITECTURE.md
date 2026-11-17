@@ -171,7 +171,7 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
 1. **Android** — `./android/build-apk.sh`
    `aapt2` (resources) → generated `R.kt` → `kotlinc -Xlambdas=class -Xsam-conversions=class` (Kotlin 2.x
    must not emit `invokedynamic`: `dx` cannot lower it for API 26) → `android/tools/verify_dex_safety.py`
-   (stage 1: 208 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
+   (stage 1: 211 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
    stage 3: no source calls an indy-emulated stdlib method; stage 4: no runtime color parsing) →
    `dx --dex` → zipalign-style packer → `apksigner` (v2+v3) with `android/keystore/chainit-release.p12`.
    The script also **fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`** and asserts
@@ -305,9 +305,21 @@ file, and to make every refusal visible instead of failing quietly.
 
 ---
 
-## 7. Bluetooth as a First-Class Drive Transport (v1.4.0)
+## 7. Bluetooth as a First-Class Drive Transport (v1.4.0, rebuilt in v1.8.0)
 
 Before v1.4.0 the RFCOMM link came up and then appeared to do nothing. Three independent causes, all fixed.
+
+v1.8.0 is the second pass, and it started from a user report rather than a design review: *"improve the bluetooth
+connectivity, it still didn't connect — the offline one specifically, it must work smoothly and fast."* Reading the
+code against that complaint turned up seven defects, listed in §7.7 and fixed in §7.8–§7.11. Two of them are
+worth stating up front because they are the kind of bug that survives review:
+
+- the RFCOMM channel cache **was dead code**. It was written, displayed in the UI and cleared on reset, but the
+  function that dials was declared *above* it in this single translation unit and therefore could not read it. In a
+  7,200-line single-TU build, declaration order is not style — it decides whether a feature exists.
+- the phone's listener **needed a permission nobody requested at runtime**. `listenUsingRfcommWithServiceRecord`
+  publishes an SDP record, which on Android 12+ requires `BLUETOOTH_ADVERTISE`; only `BLUETOOTH_CONNECT` was checked
+  or asked for on first run. The listener opened, the UI said `LIVE`, and the PC's lookup found nothing at all.
 
 ### 7.1 Why it looked dead
 
@@ -317,27 +329,41 @@ Before v1.4.0 the RFCOMM link came up and then appeared to do nothing. Three ind
 | The phone served **one request per connection** | Even a reused socket could not carry a second request | `handleStreamSession` loops: parses as many requests as the peer pipelines, frames each response by `Content-Length`/chunked (never by EOF), drains unconsumed bodies, flushes per response |
 | `/dav` **faked success** when the phone did not answer | Explorer mounted `Z:\` and showed an empty synthetic drive - "connected but does nothing" | Real **503 + the actual reason**, logged, transport re-scan forced, published as `linkProblem` in `/api/state`; before any phone has paired, `Z:\` serves one readable `READ ME FIRST` file |
 
+v1.8.0 adds the second table, this time for a link that would not *come up* at all (§7.7).
+
 ### 7.2 Persistent RFCOMM channel pool (Windows)
 
 ```text
-httpRequestToPhone("bt://AA:BB:CC:DD:EE:FF", ...)
-  btAcquireChannel()   -> reuse a parked channel, else btRfcommConnect()
-                          (first dial caches the SDP-discovered RFCOMM channel
-                           number in gBtCachedPort, so later dials skip SDP)
+httpRequestToPhone("bt://AA:BB:CC:DD:EE:FF[:chan]", ...)
+  btAcquireChannel()   -> reuse a parked channel *for this endpoint*, else dial
+                          (every BtChannel remembers the endpoint it was dialled for, so a
+                           channel to one handset is never handed to another)
+  btRfcommConnectWithReason()
+      -> btRfcommConnectResolved(endpoint, addr, channel, deadline, &reason)
+           1. channel from the endpoint text          (no SDP at all)
+           2. channel cached for this handset         (no SDP at all)   <- gBtChannelCache
+           3. SDP query for kChainItPhoneUuid         (slow, authoritative)
+           4. verified blind sweep of channels 1..12  (btProbeChannel must see "HTTP/")
+      one shared deadline: strategies divide the caller's budget, never multiply it
   lock channel.mtx     -> per channel, NOT global: 3 requests run in parallel
   btHttpExchangeOnChannel()
       send request with "Connection: keep-alive"
       read headers byte-at-a-time to CRLFCRLF (never over-reads into the body)
       body from Content-Length, or by de-chunking, or (no framing) to EOF -> drop channel
   btReleaseChannel(ok && keepAliveOk)  -> park for reuse, or close
-  on failure: btPoolReset() and re-dial (up to 3 attempts)
+  on failure: btPoolReset() and re-dial (up to 3 attempts); btSetLastDialError(reason)
 ```
 
 `btPoolReset()` only closes channels marked `inPool`; a channel mid-request is owned by its caller and closed
-by it, so a transport switch can never pull a socket out from under an in-flight transfer.
+by it, so a transport switch can never pull a socket out from under an in-flight transfer. It deliberately
+**keeps** the resolved-channel cache: it runs between retry attempts, and re-running SDP on attempt two is
+exactly the latency the cache exists to remove. Only `btClearChannelCache()` drops it, and only when the radio
+itself disappears.
 
 Telemetry published in `/api/state -> bluetooth`: `pooledChannels`, `maxChannels`, `cachedRfcommChannel`,
-`requestsServed`, `redials`, `lastRttMs`, `keepAlive`.
+`requestsServed`, `redials`, `lastRttMs`, `keepAlive`, and from v1.8.0 `channelCacheEntries`,
+`channelCacheHits`, `channelCacheMisses`, `sdpQueries`, `guessRecoveredLinks`, `lastDialError`,
+`lastDialErrorAgeMs`, `learnedPhoneEndpoint` and `pcBluetoothAddress`.
 
 ### 7.3 Keep-alive session loop (Android)
 
@@ -367,7 +393,125 @@ that is indistinguishable from a dead link. Wrong or missing keys still answer 4
 brute-force lockout. Any of these, plus an unreachable phone, is written to `gState.phoneLinkProblem`, shown
 in an amber banner in the web UI and as the headline of the native hub window.
 
-### 7.6 Attribution
+### 7.6 What still did not connect (the v1.8.0 diagnosis)
+
+Every row below was found by reading the shipped code, not by guessing at radio behaviour. The Windows line
+numbers are from `3856791`, the commit this work branched from.
+
+| # | Defect | Why it produced "did not connect" or "slow" |
+| :-- | :--- | :--- |
+| W1 | The channel cache was **dead code**: `btRfcommConnect()` sat at line 156, `gBtCachedPort` at line 770 | Every dial re-ran a full SDP query. The pool's own comment claimed the lookup was removed from later dials; it was not. This is the whole of the "slow" complaint |
+| W2 | No recovery when SDP resolution failed | A handset whose record was not visible (dozing, re-paired, permission missing, stale stack cache) was simply unreachable, with nothing left to try |
+| W3 | A failed non-blocking connect could be **accepted as success** — `SO_ERROR` was never read after `select()` reported writable | A dead dial came back as a live socket and failed later inside the first request's read timeout, burning the entire budget and one of three retries before anything was known |
+| W4 | No socket buffer tuning on any `AF_BTH` socket | RFCOMM defaults are small and the link is latency-bound, so the window — not the radio — set throughput |
+| W5 | Discovery probed 6 candidates serially, and `httpRequestToPhone` forced `dialTimeout = max(timeoutMs, 12000)` | The caller's "4 s" was fiction: 6 × 12 s = 72 s per cycle on a 3.5 s tick, re-dialling the same dead devices forever, with no backoff. Bluetooth felt hung rather than absent |
+| W6 | Every failure returned a bare `INVALID_SOCKET` with no reason | Radio off, nothing paired, no SDP record, refused and timed out were all the same silence — in a codebase that treats an unexplained refusal as a bug (§7.5, §9.5) |
+| W7 | The cache was one global `ULONG`, not per device | Even once W1 was fixed, handset A's channel would have been tried against handset B first |
+| A1 | `hasBluetoothPermission()` checked only `BLUETOOTH_CONNECT`, and `BLUETOOTH_ADVERTISE` was declared but never requested on first run | `listenUsingRfcommWithServiceRecord` **publishes an SDP record**, which needs `ADVERTISE` on API 31+. The listener opened, the UI said `LIVE`, and the PC's lookup could never resolve it. On its own this reproduces "it didn't connect" |
+| A2 | The phone→PC push had exactly one connect strategy (secure service record) | No recovery from the classic `read failed, socket might closed or timeout, read ret: -1` that a desktop-published record produces on many handsets |
+| A3 | `handleStreamSession` wrapped RFCOMM streams in 8 KiB `Buffered*` defaults | On a latency-bound link every flush is a round trip; the file paths already used 64 KiB arrays |
+| A4 | Nothing told the PC which paired device was the phone | The PC had to enumerate and dial every paired device (W5) to find the one running ChainIt |
+
+### 7.7 The dial path: cached channel, then SDP, then a *verified* sweep
+
+`btRfcommConnectResolved()` runs the strategies cheapest-and-most-likely first, under **one shared deadline**
+so the strategies divide the caller's budget instead of multiplying it:
+
+1. the channel in the endpoint text, if the caller supplied one;
+2. the channel remembered for this handset (`gBtChannelCache`, keyed by the 48-bit address alone — never by an
+   endpoint spelling, so one handset's channel is never tried against another);
+3. an SDP query for `kChainItPhoneUuid` — authoritative and slow; the resolved channel is cached on success;
+4. a bounded sweep of RFCOMM channels 1–12, each candidate **verified** before it is trusted.
+
+Step 4 is the recovery for step 3 failing, which is the ordinary shape of the field report. Guessing is only
+safe because a wrong guess is detectable: `btProbeChannel()` sends the first bytes of a real request and
+requires an HTTP status line back, so a channel belonging to some other service on the handset is closed
+rather than adopted. A link that looks open and answers nothing is worse than an honest failure — it is the
+"connected but dead" failure mode §7.1 was written about. The sweep stops at 12 because Android RFCOMM
+services sit on low channels almost without exception, and a 1–30 sweep would spend the budget guessing.
+
+A cached channel that now **refuses** is forgotten (`btForgetChannel`), because that means the listener moved;
+the next dial goes straight to SDP instead of retrying a dead number first.
+
+`btDialChannel()` reads `SO_ERROR` after `select()` reports writable, fixing W3, and every socket — client,
+server and accepted — goes through `btTuneSocket()` (256 KiB `SO_RCVBUF`/`SO_SNDBUF`), fixing W4.
+
+### 7.8 Discovery: parallel, bounded, and backing off
+
+`bluetoothDiscoveryLoop()` still ticks every 3.5 s, but a cycle now costs the *slowest* handset rather than
+the sum of all of them:
+
+- candidates are dialled **concurrently** (one thread each, capped at 6, first answer wins);
+- the dial budget is the caller's own (3 s) plus a 6 s floor for a genuinely cold first link, instead of a flat
+  12 s per candidate;
+- a handset that keeps refusing is retried on an exponential backoff — 1 s, 2 s, 4 s … capped at 30 s — so a
+  paired-but-absent phone stops being re-dialled forever, while the live endpoint is re-checked every cycle
+  and a working link is never starved by a dead one;
+- when the radio disappears the channel cache is cleared, because no channel number survives an adapter
+  re-initialisation.
+
+On the server side, `WSASetServiceW(RNRSERVICE_REGISTER)` is **retried every 15 s until it succeeds**. The
+receiver binds 0.9 s after startup, when the radio is often not ready; before this, a failed registration left
+the PC listening but unpublished until the process was restarted — invisible to the phone, with the log line
+"SDP publish blocked" as the only hint. A bind failure now logs its own `WSAGetLastError` translation too.
+
+### 7.9 Both ends say who they are
+
+Discovery in both directions used to be a sweep, because neither side published its own address.
+
+| Direction | Published | Consumed |
+| :--- | :--- | :--- |
+| phone → PC | `btAddress` + `btRfcommChannel` in `/chainit/ping` and in the UDP beacon | `btLearnFromPayload()` caches the channel and stores `bt://AA:…:FF:7` as the learned endpoint; the discovery loop dials **that first**, and the UDP loop arms Bluetooth from a beacon heard over Wi-Fi (rate-limited to one attempt per 10 s, skipped while a BT endpoint is live) |
+| PC → phone | `X-ChainIt-Pc-Bt` on **every** HTTP response, plus `pcBluetoothAddress` in `/api/state`; the address comes from the receiver socket's own `getsockname` | `PcVfsClient` persists it and orders the paired list around it; `sendUriOverBluetoothToPairedPc` remembers whichever device answered |
+
+So a PC that has spoken to the phone over Wi-Fi once can arm the Bluetooth link with a single direct dial
+before Wi-Fi goes away — and a phone that has spoken to the PC once pushes to it in one connect instead of one
+failed connect per wrong paired device.
+
+### 7.10 Android: the permission that was never asked for
+
+`bluetoothPermissionProblem()` names the missing permission verbatim — *"Android withheld the Bluetooth
+permission to advertise to nearby devices (BLUETOOTH_ADVERTISE). Grant it in Settings > Apps > ChainIt >
+Permissions, then reopen ChainIt."* — and is checked by the listener before it tries to open one. The setup
+row now requires **both** `CONNECT` and `ADVERTISE`, and `requestInitialRuntimePermissions()` asks for
+`ADVERTISE` on first run, so a fresh install cannot end up listening-but-unpublished. When a `listen*` call
+still throws, the message distinguishes a permission failure from a channel already held by an older instance.
+
+The push and the native PC browser now share one connect chain —
+`BluetoothRfcommTransport.rfcommStrategies(device)`: secure service record, insecure service record, then
+`createRfcommSocket(channel)` by reflection for channels 1–12 — with each attempt labelled, so a failure
+reports *which* strategy failed rather than "no RFCOMM channel could be opened". `PcVfsClient` runs that chain
+inside its existing deadline-bounded dial worker, so it keeps its guarantee of an answer rather than a hang.
+A push verdict now reads the HTTP status line properly (looping until the header terminator, matching on
+`" 200 "`/`" 201 "`) instead of one 512-byte read searched for the substring `"200"`, and a 401/403 is
+reported as a key mismatch with the remedy rather than as a dead link.
+
+`handleStreamSession` wraps RFCOMM streams in 64 KiB buffers, matching the arrays its own file paths use.
+
+### 7.11 Contract test: the property, plus two negative tests
+
+The preview cannot reach a radio, so it does the next best thing: `app/server/btLink.ts` runs the **same
+resolution policy** against a described handset, and the counters in `/api/state -> bluetooth` are results of
+real dials through it. (They used to be constants — `requestsServed: 1284`, `redials: 6`, `lastRttMs: 42` —
+which is the same defect as quoting a nominal transfer speed: a number nobody measured. `requestsServed` now
+only moves when a phone-volume request is actually served while the link is up.)
+
+`selftest.ts` §8 asserts:
+
+- a cold dial resolves by `sdp` and caches the channel; the **next dial reports `cached` and does not increase
+  `sdpQueries`** — the property the whole fix exists for;
+- a handset whose listener moved is re-resolved and the cache follows it;
+- a handset that is `listening` but not `sdpVisible` is rescued by the sweep (`strategy: 'guess'`, counted in
+  `guessRecoveredLinks`), and the engine re-dials **on its own** when radio conditions change under a live link;
+- an endpoint learned from a beacon dials directly with no extra SDP query;
+- with the listener closed the dial fails, `lastDialError` states a specific cause, `activeLink` is empty,
+  `pooledChannels` is 0, and `POST /api/transport/connect-ip` answers **400** with that cause — never a link
+  that looks connected and serves nothing.
+
+Two negative tests prove the assertions bite: deleting the cache read fails with `'sdp' !== 'cached'`, and
+disabling the sweep fails on the rescue assertion. Both were run; both were reverted.
+
+### 7.12 Attribution
 
 **Built by Qmer** - the Windows About tab, the native hub window header and footer, the Android app footer,
 and the `VERSIONINFO` of both exes (`CompanyName = Qmer`, `LegalCopyright = "Built by Qmer"`).
@@ -616,8 +760,8 @@ milliseconds, so "it worked" is observable rather than assumed.
 
 `android/build-apk.sh` fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`, and the
 final `classes.dex` is asserted to contain `PcBrowserActivity`, `PcVfsClient` and `ChainItFileProvider` alongside
-the classes already guarded. `verify_dex_safety.py` still proves all 208 first-party classes (183 at v1.6.0, +25 in
-v1.7.0) are
+the classes already guarded. `verify_dex_safety.py` still proves all 211 first-party classes (183 at v1.6.0, +25 in
+v1.7.0, +3 in v1.8.0 from the shared RFCOMM connect chain) are
 `invokedynamic`-free and that no source touches an indy-emulated stdlib method or parses a colour at runtime.
 
 ### 9.7 Contract test

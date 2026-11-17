@@ -44,12 +44,23 @@ export const AboutView: React.FC<Props> = ({ snapshot }) => {
     },
     {
       label: 'Bluetooth RFCOMM',
-      value: bt?.activeLink ? `live · ${bt.pooledChannels ?? 0}/${bt.maxChannels ?? 3} channels parked` : 'idle',
-      hint: bt?.keepAlive
-        ? `keep-alive on · ${bt.requestsServed ?? 0} requests served · ${bt.redials ?? 0} dials · ${
-            bt.cachedRfcommChannel ? `channel ${bt.cachedRfcommChannel}` : 'SDP each dial'
-          }`
-        : undefined,
+      // A link is reported live only when a dial actually reached the phone. The old line said
+      // "live" whenever a bt:// endpoint was pinned - which is exactly how a link that serves
+      // nothing ends up looking connected.
+      value: bt?.activeLink
+        ? `live · ${bt.pooledChannels ?? 0}/${bt.maxChannels ?? 3} channels parked`
+        : bt?.lastDialError
+          ? 'not connected'
+          : 'idle',
+      hint: bt?.lastDialError
+        ? bt.lastDialError
+        : bt?.keepAlive
+          ? `keep-alive on · ${bt.requestsServed ?? 0} requests served · ${bt.dials ?? bt.redials ?? 0} dials · ${
+              bt.sdpQueries ?? 0
+            } SDP lookups · ${bt.channelCacheHits ?? 0} skipped · ${
+              bt.cachedRfcommChannel ? `channel ${bt.cachedRfcommChannel}` : 'no channel cached yet'
+            }${bt.guessRecoveredLinks ? ` · ${bt.guessRecoveredLinks} rescued by sweep` : ''}`
+          : undefined,
     },
     {
       label: 'Transfer integrity',

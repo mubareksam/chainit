@@ -297,6 +297,145 @@ async function run() {
   }
   console.log('✓ Volumes beyond C:, drive-reach switch, shared-file history and battery telemetry verified');
 
+  // ---------------------------------------------------------------------------------------
+  // 8. Bluetooth RFCOMM: the dial path must be fast, recoverable and honest.
+  //
+  //    "Improve the bluetooth connectivity, it still didn't connect" is not fixed by a nicer
+  //    status line. These assertions pin the behaviour that was broken:
+  //      a. a warm link performs NO further SDP query (the cache is read, not just displayed);
+  //      b. a handset that is listening but published no SDP record is rescued by a verified
+  //         channel sweep instead of being reported unreachable;
+  //      c. the phone's own address+channel, learned from a beacon, is dialled directly;
+  //      d. a closed listener fails with a stated cause, and the snapshot then reports NO
+  //         active link - never a link that looks connected and serves nothing.
+  // ---------------------------------------------------------------------------------------
+  {
+    const HANDSET = 'C4:A1:B1:70:00:0E';
+    const probe = async (body: Record<string, unknown>) =>
+      (
+        await fetch(`${BASE}/api/bluetooth/probe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+      ).json();
+    const env = (patch: Record<string, unknown>) =>
+      fetch(`${BASE}/api/environment/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+
+    await env({ btListenerOpen: true, btSdpVisible: true, btRfcommChannel: 7 });
+
+    // Counters are read as *deltas*: this process may already have dialled (the preview is long
+    // lived, and /api/state is polled), so absolute totals would make the suite depend on being
+    // the first thing to touch the engine. A delta is both robust and the stricter claim - it
+    // says what THIS dial cost, not what the process has cost so far.
+    const baseline = (await (await fetch(`${BASE}/api/state`)).json()).bluetooth;
+
+    // (a) a cold dial has to resolve the channel: SDP answers, and the channel is remembered.
+    const cold = await probe({ endpoint: `bt://${HANDSET}`, forgetCache: true });
+    assert.equal(cold.dial.ok, true, 'the first Bluetooth dial reaches the phone');
+    assert.equal(cold.dial.channel, 7, 'and it lands on the phone\'s real RFCOMM channel');
+    assert.equal(cold.dial.strategy, 'sdp', 'a cold dial resolves through SDP');
+    assert.equal(cold.bluetooth.sdpQueries, baseline.sdpQueries + 1, 'it cost exactly one SDP query');
+    assert.equal(cold.bluetooth.cachedRfcommChannel, 7, 'the resolved channel is cached');
+    assert.equal(cold.bluetooth.channelCacheEntries, 1, 'for this one handset');
+
+    // The whole point of the cache: the next dial must not touch SDP again.
+    const warm = await probe({ endpoint: `bt://${HANDSET}` });
+    assert.equal(warm.dial.ok, true, 'the second dial succeeds too');
+    assert.equal(warm.dial.strategy, 'cached', 'and it reuses the remembered channel');
+    assert.equal(warm.bluetooth.sdpQueries, cold.bluetooth.sdpQueries, 'SDP was NOT queried a second time');
+    assert.equal(warm.bluetooth.channelCacheHits, cold.bluetooth.channelCacheHits + 1, 'the cache hit is counted');
+    assert.ok(
+      Number.isFinite(warm.bluetooth.requestsServed) && Number.isFinite(warm.bluetooth.dials),
+      'served-request and dial telemetry are real numbers, not invented constants'
+    );
+
+    // A stale channel must not be retried forever: it is forgotten and re-resolved.
+    await env({ btRfcommChannel: 9 });
+    const moved = await probe({ endpoint: `bt://${HANDSET}` });
+    assert.equal(moved.dial.ok, true, 'a handset whose listener moved is still reached');
+    assert.equal(moved.dial.channel, 9, 'on its new channel');
+    assert.equal(moved.bluetooth.cachedRfcommChannel, 9, 'and the cache follows it');
+
+    // (b) listening but invisible to SDP - the failure that used to leave the link dead.
+    // Changing the radio conditions under a pinned link makes the engine re-dial (that is the
+    // correct behaviour, and it is what the native discovery loop does), so the rescue counter is
+    // compared as a delta: this dial must add exactly one, whatever the previous total was.
+    await env({ btSdpVisible: false, btRfcommChannel: 5 });
+    // Changing the radio under a pinned link re-dials it immediately, and with SDP now invisible
+    // that re-dial has to be rescued by the sweep on its own. Assert that too: a link that only
+    // recovers on the next manual probe is not a link that "works smoothly".
+    const afterRadioChange = (await (await fetch(`${BASE}/api/state`)).json()).bluetooth;
+    assert.ok(
+      afterRadioChange.guessRecoveredLinks > moved.bluetooth.guessRecoveredLinks,
+      'the engine re-dials on its own when the radio conditions change under a live link'
+    );
+    const rescuesBefore = afterRadioChange.guessRecoveredLinks;
+    const swept = await probe({ endpoint: `bt://${HANDSET}`, forgetCache: true });
+    assert.equal(swept.dial.ok, true, 'a phone with no SDP record is still reachable');
+    assert.equal(swept.dial.strategy, 'guess', 'by the verified channel sweep');
+    assert.equal(swept.dial.channel, 5, 'which finds the channel the listener is really on');
+    assert.equal(
+      swept.bluetooth.guessRecoveredLinks,
+      rescuesBefore + 1,
+      'and this dial is counted as exactly one rescue'
+    );
+
+    // (c) the phone reports itself, so the PC dials the channel with no SDP and no sweep.
+    const beforeQueries = swept.bluetooth.sdpQueries;
+    const learned = await (
+      await fetch(`${BASE}/api/bluetooth/learn`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ btAddress: 'c4-a1-b1-70-00-0e', btRfcommChannel: 5, btListening: true }),
+      })
+    ).json();
+    assert.equal(
+      learned.learnedEndpoint,
+      `bt://${HANDSET}:5`,
+      'the beacon\'s address and channel become a directly dialable endpoint'
+    );
+    const direct = await probe({ endpoint: `bt://${HANDSET}:5` });
+    assert.equal(direct.dial.ok, true, 'the explicit channel connects');
+    assert.equal(direct.dial.strategy, 'explicit', 'with no resolution step at all');
+    assert.equal(direct.bluetooth.sdpQueries, beforeQueries, 'and no extra SDP query');
+
+    // (d) a closed listener must fail loudly and must NOT be reported as an active link.
+    await env({ btListenerOpen: false });
+    const dead = await probe({ endpoint: `bt://${HANDSET}` });
+    assert.equal(dead.dial.ok, false, 'a closed listener does not connect');
+    assert.ok(dead.dial.error.length > 10, 'and the failure states a cause');
+    assert.ok(
+      dead.dial.error.toLowerCase().includes('listener') ||
+        dead.dial.error.toLowerCase().includes('refused'),
+      `the cause is specific, not generic (got: ${dead.dial.error})`
+    );
+    assert.equal(dead.bluetooth.lastDialError, dead.dial.error, 'the snapshot carries the same cause');
+    assert.equal(dead.bluetooth.activeLink, '', 'no link is claimed while the dial fails');
+    assert.equal(dead.bluetooth.pooledChannels, 0, 'and no channel is parked for it');
+
+    // A manual connect must refuse rather than pretend.
+    const refused = await fetch(`${BASE}/api/transport/connect-ip`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phoneIp: `bt://${HANDSET}` }),
+    });
+    assert.equal(refused.status, 400, 'connect-ip does not report a link that did not come up');
+    const refusedBody = (await refused.json()) as { error?: string };
+    assert.ok(refusedBody.error && refusedBody.error.length > 20, 'and it says why');
+
+    // Restore a working radio for the rest of the suite.
+    await env({ btListenerOpen: true, btSdpVisible: true, btRfcommChannel: 7 });
+    const restored = await probe({ endpoint: `bt://${HANDSET}`, forgetCache: true });
+    assert.equal(restored.dial.ok, true, 'the link comes back once the listener reopens');
+    assert.equal(restored.bluetooth.lastDialError, '', 'and the failure is cleared, not sticky');
+  }
+  console.log('✓ Bluetooth RFCOMM dial policy verified (cache-first, SDP fallback, verified sweep, honest failure)');
+
   // Clean up test copy & restore clean default preview state
   await fetch(`${BASE}/api/vfs/phone/delete`, {
     method: 'POST',

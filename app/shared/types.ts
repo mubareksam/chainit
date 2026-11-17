@@ -67,6 +67,18 @@ export interface EnvironmentSimulation {
   phoneSeenMs?: number;
   /** False when the last report is older than three minutes - the number is then history, not live. */
   phoneTelemetryLive?: boolean;
+  /**
+   * Bluetooth radio simulation (v1.8.0). The preview has no radio, so these three knobs describe
+   * the handset the dial policy should behave as though is paired. They exist so the *policy* can
+   * be exercised and asserted - a listener that is open but published no SDP record is the failure
+   * that used to leave the native link dead with nothing to explain it.
+   */
+  /** Whether the phone's ChainIt RFCOMM listener is open at all. Default true. */
+  btListenerOpen?: boolean;
+  /** Whether that listener published an SDP record. Default true; false forces the channel sweep. */
+  btSdpVisible?: boolean;
+  /** The RFCOMM channel the simulated listener sits on. Default 7. */
+  btRfcommChannel?: number;
 }
 
 /**
@@ -164,12 +176,40 @@ export interface BluetoothLinkInfo {
   /** Persistent keep-alive RFCOMM channels parked and ready to reuse. */
   pooledChannels?: number;
   maxChannels?: number;
-  /** RFCOMM channel number cached from the first SDP query (skips later lookups). */
+  /**
+   * RFCOMM channel number remembered for the handset, so later dials skip SDP entirely.
+   * 0 means nothing is cached yet and the next dial has to resolve it.
+   */
   cachedRfcommChannel?: number;
   requestsServed?: number;
   redials?: number;
   lastRttMs?: number;
   keepAlive?: boolean;
+  /** v1.8.0 dial telemetry - all of it counted from real dials, none of it nominal. */
+  /** Handsets with a channel remembered. */
+  channelCacheEntries?: number;
+  /** Dials that reused a remembered channel and therefore ran no SDP query. */
+  channelCacheHits?: number;
+  /** Dials that had to resolve a channel from scratch. */
+  channelCacheMisses?: number;
+  /** SDP queries actually performed. A warm link must not increase this. */
+  sdpQueries?: number;
+  /** Links rescued by the verified blind sweep after SDP found nothing. */
+  guessRecoveredLinks?: number;
+  /** Total dials attempted, and how many of them reached a ChainIt listener. */
+  dials?: number;
+  dialSuccesses?: number;
+  /** Keep-alive channels handed straight back with no dial at all. */
+  pooledReuses?: number;
+  /**
+   * Why the last dial failed, in words, or '' when it succeeded. Never a fake status: a link
+   * that looks connected but serves nothing is the failure this field exists to prevent.
+   */
+  lastDialError?: string;
+  /** Which resolution step produced the current link: explicit | cached | sdp | guess | none. */
+  lastDialStrategy?: string;
+  /** Endpoint the phone reported for itself, so the PC dials it directly instead of sweeping. */
+  learnedEndpoint?: string;
 }
 
 export interface SystemSnapshot {

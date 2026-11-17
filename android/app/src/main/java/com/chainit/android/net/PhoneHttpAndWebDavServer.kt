@@ -6,6 +6,7 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
+import com.chainit.android.service.SiblingDaemonService
 import com.chainit.android.vfs.AndroidStorageVfsProvider
 import com.chainit.android.vfs.FileOps
 import org.json.JSONArray
@@ -267,8 +268,12 @@ class PhoneHttpAndWebDavServer(
         viaBluetooth: Boolean,
         closeable: java.io.Closeable? = null
     ) {
-        val input = BufferedInputStream(rawInput)
-        val output = BufferedOutputStream(rawOutput)
+        // 64 KiB, not the 8 KiB default. An RFCOMM link is latency-bound: every buffer flush
+        // is a round trip over the radio, so a narrow buffer caps throughput no matter how fast
+        // the file path underneath is. This matches the 64 KiB arrays the file handlers already
+        // use, and it is what makes a Bluetooth transfer behave like a LAN one.
+        val input = BufferedInputStream(rawInput, 64 * 1024)
+        val output = BufferedOutputStream(rawOutput, 64 * 1024)
         startSessionSweeper()
 
         val session = Session(closeable)
@@ -415,6 +420,14 @@ class PhoneHttpAndWebDavServer(
                 obj.put("screenLocked", !pm.isInteractive || km.isKeyguardLocked)
                 obj.put("totalBytes", totalB)
                 obj.put("usedBytes", usedB)
+                // v1.8.0: the PC dials this phone over Bluetooth by *address*. Without these two
+                // fields it had to enumerate every paired device and dial each one, which is what
+                // made Bluetooth discovery feel hung. With them, one dial reaches the right phone,
+                // and the channel number lets the PC skip the SDP query entirely.
+                val btAddr = BluetoothRfcommTransport.localAddress(context)
+                if (btAddr != null) obj.put("btAddress", btAddr)
+                obj.put("btRfcommChannel", SiblingDaemonService.bluetoothChannel())
+                obj.put("btListening", SiblingDaemonService.isBluetoothListening())
                 sendJson(output, 200, obj)
             }
 
