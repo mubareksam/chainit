@@ -6,6 +6,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { DriveTarget, SelectionMode, TransportId } from '../shared/types.js';
 import { engine } from './engineState.js';
+import { btLinkModel } from './btLink.js';
 import { ensureSeededStorage } from './seedStorage.js';
 import {
   createNewFolder,
@@ -118,7 +119,7 @@ const normalizeBtLink = (raw: string): string | null => {
   return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
 };
 
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 
 app.get('/api/app/version', (_req, res) => {
   res.json({ version: APP_VERSION, runtime: 'node-preview', channel: 'stable' });
@@ -147,6 +148,34 @@ app.post('/api/app/update', (_req, res) => {
   });
 });
 
+/**
+ * Counts a request that the preview really served over the simulated Bluetooth link.
+ *
+ * `requestsServed` used to be a hard-coded 1284 whenever a bt:// endpoint was pinned - a number
+ * nobody measured. It now only moves when a phone-volume request is served while the link is up,
+ * which is the same thing the native engine's counter means: HTTP exchanges over a parked RFCOMM
+ * keep-alive channel, no dial involved.
+ */
+app.use((req, _res, next) => {
+  try {
+    const overBluetooth =
+      engine.btLinkUp &&
+      engine.activeTransportId === 'bluetooth' &&
+      engine.manualPhoneEndpoint.startsWith('bt://');
+    const phonePath =
+      req.path.startsWith('/api/vfs/phone') ||
+      req.path.startsWith('/chainit/') ||
+      req.path.startsWith('/dav') ||
+      req.path.startsWith('/raw') ||
+      req.path.startsWith('/api/vfs/list') ||
+      req.path.startsWith('/api/vfs/text');
+    if (overBluetooth && phonePath) btLinkModel.noteReusedRequest();
+  } catch {
+    /* telemetry must never break a request */
+  }
+  next();
+});
+
 app.post('/api/transport/connect-ip', (req, res) => {
   const { phoneIp, siblingKey } = (req.body || {}) as { phoneIp?: string; siblingKey?: string };
   if (!phoneIp || !phoneIp.trim()) {
@@ -161,10 +190,28 @@ app.post('/api/transport/connect-ip', (req, res) => {
     engine.environment.bluetoothEnabled = true;
     engine.manualPhoneEndpoint = btLink;
     engine.recomputeState();
+
+    // Dial it for real through the resolution policy, and refuse to claim a link that did not
+    // come up. The native engine now does the same: a failure names its cause (radio off, nothing
+    // paired, no SDP record, refused, timed out) instead of reporting "connected" and serving
+    // nothing - which is precisely how "Bluetooth does not work" gets reported by a user.
+    const dial = engine.refreshBluetoothLink() ?? engine.dialBluetoothEndpoint(btLink, { force: true });
+    if (!dial.ok) {
+      engine.addLog(
+        'BLUETOOTH',
+        `Manual Bluetooth link failed -> ${btLink}`,
+        `${dial.error}. Pair the phone with this PC, keep ChainIt-Android.apk running, and make sure Bluetooth is ON on both devices.`
+      );
+      engine.broadcast('snapshot');
+      res.status(400).json({ error: `Could not open a native RFCOMM link to ${btLink} - ${dial.error}` });
+      return;
+    }
+
     engine.addLog(
       'BLUETOOTH',
-      `Native Bluetooth RFCOMM link pinned -> ${btLink}`,
-      'AF_BTH socket to phone UUID c4a1b170-0001-4000-8000-00805f9b34fb; Z:\\ VFS + WebDAV now run over Bluetooth alone.'
+      `Native Bluetooth RFCOMM link pinned -> ${dial.endpoint}`,
+      `Resolved by ${dial.strategy} channel ${dial.channel} (SDP queries so far: ${btLinkModel.sdpQueries}). ` +
+        'AF_BTH socket to phone UUID c4a1b170-0001-4000-8000-00805f9b34fb; Z:\\ VFS + WebDAV now run over Bluetooth alone.'
     );
     engine.broadcast('snapshot');
     res.json(engine.getSnapshot());
@@ -183,10 +230,63 @@ app.post('/api/transport/connect-ip', (req, res) => {
   res.json(engine.getSnapshot());
 });
 
+/**
+ * Forces one Bluetooth dial and reports exactly what the resolution policy did.
+ *
+ * This is the endpoint the contract test uses to prove the fix rather than assert a shape:
+ * a second dial to the same handset must reuse the remembered channel and perform **no** further
+ * SDP query, and a handset that is listening but published no record must be rescued by the
+ * verified sweep instead of being reported as unreachable.
+ */
+app.post('/api/bluetooth/probe', (req, res) => {
+  const body = (req.body || {}) as { endpoint?: string; forgetCache?: boolean };
+  const endpoint = normalizeBtLink(body.endpoint || engine.manualPhoneEndpoint || '');
+  if (!endpoint) {
+    res.status(400).json({ error: 'A Bluetooth endpoint is required, e.g. bt://AA:BB:CC:DD:EE:FF' });
+    return;
+  }
+  engine.environment.bluetoothEnabled = true;
+  engine.manualPhoneEndpoint = endpoint;
+  engine.recomputeState();
+  // One call, one dial - so the counters this endpoint reports are the counters that dial moved.
+  const dial = engine.dialBluetoothEndpoint(endpoint, {
+    force: true,
+    forgetCache: body.forgetCache === true,
+  });
+  res.json({ dial, bluetooth: engine.getSnapshot().bluetooth });
+});
+
+/**
+ * Teaches the PC the phone's own Bluetooth address and RFCOMM channel, exactly as the UDP beacon
+ * and the ping reply do. Afterwards the PC dials that channel directly instead of resolving SDP
+ * or sweeping - which is the difference between a link that comes up in one dial and one that
+ * takes seconds to find.
+ */
+app.post('/api/bluetooth/learn', (req, res) => {
+  const learned = btLinkModel.learnFromPayload((req.body || {}) as Record<string, unknown>);
+  const snapshot = engine.getSnapshot();
+  if (learned) {
+    engine.addLog(
+      'BLUETOOTH',
+      `Phone reported its Bluetooth endpoint: ${learned}`,
+      'ChainIt can now dial the RFCOMM channel directly, with no SDP query and no paired-device sweep.'
+    );
+    engine.broadcast('snapshot');
+  }
+  res.json({ learned, learnedEndpoint: btLinkModel.learnedEndpoint, bluetooth: snapshot.bluetooth });
+});
+
 app.post('/api/environment/update', (req, res) => {
   const patch = req.body || {};
   const prevEnv = { ...engine.environment };
   Object.assign(engine.environment, patch);
+
+  // Bluetooth conditions changing under a pinned link is exactly when the native engine re-dials:
+  // the listener closed, the radio was toggled, the channel moved. Do it here, once, deliberately.
+  const btTouched =
+    'btListenerOpen' in patch || 'btSdpVisible' in patch || 'btRfcommChannel' in patch ||
+    'bluetoothEnabled' in patch;
+  if (btTouched) engine.refreshBluetoothLink();
 
   if (prevEnv.usbPlugged !== engine.environment.usbPlugged) {
     engine.addLog(

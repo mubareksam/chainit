@@ -108,6 +108,13 @@ class SiblingDaemonService : Service() {
 
         fun bluetoothLastError(): String? = activeBluetooth?.lastError
 
+        /**
+         * The RFCOMM channel the phone's listener sits on, or 0 when the platform will not say.
+         * Published to the PC so it can dial the channel directly instead of re-resolving SDP on
+         * every request.
+         */
+        fun bluetoothChannel(): Int = activeBluetooth?.rfcommChannel ?: 0
+
         fun bluetoothSessions(): Long = activeBluetooth?.acceptedSessions ?: 0L
 
         fun openVfsSessions(): Int = activeServer?.openSessions ?: 0

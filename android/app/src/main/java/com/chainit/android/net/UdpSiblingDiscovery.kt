@@ -4,6 +4,7 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
+import com.chainit.android.service.SiblingDaemonService
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.DatagramPacket
@@ -133,6 +134,15 @@ class UdpSiblingDiscovery(
         json.put("siblingEnabled", isSiblingEnabled())
         json.put("authTag", computeAuthToken(key, epoch))
         json.put("endpoints", endpointsArr)
+        // v1.8.0: the phone's own Bluetooth address and RFCOMM channel travel in the beacon, so a
+        // PC that hears it over Wi-Fi can arm the Bluetooth link *before* Wi-Fi goes away - and can
+        // dial the channel directly instead of re-running an SDP query. This is what turns the PC's
+        // six-device paired sweep into one dial.
+        val btAddr = BluetoothRfcommTransport.localAddress(context)
+        if (btAddr != null) json.put("btAddress", btAddr)
+        val btChan = SiblingDaemonService.bluetoothChannel()
+        if (btChan > 0) json.put("btRfcommChannel", btChan)
+        json.put("btListening", SiblingDaemonService.isBluetoothListening())
         return json.toString().toByteArray(Charsets.UTF_8)
     }
 

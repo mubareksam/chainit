@@ -46,7 +46,7 @@ import {
 } from './utils/format';
 
 /** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
-export const APP_VERSION = '1.7.0';
+export const APP_VERSION = '1.8.0';
 
 type MainTab = 'explorer' | 'connectivity' | 'sibling' | 'about';
 type ExplorerLayout = 'dual' | 'single_z';

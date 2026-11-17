@@ -17,6 +17,7 @@ import {
   PcVolume,
 } from '../shared/types.js';
 import { executeCopyOrMove, getDriveStats, listVolumes } from './vfsService.js';
+import { BtDialStrategy, btLinkModel, parseBtEndpoint } from './btLink.js';
 import { RUNTIME_ROOT } from './seedStorage.js';
 
 /**
@@ -83,6 +84,102 @@ class ChainItEngine {
   siblingKey = 'CHAINIT-SIBLING';
   /** Manually pinned endpoint: an IPv4 address or a native Bluetooth link such as bt://AA:BB:CC:DD:EE:FF */
   manualPhoneEndpoint = '';
+
+  /**
+   * Bluetooth link state produced by real dials through `btLinkModel` - never assumed.
+   * `btLinkUp` is false until a dial reached the simulated handset's ChainIt listener.
+   */
+  btLinkUp = false;
+  btActiveEndpoint = '';
+  btLastStrategy: BtDialStrategy = 'none';
+  private btDialedEndpoint = '';
+  /** Endpoint + radio conditions the current link was dialled under, so a change forces a re-dial. */
+  private btDialedSignature = '';
+
+  /**
+   * Points the link model at the handset the pinned endpoint names, using the radio conditions
+   * from the environment simulation. Called before every dial and before every snapshot, so the
+   * model and the reported state can never disagree about what the radio is doing.
+   */
+  private syncBtHandset() {
+    const parsed = parseBtEndpoint(this.manualPhoneEndpoint);
+    if (this.manualPhoneEndpoint.startsWith('bt://') && this.environment.bluetoothEnabled && parsed) {
+      btLinkModel.setHandset({
+        address: parsed.address,
+        listening: this.environment.btListenerOpen !== false,
+        channel: this.environment.btRfcommChannel ?? 7,
+        sdpVisible: this.environment.btSdpVisible !== false,
+      });
+      return;
+    }
+    btLinkModel.setHandset(null);
+    this.btLinkUp = false;
+    this.btActiveEndpoint = '';
+    this.btDialedSignature = '';
+    this.btDialedEndpoint = '';
+  }
+
+  /**
+   * Dials (or reuses the keep-alive channel for) a bt:// endpoint and records the outcome.
+   * Returns the dial result so callers - the connect handler, the probe endpoint - can report
+   * the actual cause of a failure instead of a generic "could not connect".
+   */
+  dialBluetoothEndpoint(
+    endpoint: string,
+    options: { forgetCache?: boolean; force?: boolean } = {}
+  ) {
+    if (options.forgetCache) {
+      const parsed = parseBtEndpoint(endpoint);
+      if (parsed) btLinkModel.forgetChannel(parsed.address);
+      this.btDialedEndpoint = '';
+    }
+    this.syncBtHandset();
+    const alreadyUp = !options.force && this.btLinkUp && this.btDialedEndpoint === endpoint;
+    if (alreadyUp) {
+      // The native engine keeps three RFCOMM channels open and serves a whole browsing session
+      // over them, so a warm link costs no dial at all. Nothing is counted here: served-request
+      // totals are incremented where a phone request is actually served (see index.ts).
+      return {
+        ok: true,
+        endpoint: this.btActiveEndpoint,
+        channel: btLinkModel.cachedChannel(parseBtEndpoint(endpoint)?.address ?? ''),
+        strategy: 'cached' as BtDialStrategy,
+        error: '',
+        durationMs: 0,
+        reused: true,
+      };
+    }
+    const result = btLinkModel.dial(endpoint);
+    this.btLastStrategy = result.strategy;
+    this.btLinkUp = result.ok;
+    this.btActiveEndpoint = result.ok ? result.endpoint : '';
+    this.btDialedEndpoint = endpoint;
+    // Record the radio conditions this dial was made under, so a later refresh knows whether
+    // anything actually changed. Without this a re-dial would happen on every refresh.
+    this.btDialedSignature = `${endpoint}|${this.environment.btListenerOpen !== false}|${
+      this.environment.btSdpVisible !== false
+    }|${this.environment.btRfcommChannel ?? 7}`;
+    return { ...result, reused: false };
+  }
+
+  /**
+   * Re-dials the pinned Bluetooth endpoint after something changed underneath it - the radio was
+   * toggled, the listener closed, the channel moved. Returns null when no Bluetooth endpoint is
+   * pinned, so callers can tell "nothing to do" from "the dial failed".
+   */
+  refreshBluetoothLink() {
+    if (!this.manualPhoneEndpoint.startsWith('bt://') || !this.environment.bluetoothEnabled) {
+      return null;
+    }
+    const signature = `${this.manualPhoneEndpoint}|${this.environment.btListenerOpen !== false}|${
+      this.environment.btSdpVisible !== false
+    }|${this.environment.btRfcommChannel ?? 7}`;
+    if (signature === this.btDialedSignature && this.btLinkUp) {
+      return null;   // unchanged and already up: no dial, no counters moved
+    }
+    this.btDialedSignature = signature;
+    return this.dialBluetoothEndpoint(this.manualPhoneEndpoint, { force: true });
+  }
 
   private wsClients = new Set<WebSocket>();
 
@@ -673,6 +770,15 @@ class ChainItEngine {
     }));
 
     const btLive = this.manualPhoneEndpoint.startsWith('bt://') && this.environment.bluetoothEnabled;
+    const btParsed = parseBtEndpoint(this.manualPhoneEndpoint);
+    const btAddress = btParsed?.address ?? '';
+    const btPaired = btAddress ? [`bt://${btAddress}`] : [];
+
+    // Keep the simulated handset in step with the environment knobs. This never dials: building a
+    // snapshot is not traffic, and polling /api/state must not add dials, SDP queries or served
+    // requests, or the counters would measure the UI's refresh rate instead of the link. Dials are
+    // deliberate acts - see refreshBluetoothLink().
+    this.syncBtHandset();
 
     return {
       selectionMode: this.selectionMode,
@@ -716,17 +822,32 @@ class ChainItEngine {
         receiverRfcommChannel: this.environment.bluetoothEnabled ? 12 : 0,
         phoneServerUuid: 'c4a1b170-0001-4000-8000-00805f9b34fb',
         pcReceiverUuid: 'c4a1b170-0002-4000-8000-00805f9b34fb',
-        activeLink: this.manualPhoneEndpoint.startsWith('bt://') ? this.manualPhoneEndpoint : '',
-        pairedDevices: this.manualPhoneEndpoint.startsWith('bt://') ? [this.manualPhoneEndpoint] : [],
-        // The real engine keeps three persistent RFCOMM channels open and reuses them as
-        // HTTP/1.1 keep-alive sessions; the preview mirrors that shape so the UI is honest.
-        pooledChannels: btLive ? 3 : 0,
+        // Only a link that actually dialled successfully is reported as active. The previous
+        // block printed a fixed set of plausible numbers (1284 requests served, 42 ms RTT,
+        // channel 7 cached) whenever a bt:// endpoint was pinned - figures nobody measured,
+        // which is the same defect as quoting a nominal transfer speed.
+        activeLink: btLive && this.btLinkUp ? this.btActiveEndpoint : '',
+        pairedDevices: btPaired,
+        pooledChannels: btLive && this.btLinkUp ? 3 : 0,
         maxChannels: 3,
-        cachedRfcommChannel: btLive ? 7 : 0,
-        requestsServed: btLive ? 1284 : 0,
-        redials: btLive ? 6 : 0,
-        lastRttMs: btLive ? 42 : 0,
+        // Every counter below comes from btLinkModel, which runs the same resolution policy as
+        // the native engine: cached channel first, then SDP, then a verified sweep.
+        cachedRfcommChannel: btLinkModel.cachedChannel(btAddress),
+        requestsServed: btLinkModel.requestsServed,
+        redials: btLinkModel.dials,
+        lastRttMs: btLinkModel.lastRttMs,
         keepAlive: true,
+        channelCacheEntries: btLinkModel.cacheEntries,
+        channelCacheHits: btLinkModel.hits,
+        channelCacheMisses: btLinkModel.misses,
+        sdpQueries: btLinkModel.sdpQueries,
+        guessRecoveredLinks: btLinkModel.guessRecovered,
+        dials: btLinkModel.dials,
+        dialSuccesses: btLinkModel.successes,
+        pooledReuses: btLinkModel.pooledReuses,
+        lastDialError: btLinkModel.lastDialError,
+        lastDialStrategy: this.btLastStrategy,
+        learnedEndpoint: btLinkModel.learnedEndpoint,
       },
       // Empty means the link is genuinely serving files; the native engine fills this in with the
       // exact reason when Z:\ is up but nothing comes back.

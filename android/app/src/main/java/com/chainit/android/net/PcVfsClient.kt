@@ -524,7 +524,7 @@ object PcVfsClient {
         var lanProblem: String? = null
 
         if (target.ip.isNotBlank()) {
-            val out = lanCall(target, method, pathAndQuery, body, bodySource, key, lanReadMs, sink, onUploadProgress, onDownloadProgress)
+            val out = lanCall(context, target, method, pathAndQuery, body, bodySource, key, lanReadMs, sink, onUploadProgress, onDownloadProgress)
             // A 4xx/5xx is an answer, not a transport failure — never re-ask over Bluetooth.
             if (out.status > 0) return Reply(out.status, out.body, Transport.LAN, out.rttMs, out.problem)
             lanProblem = out.problem
@@ -550,6 +550,7 @@ object PcVfsClient {
     )
 
     private fun lanCall(
+        context: Context,
         target: Target,
         method: String,
         pathAndQuery: String,
@@ -586,6 +587,12 @@ object PcVfsClient {
             }
 
             val status = conn.responseCode
+            // The PC publishes its own Bluetooth address on every reply. Learning it here means a
+            // later Bluetooth request dials that one device instead of walking the whole paired
+            // list - which is what makes the offline path feel as quick as the Wi-Fi one.
+            runCatching { conn.getHeaderField("X-ChainIt-Pc-Bt") }.getOrNull()?.let { pcBt ->
+                if (pcBt.isNotBlank()) BluetoothRfcommTransport.rememberPcAddress(context, pcBt.trim())
+            }
             val out = Outcome()
             out.status = status
             out.rttMs = System.currentTimeMillis() - started
@@ -698,9 +705,22 @@ object PcVfsClient {
         runCatching { adapter.cancelDiscovery() }
 
         var lastProblem = "no paired PC answered ChainIt's Bluetooth service"
+        // The PC this phone has already spoken to goes first. With several paired devices the old
+        // order made a Bluetooth request cost one failed connect per wrong device before it even
+        // reached the right one.
+        val knownPc = BluetoothRfcommTransport.rememberedPcAddress(context)
+        val ordered = ArrayList<BluetoothDevice>()
         for (device in bonded) {
+            val addr = runCatching { device.address }.getOrNull()?.uppercase()
+            if (knownPc != null && addr == knownPc) ordered.add(0, device) else ordered.add(device)
+        }
+        for (device in ordered) {
             val outcome = btCallDevice(device, method, pathAndQuery, body, bodySource, key, readMs, sink, onUploadProgress, onDownloadProgress)
-            if (outcome.status > 0) return outcome
+            if (outcome.status > 0) {
+                // It answered: dial this one first from now on.
+                runCatching { device.address }.getOrNull()?.let { BluetoothRfcommTransport.rememberPcAddress(context, it) }
+                return outcome
+            }
             if (outcome.problem != null) lastProblem = outcome.problem ?: lastProblem
         }
         return Outcome(problem = lastProblem)
@@ -722,31 +742,44 @@ object PcVfsClient {
         val started = System.currentTimeMillis()
         var sock: BluetoothSocket? = null
         try {
-            sock = openRfcomm(device)
-                ?: return Outcome(problem = "no RFCOMM channel could be opened to ${deviceLabel(device)}")
-
             // connect() can block for tens of seconds against a radio that is paired but asleep, so
-            // dial on a worker and give up after BT_CONNECT_MS: the user gets an answer, never a hang.
-            val dialSock = sock
+            // the whole strategy chain runs on a worker with one deadline: the user gets an answer,
+            // never a hang. Secure service record first, then the insecure variant, then explicit
+            // channels - because a Windows-published record is exactly what the secure API often
+            // refuses, and "no RFCOMM channel could be opened" used to be the end of the story.
+            val connected = AtomicReference<BluetoothSocket?>(null)
             val dialError = AtomicReference<String?>(null)
             val dialer = Thread {
-                try {
-                    dialSock.connect()
-                } catch (t: Throwable) {
-                    dialError.set(t.javaClass.simpleName)
+                val attempts = ArrayList<String>()
+                for (entry in BluetoothRfcommTransport.rfcommStrategies(device)) {
+                    if (System.currentTimeMillis() - started > BT_CONNECT_MS) break
+                    val candidate = entry.second()
+                    if (candidate == null) {
+                        attempts.add("${entry.first}: no socket")
+                        continue
+                    }
+                    try {
+                        candidate.connect()
+                        connected.set(candidate)
+                        return@Thread
+                    } catch (t: Throwable) {
+                        attempts.add("${entry.first}: ${t.javaClass.simpleName}")
+                        runCatching { candidate.close() }
+                    }
                 }
+                dialError.set(if (attempts.isEmpty()) "no strategy was tried" else attempts.last())
             }
             dialer.isDaemon = true
             dialer.name = "ChainItBtDial"
             dialer.start()
             dialer.join(BT_CONNECT_MS.toLong())
             if (dialer.isAlive) {
-                runCatching { sock.close() }
+                runCatching { connected.get()?.close() }
                 return Outcome(problem = "${deviceLabel(device)} did not accept the Bluetooth link within ${BT_CONNECT_MS / 1000} s")
             }
-            if (dialError.get() != null) {
-                runCatching { sock.close() }
-                return Outcome(problem = "${deviceLabel(device)} refused ChainIt's Bluetooth service (${dialError.get()})")
+            sock = connected.get()
+            if (sock == null) {
+                return Outcome(problem = "${deviceLabel(device)} refused ChainIt's Bluetooth service (${dialError.get() ?: "no channel answered"})")
             }
 
             // The PC reads a fixed Content-Length, so the length must be known before dialling in.
@@ -828,19 +861,6 @@ object PcVfsClient {
             return Outcome(problem = "the Bluetooth request to ${deviceLabel(device)} failed (${t.javaClass.simpleName})")
         } finally {
             runCatching { sock?.close() }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun openRfcomm(device: BluetoothDevice): BluetoothSocket? {
-        return try {
-            device.createRfcommSocketToServiceRecord(BluetoothRfcommTransport.CHAINIT_PC_UUID)
-        } catch (_: Throwable) {
-            try {
-                device.createInsecureRfcommSocketToServiceRecord(BluetoothRfcommTransport.CHAINIT_PC_UUID)
-            } catch (_: Throwable) {
-                null
-            }
         }
     }
 

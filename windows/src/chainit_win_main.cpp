@@ -32,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "embedded_assets.h"
@@ -152,51 +153,214 @@ static std::string normalizeBtEndpoint(const std::string& in) {
     return "bt://" + btAddrToString(addr);
 }
 
-// Opens a native RFCOMM socket to the phone's ChainIt service (SDP resolved by the Windows stack).
-static SOCKET btRfcommConnect(const std::string& endpoint, int timeoutMs) {
-    BTH_ADDR addr = 0;
-    ULONG port = 0;
-    if (!parseBtEndpoint(endpoint, &addr, &port)) return INVALID_SOCKET;
+/* =========================================================================
+ *  Resolved RFCOMM channel cache
+ *
+ *  An SDP query for kChainItPhoneUuid is a round trip over the radio: tens to
+ *  hundreds of milliseconds when the phone is awake, seconds when it is not - and
+ *  it answers the same question every time (which channel does this handset's
+ *  listener sit on?). That answer only changes when the phone re-registers its
+ *  service, so it is cached per device address and reused by every later dial.
+ *
+ *  The helpers live here, above the dial path, because a cache is only worth
+ *  anything if the function that dials can read it. It previously could not: the
+ *  single cached value was declared further down this translation unit, was
+ *  written by the pool and shown in the status JSON, and was never consulted - so
+ *  every dial paid a full SDP query and the second Bluetooth request was exactly
+ *  as slow as the first. Declaration order in a single-TU build is load-bearing
+ *  (ARCHITECTURE 8.2), and this is the case that proves it.
+ *
+ *  The table is keyed by the 48-bit address alone, never by an endpoint spelling,
+ *  so a channel remembered for one handset is never tried against another.
+ * ========================================================================= */
+
+static std::mutex gBtChannelCacheMtx;
+static std::unordered_map<unsigned long long, ULONG> gBtChannelCache;   ///< addr -> RFCOMM channel
+static std::atomic<ULONG> gBtCachedPort{0};          ///< last resolved channel (status/UI)
+static std::atomic<uint64_t> gBtChannelCacheHits{0};
+static std::atomic<uint64_t> gBtChannelCacheMisses{0};
+static std::atomic<uint64_t> gBtSdpQueries{0};
+static std::atomic<uint64_t> gBtGuessRecovered{0};   ///< links rescued by the verified sweep
+
+/// Remembers the channel a handset actually answered on.
+static void btCacheChannel(BTH_ADDR addr, ULONG channel) {
+    if (channel < BT_PORT_MIN || channel > BT_PORT_MAX) return;
+    std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
+    gBtChannelCache[static_cast<unsigned long long>(addr)] = channel;
+    gBtCachedPort.store(channel);
+}
+
+/// Returns the channel this handset last answered on, or 0 when it is unknown.
+static ULONG btCachedChannel(BTH_ADDR addr) {
+    std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
+    auto it = gBtChannelCache.find(static_cast<unsigned long long>(addr));
+    return (it == gBtChannelCache.end()) ? 0 : it->second;
+}
+
+/// Forgets one handset's channel: its listener moved, so the number is stale.
+static void btForgetChannel(BTH_ADDR addr) {
+    std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
+    gBtChannelCache.erase(static_cast<unsigned long long>(addr));
+}
+
+/// Forgets every channel. Only for "the radio went away": no number is trustworthy then.
+static void btClearChannelCache() {
+    std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
+    gBtChannelCache.clear();
+    gBtCachedPort.store(0);
+}
+
+/// How many handsets have a channel remembered (status JSON + contract test).
+static size_t btChannelCacheSize() {
+    std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
+    return gBtChannelCache.size();
+}
+
+/* ------------------------------------------------------------------------- *
+ *  Last dial failure, in words
+ *
+ *  Every path through the old dial returned a bare INVALID_SOCKET, so the UI could
+ *  only ever say "not connected" - radio off, nothing paired, no SDP record, refused
+ *  and timed out were indistinguishable. The cause is kept here and surfaced in
+ *  /api/state, the hub window and the Link tab, because a link that looks dead for
+ *  no stated reason is what makes people conclude Bluetooth "does not work".
+ * ------------------------------------------------------------------------- */
+static std::mutex gBtLastErrorMtx;
+static std::string gBtLastDialError;
+static int64_t gBtLastErrorMs = 0;
+
+static void btSetLastDialError(const std::string& why) {
+    std::lock_guard<std::mutex> lk(gBtLastErrorMtx);
+    gBtLastDialError = why;
+    gBtLastErrorMs = static_cast<int64_t>(::GetTickCount64());
+}
+
+/// Returns the most recent dial failure, or "" when the last dial succeeded.
+static std::string btLastDialError() {
+    std::lock_guard<std::mutex> lk(gBtLastErrorMtx);
+    return gBtLastDialError;
+}
+
+/// Milliseconds since boot when that failure was recorded (0 = never).
+static int64_t btLastErrorAgeMs() {
+    std::lock_guard<std::mutex> lk(gBtLastErrorMtx);
+    if (gBtLastErrorMs <= 0 || gBtLastDialError.empty()) return -1;
+    return static_cast<int64_t>(::GetTickCount64()) - gBtLastErrorMs;
+}
+
+static std::string wsaErrorText(int err) {
+    switch (err) {
+        case 0: return "connected";
+        case WSAEHOSTUNREACH: return "the phone is not reachable (out of range, asleep, or its radio is off)";
+        case WSAETIMEDOUT: return "the phone did not answer in time";
+        case WSAECONNREFUSED: return "the phone refused the connection, so its ChainIt listener is not open";
+        case WSAENETUNREACH: return "no route to the phone: this PC has no Bluetooth radio or no stack";
+        case WSAEACCES: return "the Bluetooth stack denied the connection";
+        case WSAEADDRNOTAVAIL: return "that Bluetooth address is not known to this PC (pair it first)";
+        case WSAEINVAL: return "the Bluetooth stack rejected the address or the channel";
+        case WSANO_DATA: return "the phone published no SDP record for ChainIt";
+        case WSAENOTSOCK: return "the socket is not a Bluetooth socket";
+        case WSAEWOULDBLOCK: return "the dial would block";
+        case WSAEALREADY: return "a dial to that device is already in progress";
+        case WSA_NOT_ENOUGH_MEMORY: return "the Bluetooth stack ran out of memory";
+        default: {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "Windows socket error %d", err);
+            return std::string(buf);
+        }
+    }
+}
+
+static bool sendAll(SOCKET s, const std::string& data);   // defined with the HTTP helpers below
+
+/// Widens a fresh AF_BTH socket. RFCOMM's defaults are small and the link is
+/// latency-bound, so the send/receive window - not the radio - decides throughput.
+static void btTuneSocket(SOCKET s) {
+    if (s == INVALID_SOCKET) return;
+    int bytes = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+}
+
+/**
+ * One dial to an explicit RFCOMM channel (or to BT_PORT_ANY for an SDP-resolved dial).
+ *
+ * The connect is non-blocking first, so a handset that is asleep or out of range fails
+ * inside the caller's budget instead of inside the stack's own multi-second retry.
+ *
+ * SO_ERROR is read after select() reports the socket writable. That is not ceremony: on
+ * Windows a *failed* non-blocking connect is normally reported as writable, not as
+ * exceptional, so without this check a dead dial comes back looking like a live socket and
+ * the failure only appears as a read timeout on the first request - which burns the whole
+ * budget and one of the caller's retries before anything at all is known.
+ */
+static SOCKET btDialChannel(BTH_ADDR addr, ULONG channel, int timeoutMs, std::string* outErr) {
+    std::string err;
+    SOCKET s = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+    if (s == INVALID_SOCKET) {
+        err = "could not create a Bluetooth socket: " + wsaErrorText(WSAGetLastError());
+        if (outErr) *outErr = err;
+        return INVALID_SOCKET;
+    }
+    btTuneSocket(s);
 
     SOCKADDR_BTH sa{};
     sa.addressFamily = AF_BTH;
     sa.btAddr = addr;
-    if (port != 0) {
-        sa.port = port;
+    if (channel >= BT_PORT_MIN && channel <= BT_PORT_MAX) {
+        sa.port = channel;                      // explicit dial: no SDP lookup at all
+        sa.serviceClassId = GUID_NULL;
     } else {
         sa.serviceClassId = kChainItPhoneUuid;
-        sa.port = BT_PORT_ANY; // let the stack run the SDP query for kChainItPhoneUuid
+        sa.port = BT_PORT_ANY;                  // let the stack run the SDP query
     }
 
-    SOCKET s = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
-
+    const int budget = timeoutMs > 0 ? timeoutMs : 4000;
     u_long nonBlock = 1;
     ioctlsocket(s, FIONBIO, &nonBlock);
     int cr = connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
     if (cr == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
+        int errCode = WSAGetLastError();
+        if (errCode == WSAEWOULDBLOCK || errCode == WSAEALREADY || errCode == WSAEINVAL) {
             fd_set wfds, efds;
-            FD_ZERO(&wfds);
-            FD_SET(s, &wfds);
-            FD_ZERO(&efds);
-            FD_SET(s, &efds);
+            FD_ZERO(&wfds); FD_SET(s, &wfds);
+            FD_ZERO(&efds); FD_SET(s, &efds);
             timeval tv{};
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            tv.tv_sec = budget / 1000;
+            tv.tv_usec = (budget % 1000) * 1000;
             int sel = select(0, nullptr, &wfds, &efds, &tv);
-            if (sel <= 0 || FD_ISSET(s, &efds)) {
+            if (sel == 0) errCode = WSAETIMEDOUT;
+            else if (sel < 0) errCode = WSAGetLastError();
+            int soErr = 0;
+            int soLen = sizeof(soErr);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &soLen) == 0 && soErr != 0) {
+                errCode = soErr;
+            }
+            if (sel <= 0 || FD_ISSET(s, &efds) || soErr != 0) {
                 closesocket(s);
+                err = wsaErrorText(errCode);
+                if (outErr) *outErr = err;
                 return INVALID_SOCKET;
             }
+            // Some Bluetooth stacks reject a non-blocking connect outright. Retry once
+            // blocking, but only for the same short budget, so a dead handset still fails
+            // fast instead of hanging the caller.
         } else {
             closesocket(s);
-            // Some Bluetooth stacks reject non-blocking connect: retry once in blocking mode.
             SOCKET s2 = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-            if (s2 == INVALID_SOCKET) return INVALID_SOCKET;
+            if (s2 == INVALID_SOCKET) {
+                err = wsaErrorText(errCode);
+                if (outErr) *outErr = err;
+                return INVALID_SOCKET;
+            }
+            btTuneSocket(s2);
+            DWORD blockTimeout = static_cast<DWORD>(budget);
+            setsockopt(s2, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&blockTimeout), sizeof(blockTimeout));
             if (connect(s2, reinterpret_cast<const sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) {
+                int e2 = WSAGetLastError();
                 closesocket(s2);
+                err = wsaErrorText(e2);
+                if (outErr) *outErr = err;
                 return INVALID_SOCKET;
             }
             s = s2;
@@ -205,10 +369,164 @@ static SOCKET btRfcommConnect(const std::string& endpoint, int timeoutMs) {
 
     nonBlock = 0;
     ioctlsocket(s, FIONBIO, &nonBlock);
-    DWORD sockTimeout = static_cast<DWORD>(timeoutMs);
+    DWORD sockTimeout = static_cast<DWORD>(budget);
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sockTimeout), sizeof(sockTimeout));
+    if (outErr) outErr->clear();
     return s;
+}
+
+/**
+ * Proves a socket reached a ChainIt phone before anything trusts it.
+ *
+ * A blind channel guess can connect to *someone* - another RFCOMM service on the same
+ * handset, or a stack's own listener - and a link that looks open but answers nothing is
+ * worse than an honest failure, because the UI then reports "connected" while every file
+ * request times out. So a guessed channel must answer a real request with an HTTP status
+ * line before it is cached or reused.
+ */
+static bool btProbeChannel(SOCKET s, int timeoutMs, std::string* outErr) {
+    const std::string probe =
+        "GET /chainit/ping HTTP/1.1\r\nHost: chainit-bluetooth\r\nConnection: keep-alive\r\n\r\n";
+    if (!sendAll(s, probe)) {
+        if (outErr) *outErr = "the device took the channel but would not accept a request";
+        return false;
+    }
+    DWORD ioTimeout = static_cast<DWORD>(timeoutMs > 0 ? timeoutMs : 2500);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ioTimeout), sizeof(ioTimeout));
+    char head[16] = {};
+    int got = recv(s, head, sizeof(head) - 1, 0);
+    if (got <= 0) {
+        if (outErr) *outErr = "the device answered nothing on that channel";
+        return false;
+    }
+    head[got] = '\0';
+    if (std::strncmp(head, "HTTP/", 5) != 0) {
+        if (outErr) *outErr = "that channel is a different service, not ChainIt";
+        return false;
+    }
+    if (outErr) outErr->clear();
+    return true;
+}
+
+/**
+ * Opens a native RFCOMM socket to the phone's ChainIt service.
+ *
+ * Resolution runs cheapest-and-most-likely first:
+ *   1. the channel in the endpoint text, if the caller supplied one;
+ *   2. the channel remembered from an earlier successful dial to this handset;
+ *   3. an SDP query for kChainItPhoneUuid - authoritative, and the slow path;
+ *   4. a bounded blind sweep, every candidate verified by a real request.
+ *
+ * Step 4 is what makes "it didn't connect" recoverable. SDP is the step that fails in the
+ * field: a handset whose listener has not published its record yet (screen off and dozing,
+ * BLUETOOTH_ADVERTISE denied, service re-registered after a re-pair, or a stack with a
+ * stale cache) is simply invisible to a UUID dial, and without a fallback the link stays
+ * dead until the user restarts something. Guessing is safe here precisely because
+ * btProbeChannel() rejects a wrong guess instead of adopting it.
+ *
+ * outReason receives a human-readable cause on failure. An unexplained refusal is treated
+ * as a defect everywhere else in this codebase, and Bluetooth is no exception.
+ */
+static SOCKET btRfcommConnectResolved(BTH_ADDR addr, ULONG channel, int timeoutMs,
+                                      std::string* outReason) {
+    // Every step below draws from one deadline, so the whole resolution - cached channel,
+    // SDP query and verified sweep together - finishes inside the caller's timeout instead
+    // of multiplying it. A caller asking for 4 s gets 4 s, not 4 s per strategy.
+    const int budget = timeoutMs > 0 ? timeoutMs : 4000;
+    const ULONGLONG deadline = ::GetTickCount64() + static_cast<ULONGLONG>(budget);
+    auto remainingMs = [&deadline]() -> int {
+        const ULONGLONG now = ::GetTickCount64();
+        if (now >= deadline) return 0;
+        return static_cast<int>(deadline - now);
+    };
+    // A step never gets less than 250 ms (too short to be meaningful) and never more than
+    // 4 s (long enough for one SDP round trip on a dozing handset, no longer).
+    auto stepMs = [&remainingMs](int divisor) -> int {
+        const int left = remainingMs();
+        if (left <= 0) return 0;
+        return std::min(4000, std::max(250, left / divisor));
+    };
+    const int perTry = stepMs(3);
+    std::string err;
+
+    // 1/2: an explicit channel from the caller, or the one this handset answered on before.
+    if (channel >= BT_PORT_MIN && channel <= BT_PORT_MAX && perTry > 0) {
+        SOCKET s = btDialChannel(addr, channel, perTry, &err);
+        if (s != INVALID_SOCKET) {
+            btCacheChannel(addr, channel);
+            gBtChannelCacheHits.fetch_add(1);
+            if (outReason) outReason->clear();
+            return s;
+        }
+        // A number that used to work and now refuses means the listener moved. Forget it so
+        // the next dial goes straight to SDP instead of retrying a dead channel first.
+        if (channel == btCachedChannel(addr)) btForgetChannel(addr);
+    } else {
+        gBtChannelCacheMisses.fetch_add(1);
+    }
+
+    // 3: authoritative SDP query for the phone's UUID.
+    gBtSdpQueries.fetch_add(1);
+    SOCKET s = btDialChannel(addr, BT_PORT_ANY, std::max(500, remainingMs()), &err);
+    if (s != INVALID_SOCKET) {
+        SOCKADDR_BTH peer{};
+        int len = sizeof(peer);
+        if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &len) == 0 &&
+            peer.port >= BT_PORT_MIN && peer.port <= BT_PORT_MAX) {
+            btCacheChannel(addr, peer.port);   // next dial skips SDP entirely
+        }
+        if (outReason) outReason->clear();
+        return s;
+    }
+    const std::string sdpErr = err.empty() ? wsaErrorText(WSAGetLastError()) : err;
+
+    // 4: bounded blind sweep, each candidate verified. Android RFCOMM services sit on low
+    // channels almost without exception, so 1..12 covers the realistic range; sweeping all
+    // 30 would spend the budget guessing at channels nothing is listening on.
+    for (ULONG guess = BT_PORT_MIN; guess <= 12 && remainingMs() > 250; ++guess) {
+        if (guess == channel) continue;
+        const int tryMs = stepMs(4);
+        if (tryMs <= 0) break;
+        SOCKET cand = btDialChannel(addr, guess, tryMs, nullptr);
+        if (cand == INVALID_SOCKET) continue;
+        std::string probeErr;
+        const bool ok = btProbeChannel(cand, tryMs, &probeErr);
+        closesocket(cand);          // the probe consumed the response, so re-dial for real
+        if (!ok) continue;
+        SOCKET real = btDialChannel(addr, guess, std::max(250, stepMs(2)), &probeErr);
+        if (real != INVALID_SOCKET) {
+            btCacheChannel(addr, guess);
+            gBtGuessRecovered.fetch_add(1);
+            if (outReason) outReason->clear();
+            return real;
+        }
+        closesocket(real);
+    }
+
+    if (outReason) {
+        *outReason = "SDP: " + sdpErr + "; verified channel sweep found no ChainIt listener";
+    }
+    return INVALID_SOCKET;
+}
+
+/**
+ * Parses a bt:// endpoint and dials it with the full fallback chain above - the single entry
+ * point for every client dial in this file.
+ *
+ * There is deliberately no reason-less variant: a wrapper that returned a bare INVALID_SOCKET
+ * would let a caller drop the cause on the floor again, which is how every dial failure in this
+ * transport used to end up indistinguishable from "phone absent".
+ */
+static SOCKET btRfcommConnectWithReason(const std::string& endpoint, int timeoutMs, std::string* outReason) {
+    BTH_ADDR addr = 0;
+    ULONG port = 0;
+    if (!parseBtEndpoint(endpoint, &addr, &port)) {
+        if (outReason) *outReason = "\"" + endpoint + "\" is not a Bluetooth address";
+        return INVALID_SOCKET;
+    }
+    if (port == 0) port = btCachedChannel(addr);
+    return btRfcommConnectResolved(addr, port, timeoutMs, outReason);
 }
 
 
@@ -301,6 +619,88 @@ static int64_t jsonExtractInt(const std::string& json, const std::string& key, i
     long long v = std::strtoll(json.c_str() + pos, &endPtr, 10);
     if (endPtr == json.c_str() + pos) return defVal;
     return static_cast<int64_t>(v);
+}
+
+/* ------------------------------------------------------------------------- *
+ *  Learning the phone's Bluetooth address from a reply that already arrived
+ *
+ *  The phone reports its own adapter address and the RFCOMM channel its listener
+ *  sits on ("btAddress", "btRfcommChannel") in every /chainit/ping reply and in
+ *  every UDP beacon. So a PC that is currently talking Wi-Fi learns exactly how to
+ *  reach the same phone over Bluetooth *before* Wi-Fi goes away - and can dial
+ *  "bt://AA:BB:CC:DD:EE:FF:7" directly, with no SDP query and no guessing.
+ *
+ *  This replaces the alternative, which was to enumerate every paired device and
+ *  dial each one until something answered. That sweep is what made Bluetooth look
+ *  hung: with several paired handsets it cost seconds per cycle and found nothing
+ *  whenever the phone's SDP record was not visible yet.
+ * ------------------------------------------------------------------------- */
+
+static std::mutex gBtLearnedMtx;
+static std::string gBtLearnedEndpoint;   ///< canonical "bt://AA:..:FF[:chan]" from the phone itself
+static int64_t gBtLearnedMs = 0;
+
+/**
+ * Reads the phone's self-reported Bluetooth address and channel out of a JSON reply or
+ * beacon and stores them. Returns the endpoint learned, or "" when the payload carried none.
+ * Safe to call with any transport's payload - a Wi-Fi ping is the most useful source of all.
+ */
+static std::string btLearnFromPayload(const std::string& json) {
+    if (json.empty() || json.find("btAddress") == std::string::npos) return std::string();
+    const std::string raw = jsonExtractString(json, "btAddress", "");
+    BTH_ADDR addr = 0;
+    if (raw.empty() || !parseBtMac(raw, &addr)) return std::string();
+
+    ULONG channel = 0;
+    const int64_t ch = jsonExtractInt(json, "btRfcommChannel", 0);
+    if (ch >= BT_PORT_MIN && ch <= BT_PORT_MAX) {
+        channel = static_cast<ULONG>(ch);
+        // The phone told us where it listens. That is better than any SDP answer, so it
+        // becomes the channel every later dial uses first.
+        btCacheChannel(addr, channel);
+    }
+
+    std::string ep = "bt://" + btAddrToString(addr);
+    if (channel != 0) ep += ":" + std::to_string(channel);
+
+    std::lock_guard<std::mutex> lk(gBtLearnedMtx);
+    const bool changed = (gBtLearnedEndpoint != ep);
+    gBtLearnedEndpoint = ep;
+    gBtLearnedMs = static_cast<int64_t>(::GetTickCount64());
+    return changed ? ep : std::string();
+}
+
+/** The endpoint the phone last reported for itself, or "" if it never has. */
+static std::string btLearnedEndpoint() {
+    std::lock_guard<std::mutex> lk(gBtLearnedMtx);
+    return gBtLearnedEndpoint;
+}
+
+/* ------------------------------------------------------------------------- *
+ *  This PC's own Bluetooth address
+ *
+ *  The phone had the same problem in mirror image: to push a file it walked every
+ *  paired device and dialled each one until something answered ChainIt's PC UUID.
+ *  The receiver socket already knows the local radio address from getsockname(), so
+ *  it is published in every HTTP response (X-ChainIt-Pc-Bt) and in the state JSON.
+ *  A phone that has talked to this PC over Wi-Fi once then dials it directly over
+ *  Bluetooth - one connect instead of a sweep, which is the difference between a
+ *  push that takes a second and one that takes as long as there are paired devices.
+ * ------------------------------------------------------------------------- */
+static std::mutex gBtLocalAddrMtx;
+static std::string gBtLocalAddress;
+
+static void btSetLocalAddress(BTH_ADDR addr) {
+    if (addr == 0 || addr == BTH_ADDR_NULL) return;
+    const std::string text = btAddrToString(addr);
+    std::lock_guard<std::mutex> lk(gBtLocalAddrMtx);
+    gBtLocalAddress = text;
+}
+
+/// This PC's Bluetooth address as "AA:BB:CC:DD:EE:FF", or "" until the receiver has bound.
+static std::string btLocalAddress() {
+    std::lock_guard<std::mutex> lk(gBtLocalAddrMtx);
+    return gBtLocalAddress;
 }
 
 static std::vector<std::string> jsonExtractStringArray(const std::string& json, const std::string& key) {
@@ -762,12 +1162,16 @@ static bool sendAll(SOCKET s, const std::string& data) {
 // These channels are therefore *kept open* and reused. The phone answers them as
 // HTTP/1.1 keep-alive sessions, so one dial serves a whole browsing session, and
 // several channels run side by side (per-channel mutex, not a global one) so a
-// slow PROPFIND never blocks a file read. The RFCOMM channel number discovered by
-// the first SDP query is cached, which removes the lookup from every later dial.
+// slow PROPFIND never blocks a file read. Each pooled channel remembers the endpoint
+// it was dialled for, so a channel to one handset is never handed to another.
+//
+// The RFCOMM channel number discovered by the first dial is cached per device above
+// (btCacheChannel), which removes the SDP lookup from every later dial - that cache
+// is what makes the second Bluetooth request faster than the first, and it is read
+// by btRfcommConnectWithReason() rather than merely displayed.
 // ===========================================================================
 
 static const size_t kBtChannelCount = 3;
-static std::atomic<ULONG> gBtCachedPort{0};
 static std::atomic<uint64_t> gBtRequestsServed{0};
 static std::atomic<uint64_t> gBtRedials{0};
 static std::atomic<int64_t> gBtLastRttUs{0};
@@ -779,6 +1183,7 @@ struct BtChannel {
     size_t pos = 0;
     int64_t lastUseMs = 0;
     bool inPool = false;
+    std::string endpoint;      // canonical "bt://AA:..:FF" this channel is talking to
 
     bool ensure(size_t want) {
         while (buf.size() - pos < want) {
@@ -835,31 +1240,35 @@ static void btChannelClose(const std::shared_ptr<BtChannel>& ch) {
 }
 
 static std::shared_ptr<BtChannel> btAcquireChannel(const std::string& endpoint, int timeoutMs) {
-    // 1. reuse a live channel
+    const std::string want = normalizeBtEndpoint(endpoint);
+
+    // 1. reuse a live channel *to this device*. Reusing any parked channel would send a
+    //    request meant for one handset down a socket open to another, which reads as a
+    //    timeout or, worse, as an answer from the wrong phone.
     {
         std::lock_guard<std::mutex> lk(gBtPoolMtx);
         for (auto& ch : gBtPool) {
-            if (ch->inPool && ch->sock != INVALID_SOCKET) {
+            if (ch->inPool && ch->sock != INVALID_SOCKET && ch->endpoint == want) {
                 ch->inPool = false;
                 return ch;
             }
         }
     }
-    // 2. dial a new one (SDP is skipped when we already know the RFCOMM channel)
-    SOCKET s = btRfcommConnect(endpoint, timeoutMs);
-    if (s == INVALID_SOCKET) return nullptr;
-    gBtRedials.fetch_add(1);
 
-    if (gBtCachedPort.load() == 0) {
-        SOCKADDR_BTH peer{};
-        int len = sizeof(peer);
-        if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &len) == 0 && peer.port != 0) {
-            gBtCachedPort.store(peer.port);
-        }
+    // 2. dial a new one. SDP is skipped whenever this device's channel is already known,
+    //    and a failed dial leaves an explanation behind instead of a bare dead socket.
+    std::string reason;
+    SOCKET s = btRfcommConnectWithReason(endpoint, timeoutMs, &reason);
+    if (s == INVALID_SOCKET) {
+        btSetLastDialError(reason);
+        return nullptr;
     }
+    btSetLastDialError(std::string());
+    gBtRedials.fetch_add(1);
 
     auto ch = std::make_shared<BtChannel>();
     ch->sock = s;
+    ch->endpoint = want;
     ch->lastUseMs = nowMs();
     return ch;
 }
@@ -901,7 +1310,9 @@ static void btPoolReset() {
         if (ch->inPool) btChannelClose(ch);
     }
     gBtPool.clear();
-    gBtCachedPort.store(0);
+    // The resolved RFCOMM channel cache is deliberately *kept*: this is called between
+    // retry attempts, and re-running SDP on the second attempt is exactly the latency the
+    // cache exists to remove. Only btClearChannelCache() (radio went away) drops it.
 }
 
 /**
@@ -1021,7 +1432,11 @@ static HttpReply httpRequestToPhone(
         req << "\r\n";
         const std::string headStr = req.str();
 
-        const int dialTimeout = std::max(timeoutMs, 12000);
+        // The dial gets the caller's own budget plus a floor for a genuinely cold first
+        // link (SDP + RFCOMM setup on a handset that was dozing). It used to be a flat
+        // 12 s regardless of what the caller asked for, which is why a six-device sweep in
+        // the discovery loop could run for over a minute: every "4 s" probe was really 12 s.
+        const int dialTimeout = std::max(timeoutMs, 6000);
         for (int attempt = 0; attempt < 3; ++attempt) {
             std::shared_ptr<BtChannel> ch = btAcquireChannel(ip, dialTimeout);
             if (!ch) break;
@@ -1064,13 +1479,24 @@ static HttpReply httpRequestToPhone(
         }
 
         connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-        fd_set wfds;
+        fd_set wfds, efds;
         FD_ZERO(&wfds);
         FD_SET(s, &wfds);
+        FD_ZERO(&efds);
+        FD_SET(s, &efds);
         timeval tv{};
         tv.tv_sec = timeoutMs / 1000;
         tv.tv_usec = (timeoutMs % 1000) * 1000;
-        if (select(0, nullptr, &wfds, nullptr, &tv) <= 0) {
+        // A failed non-blocking connect is reported as *writable* on Windows, so SO_ERROR
+        // has to be read: otherwise a dead peer looks connected and the request dies later
+        // inside the read timeout.
+        if (select(0, nullptr, &wfds, &efds, &tv) <= 0 || FD_ISSET(s, &efds)) {
+            closesocket(s);
+            return rep;
+        }
+        int soErr = 0;
+        int soLen = sizeof(soErr);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &soLen) == 0 && soErr != 0) {
             closesocket(s);
             return rep;
         }
@@ -1940,10 +2366,22 @@ static std::string buildStateSnapshotJson() {
         << "\"pooledChannels\":" << btPooledChannels() << ","
         << "\"maxChannels\":" << kBtChannelCount << ","
         << "\"cachedRfcommChannel\":" << gBtCachedPort.load() << ","
+        << "\"pcBluetoothAddress\":\"" << jsonEscape(btLocalAddress()) << "\","
+        << "\"learnedPhoneEndpoint\":\"" << jsonEscape(btLearnedEndpoint()) << "\","
         << "\"requestsServed\":" << gBtRequestsServed.load() << ","
         << "\"redials\":" << gBtRedials.load() << ","
         << "\"lastRttMs\":" << (static_cast<double>(gBtLastRttUs.load()) / 1000.0) << ","
         << "\"keepAlive\":true,"
+        // v1.8.0: the dial path is observable. A user who says "Bluetooth does not connect"
+        // can now be told whether SDP found nothing, whether the channel cache is doing its
+        // job, and what the last failure actually was - in words, from the stack itself.
+        << "\"channelCacheEntries\":" << btChannelCacheSize() << ","
+        << "\"channelCacheHits\":" << gBtChannelCacheHits.load() << ","
+        << "\"channelCacheMisses\":" << gBtChannelCacheMisses.load() << ","
+        << "\"sdpQueries\":" << gBtSdpQueries.load() << ","
+        << "\"guessRecoveredLinks\":" << gBtGuessRecovered.load() << ","
+        << "\"lastDialError\":\"" << jsonEscape(btLastDialError()) << "\","
+        << "\"lastDialErrorAgeMs\":" << btLastErrorAgeMs() << ","
         << "\"pairedDevices\":[";
     for (size_t i = 0; i < gState.btPairedDevices.size(); ++i) {
         if (i > 0) oss << ",";
@@ -2024,6 +2462,12 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int
     if (rep.status != 200 || rep.body.find("\"ok\":true") == std::string::npos) {
         return false;
     }
+
+    // Whatever transport this reply came in on, it carries the phone's own Bluetooth address
+    // and RFCOMM channel. Learning them here is what lets the Bluetooth link come up with a
+    // single direct dial later - including when this ping arrived over Wi-Fi and Wi-Fi is
+    // about to disappear.
+    btLearnFromPayload(rep.body);
 
     std::string kind = kindHint;
     if (kind.empty()) {
@@ -2106,6 +2550,7 @@ static void discoveryLoop() {
                                  jsonEscape(compName) + "\",\"httpPort\":4173}";
 
     int tick = 0;
+    ULONGLONG lastBtArmTry = 0;   // rate limit for arming Bluetooth from a learned endpoint
     while (gRunning.load()) {
         // 1. Broadcast UDP discovery packet on 255.255.255.255 + subnet broadcasts
         std::vector<std::string> bcasts = {"255.255.255.255"};
@@ -2138,6 +2583,33 @@ static void discoveryLoop() {
                     char senderIp[64] = {};
                     inet_ntop(AF_INET, &sender.sin_addr, senderIp, sizeof(senderIp));
                     probePhoneIp(senderIp, "");
+                    // The beacon also names the phone's Bluetooth address and channel. Arm the
+                    // native link from it right away, so Bluetooth is already up (or already
+                    // known-bad with a reason) before Wi-Fi is switched off - rather than being
+                    // discovered only by sweeping every paired device later.
+                    const std::string learned = btLearnFromPayload(msg);
+                    if (!learned.empty()) {
+                        std::lock_guard<std::mutex> lk(gState.mtx);
+                        addLogLocked("BLUETOOTH", "Phone reported its Bluetooth endpoint: " + learned,
+                                     "ChainIt can now dial the RFCOMM channel directly, with no SDP query and no paired-device sweep.");
+                    }
+                    // Arm the native link from what we just learned - but not on every beacon.
+                    // This thread also has to keep receiving, and a Bluetooth dial can take
+                    // seconds, so the arm attempt is rate-limited and skipped once a Bluetooth
+                    // endpoint is already live (the discovery loop keeps that one fresh).
+                    const std::string btEp = btLearnedEndpoint();
+                    if (!btEp.empty() && (::GetTickCount64() - lastBtArmTry) >= 10000) {
+                        bool btLive = false;
+                        {
+                            std::lock_guard<std::mutex> lk(gState.mtx);
+                            auto it = gState.phoneEndpoints.find("bluetooth");
+                            btLive = (it != gState.phoneEndpoints.end() && isBtEndpoint(it->second.ip));
+                        }
+                        if (!btLive) {
+                            lastBtArmTry = ::GetTickCount64();
+                            probePhoneIp(btEp, "bluetooth", 3000);
+                        }
+                    }
                 }
             }
         }
@@ -2216,12 +2688,21 @@ static std::vector<std::string> enumeratePairedBluetoothDevices() {
 // Keeps a native RFCOMM link to the phone warm: paired devices are probed until ChainIt-Android answers
 // on UUID c4a1b170-0001-4000-8000-00805f9b34fb, then the endpoint is refreshed every cycle so the
 // transport engine can fail over to Bluetooth instantly (Wi-Fi / Hotspot / USB all OFF).
+//
+// Probing runs in parallel and backs off per device. The old loop dialled up to six paired
+// handsets one after another, and because the request layer inflated every dial to 12 s, one
+// cycle could take over a minute while the tick was only 3.5 s: Bluetooth looked hung rather
+// than absent. Now all candidates are dialled at once, a handset that keeps refusing is
+// retried on an exponential backoff (1 s, 2 s, 4 s ... capped at 30 s), and the live endpoint
+// is always re-checked every cycle so a working link is never starved by a dead one.
 static void bluetoothDiscoveryLoop() {
     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
     int tick = 0;
     bool btWasUp = false;
     bool loggedNoRadio = false;
+    std::map<std::string, int> failCounts;        ///< endpoint -> consecutive failed probes
+    std::map<std::string, int64_t> nextTryMs;     ///< endpoint -> earliest retry (GetTickCount64)
 
     while (gRunning.load()) {
         std::string liveBt;
@@ -2231,8 +2712,22 @@ static void bluetoothDiscoveryLoop() {
             if (it != gState.phoneEndpoints.end() && isBtEndpoint(it->second.ip)) liveBt = it->second.ip;
         }
 
+        // The endpoint the phone reported for itself is the one worth dialling first: it is the
+        // device actually running ChainIt, and its spelling carries the RFCOMM channel, so the
+        // dial skips SDP entirely. When it names the same handset as the live endpoint, the
+        // learned spelling *replaces* it rather than being added - two probes of one device per
+        // cycle is exactly the waste this loop used to have.
         std::vector<std::string> candidates;
-        if (!liveBt.empty()) candidates.push_back(liveBt);
+        const std::string learnedBt = btLearnedEndpoint();
+        if (!learnedBt.empty()) {
+            candidates.push_back(learnedBt);
+        } else if (!liveBt.empty()) {
+            candidates.push_back(liveBt);
+        }
+        if (!liveBt.empty() && normalizeBtEndpoint(liveBt) != normalizeBtEndpoint(learnedBt) &&
+            std::find(candidates.begin(), candidates.end(), liveBt) == candidates.end()) {
+            candidates.push_back(liveBt);
+        }
 
         if (liveBt.empty() || tick % 8 == 0) {
             std::vector<std::string> paired = enumeratePairedBluetoothDevices();
@@ -2243,6 +2738,10 @@ static void bluetoothDiscoveryLoop() {
             if (!gBtRadioPresent.load()) {
                 if (!loggedNoRadio) {
                     loggedNoRadio = true;
+                    // No radio means no channel number is trustworthy any more; when it
+                    // comes back the first dial has to re-resolve rather than reuse a stale
+                    // channel from before the adapter was re-initialised.
+                    btClearChannelCache();
                     std::lock_guard<std::mutex> lk(gState.mtx);
                     addLogLocked("BLUETOOTH", "No usable Bluetooth radio detected",
                                  "Enable Bluetooth on this PC (Settings > Bluetooth & devices) to arm the native RFCOMM transport.");
@@ -2259,9 +2758,55 @@ static void bluetoothDiscoveryLoop() {
             }
         }
 
-        size_t limit = std::min<size_t>(candidates.size(), 6);
-        for (size_t i = 0; i < limit && gRunning.load(); ++i) {
-            if (probePhoneIp(candidates[i], "bluetooth", 4000)) break;
+        // Drop candidates that are still inside their backoff window, unless one is the
+        // live endpoint (a working link is worth a check every cycle).
+        const int64_t nowTicks = static_cast<int64_t>(::GetTickCount64());
+        std::vector<std::string> toProbe;
+        for (const auto& c : candidates) {
+            if (c == liveBt) { toProbe.push_back(c); continue; }
+            auto nt = nextTryMs.find(c);
+            if (nt != nextTryMs.end() && nt->second > nowTicks) continue;
+            toProbe.push_back(c);
+        }
+        const size_t limit = std::min<size_t>(toProbe.size(), 6);
+        toProbe.resize(limit);
+
+        // Dial them concurrently: the cost of a sweep is then the slowest single handset,
+        // not the sum of all of them. The first to answer wins and is recorded; the rest
+        // simply finish and close.
+        std::atomic<bool> answered{false};
+        std::vector<std::thread> probers;
+        probers.reserve(toProbe.size());
+        for (const auto& cand : toProbe) {
+            if (!gRunning.load()) break;
+            probers.emplace_back([cand, &answered]() {
+                if (answered.load()) return;
+                if (probePhoneIp(cand, "bluetooth", 3000)) answered.store(true);
+            });
+        }
+        for (auto& t : probers) {
+            if (t.joinable()) t.join();
+        }
+
+        // Per-device backoff, so a paired-but-absent handset stops being re-dialled every
+        // 3.5 s forever. Capped at 30 s: a phone walking back into range should be found
+        // quickly, and Bluetooth radios nap in tens of seconds, not minutes.
+        for (const auto& cand : toProbe) {
+            bool live = false;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                auto it = gState.phoneEndpoints.find("bluetooth");
+                live = (it != gState.phoneEndpoints.end() && it->second.ip == cand);
+            }
+            if (live) {
+                failCounts[cand] = 0;
+                nextTryMs.erase(cand);
+            } else {
+                int n = ++failCounts[cand];
+                int64_t backoff = static_cast<int64_t>(1000) * (static_cast<int64_t>(1) << std::min(n - 1, 5));
+                if (backoff > 30000) backoff = 30000;
+                nextTryMs[cand] = static_cast<int64_t>(::GetTickCount64()) + backoff;
+            }
         }
 
         bool upNow = false;
@@ -2311,7 +2856,16 @@ static void bluetoothServerLoop() {
         sa.serviceClassId = kChainItPcUuid;
         sa.port = BT_PORT_ANY;              // stack assigns a free RFCOMM channel
 
-        if (bind(srv, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR || listen(srv, 4) == SOCKET_ERROR) {
+        btTuneSocket(srv);   // the same wide buffers as the client side
+
+        if (bind(srv, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR || listen(srv, 8) == SOCKET_ERROR) {
+            const int bindErr = WSAGetLastError();
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("BLUETOOTH", "Bluetooth receiver could not bind",
+                             "ChainIt cannot accept pushes from the phone: " + wsaErrorText(bindErr) +
+                             ". Another instance may already hold the receiver, or the radio is off.");
+            }
             closesocket(srv);
             gBtServerListening.store(false);
             for (int i = 0; i < 200 && gRunning.load() && !gForceRescan.load(); ++i)
@@ -2321,6 +2875,11 @@ static void bluetoothServerLoop() {
 
         SOCKADDR_BTH bound = sa;
         int boundLen = sizeof(bound);
+        if (getsockname(srv, reinterpret_cast<sockaddr*>(&bound), &boundLen) == 0) {
+            // This PC's own radio address. Published to the phone so it can dial straight back
+            // over Bluetooth instead of walking its paired-device list.
+            btSetLocalAddress(bound.btAddr);
+        }
         if (getsockname(srv, reinterpret_cast<sockaddr*>(&bound), &boundLen) == 0 && bound.port != 0 && bound.port != BT_PORT_ANY) {
             gBtServerChannel.store(static_cast<int>(bound.port));
         } else {
@@ -2353,6 +2912,7 @@ static void bluetoothServerLoop() {
         wsq.lpcsaBuffer = &csai;
 
         bool published = (WSASetServiceW(&wsq, RNRSERVICE_REGISTER, 0) == 0);
+        const int publishErr = published ? 0 : WSAGetLastError();
         gBtServerListening.store(true);
         {
             std::lock_guard<std::mutex> lk(gState.mtx);
@@ -2360,10 +2920,28 @@ static void bluetoothServerLoop() {
                          published ? ("Bluetooth PC Receiver published (RFCOMM channel " + std::to_string(gBtServerChannel.load()) + ")")
                                    : "Bluetooth receiver socket open (SDP publish blocked)",
                          published ? ("Paired Android phones resolve UUID " + kChainItPcUuidStr + " and their Bluetooth pushes land in C:\\Users\\<you>\\Desktop.")
-                                   : ("Listening on AF_BTH RFCOMM; pair this PC with the phone so Android can resolve UUID " + kChainItPcUuidStr + "."));
+                                   : ("Listening on AF_BTH RFCOMM, but the SDP record is not published yet (" + wsaErrorText(publishErr) +
+                                      "), so the phone cannot resolve UUID " + kChainItPcUuidStr + ". ChainIt keeps retrying the registration."));
         }
 
+        // A socket that is listening but not *published* is invisible to the phone: its
+        // SDP query for the PC UUID finds nothing and the push fails with no clue why. The
+        // registration is therefore retried until it takes, because the radio is often not
+        // ready 0.9 s after startup - which is when this loop first runs.
+        ULONGLONG lastPublishTry = ::GetTickCount64();
+
         while (gRunning.load()) {
+            if (!published && (::GetTickCount64() - lastPublishTry) >= 15000) {
+                lastPublishTry = ::GetTickCount64();
+                if (WSASetServiceW(&wsq, RNRSERVICE_REGISTER, 0) == 0) {
+                    published = true;
+                    std::lock_guard<std::mutex> lk(gState.mtx);
+                    addLogLocked("BLUETOOTH",
+                                 "Bluetooth PC Receiver published (RFCOMM channel " + std::to_string(gBtServerChannel.load()) + ")",
+                                 "The SDP record for UUID " + kChainItPcUuidStr + " is now visible, so phone-to-PC pushes can resolve this PC.");
+                }
+            }
+
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(srv, &rfds);
@@ -2374,6 +2952,7 @@ static void bluetoothServerLoop() {
 
             SOCKET client = accept(srv, nullptr, nullptr);
             if (client == INVALID_SOCKET) continue;
+            btTuneSocket(client);
 
             DWORD t = 180000;
             setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&t), sizeof(t));
@@ -2838,12 +3417,12 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.7.0";
+static const char* const kChainItAppVersion = "1.8.0";
 /** Increases with every release (mirrors the APK versionCode). Published on the
  *  File Manager window as the "ChainItBuild" property so that a newly launched
  *  build can tell a *current* resident instance from an *older* one - and take
  *  over from the older one instead of politely handing the user back to it. */
-static const int kChainItBuildNumber = 9;
+static const int kChainItBuildNumber = 10;
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -3204,6 +3783,15 @@ static void sendHttpResponse(
     hdr << "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PROPFIND, MKCOL, MOVE, COPY, LOCK, UNLOCK, PROPPATCH\r\n";
     hdr << "Access-Control-Allow-Headers: Content-Type, Depth, Destination, Overwrite, Range\r\n";
     hdr << "Connection: close\r\n";
+    {
+        // Tells the phone how to reach this PC over Bluetooth later, so it never has to sweep
+        // its paired-device list. Empty until the RFCOMM receiver has bound to the radio.
+        const std::string pcBt = btLocalAddress();
+        if (!pcBt.empty()) {
+            hdr << "X-ChainIt-Pc-Bt: " << pcBt << "\r\n";
+            hdr << "Access-Control-Expose-Headers: X-ChainIt-Pc-Bt\r\n";
+        }
+    }
     for (const auto& kv : extraHeaders) {
         hdr << kv.first << ": " << kv.second << "\r\n";
     }
@@ -3652,9 +4240,21 @@ static void handleHttpClient(SOCKET client) {
         if (!btLink.empty()) ip = btLink;
         bool isBt = isBtEndpoint(ip);
 
+        if (isBt) btSetLastDialError(std::string());   // a manual dial reports its own outcome
         if (ip.empty() || !probePhoneIp(ip, isBt ? "bluetooth" : "", isBt ? 12000 : 0)) {
+            // Name the actual cause. "Could not open a link" is not actionable; "the phone
+            // refused the connection, so its ChainIt listener is not open" is.
+            std::string cause;
+            if (isBt) {
+                cause = btLastDialError();
+                if (cause.empty() && !gBtRadioPresent.load()) {
+                    cause = "this PC has no usable Bluetooth radio";
+                }
+            }
             std::string hint = isBt
-                                   ? ("Could not open a native RFCOMM link to " + jsonEscape(ip) + ". Pair the phone with this PC in Windows Bluetooth settings, keep ChainIt-Android.apk running, and make sure Bluetooth is ON on both devices.")
+                                   ? ("Could not open a native RFCOMM link to " + jsonEscape(ip) +
+                                      (cause.empty() ? "" : (" - " + jsonEscape(cause))) +
+                                      ". Pair the phone with this PC in Windows Bluetooth settings, keep ChainIt-Android.apk running, and make sure Bluetooth is ON on both devices.")
                                    : ("Could not reach ChainIt Sibling on " + jsonEscape(ip) + ":49180. Make sure ChainIt-Android.apk is open/active on your phone.");
             if (isBt) {
                 std::lock_guard<std::mutex> lk(gState.mtx);
@@ -5638,6 +6238,12 @@ struct UiLinkInfo {
     int pooled = 0, maxCh = 0, cachedCh = 0;
     uint64_t served = 0, redials = 0;
     double rttMs = 0.0;
+    // v1.8.0 - the dial path is observable, because "Bluetooth does not connect" is not
+    // actionable and "the phone published no SDP record for ChainIt" is.
+    uint64_t sdpQueries = 0, cacheHits = 0, guessRecovered = 0;
+    std::wstring dialError;          // empty once a dial has succeeded
+    std::wstring learnedPhone;       // endpoint the phone reported for itself
+    std::wstring localAddress;       // this PC's radio address, for the phone to dial
     std::vector<std::wstring> paired;
     std::vector<std::wstring> lan;
     uint64_t phoneTotal = 0, phoneUsed = 0;
@@ -5691,6 +6297,12 @@ static UiLinkInfo uiLinkInfo() {
     s.served = gBtRequestsServed.load();
     s.redials = gBtRedials.load();
     s.rttMs = static_cast<double>(gBtLastRttUs.load()) / 1000.0;
+    s.sdpQueries = gBtSdpQueries.load();
+    s.cacheHits = gBtChannelCacheHits.load();
+    s.guessRecovered = gBtGuessRecovered.load();
+    s.dialError = uiUtf8ToWide(btLastDialError());
+    s.learnedPhone = uiUtf8ToWide(btLearnedEndpoint());
+    s.localAddress = uiUtf8ToWide(btLocalAddress());
     return s;
 }
 
@@ -6465,23 +7077,44 @@ static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
          s.lan.empty() ? L"none yet" : std::to_wstring(s.lan.size()) + L" candidate(s)", kColDim);
 
     y += 278;
-    RECT c2{24, y, 24 + colW, y + 176};
+    RECT c2{24, y, 24 + colW, y + 214};
     uiCard(dc, c2, L"Bluetooth RFCOMM link");
-    yy = c2.top + 46;
+    yy = c2.top + 44;
     wchar_t pool[96];
     swprintf(pool, 96, L"%d of %d keep-alive channels open", s.pooled, s.maxCh);
-    uiKv(dc, c2.left + 18, yy, colW - 40, L"Channel pool", pool, s.pooled > 0 ? kColEmerald : kColDim); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Channel pool", pool, s.pooled > 0 ? kColEmerald : kColDim); yy += 20;
     uiKv(dc, c2.left + 18, yy, colW - 40, L"Cached SDP channel",
-         s.cachedCh > 0 ? (std::to_wstring(s.cachedCh) + L" (no re-lookup)") : L"", kColText); yy += 24;
-    uiKv(dc, c2.left + 18, yy, colW - 40, L"Requests served", std::to_wstring(s.served), kColText); yy += 24;
-    uiKv(dc, c2.left + 18, yy, colW - 40, L"Re-dials", std::to_wstring(s.redials), s.redials > 8 ? kColAmber : kColDim); yy += 24;
+         s.cachedCh > 0 ? (std::to_wstring(s.cachedCh) + L" (no re-lookup)") : L"not resolved yet", kColText); yy += 20;
+    // The point of the cache, stated as a number: how many dials skipped the radio lookup.
+    wchar_t lookups[128];
+    swprintf(lookups, 128, L"%llu lookup(s)  \u00B7  %llu skipped  \u00B7  %llu rescued by sweep",
+             static_cast<unsigned long long>(s.sdpQueries),
+             static_cast<unsigned long long>(s.cacheHits),
+             static_cast<unsigned long long>(s.guessRecovered));
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"SDP", lookups, s.cacheHits > 0 ? kColEmerald : kColDim); yy += 20;
+    wchar_t counts[96];
+    swprintf(counts, 96, L"%llu served  \u00B7  %llu re-dial(s)",
+             static_cast<unsigned long long>(s.served), static_cast<unsigned long long>(s.redials));
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Traffic", counts, s.redials > 8 ? kColAmber : kColText); yy += 20;
     wchar_t rtt[48]; swprintf(rtt, 48, L"%.0f ms", s.rttMs);
-    uiKv(dc, c2.left + 18, yy, colW - 40, L"Last round trip", s.rttMs > 0 ? rtt : L"", kColText); yy += 24;
+    uiKv(dc, c2.left + 18, yy, colW - 40, L"Last round trip", s.rttMs > 0 ? rtt : L"", kColText); yy += 20;
     uiKv(dc, c2.left + 18, yy, colW - 40, L"Radio / receiver",
          std::wstring(s.btRadio ? L"present" : L"absent") + L"  \u00B7  " + (s.btListening ? L"listening" : L"idle"),
-         s.btRadio ? kColEmerald : kColAmber);
+         s.btRadio ? kColEmerald : kColAmber); yy += 20;
+    // The honest line: either what the phone told us, or why the last dial failed. Nothing here
+    // is invented - an empty cause means the last dial succeeded.
+    if (!s.dialError.empty()) {
+        uiKv(dc, c2.left + 18, yy, colW - 40, L"Last dial failed", s.dialError, kColAmber); yy += 20;
+    } else if (!s.learnedPhone.empty()) {
+        uiKv(dc, c2.left + 18, yy, colW - 40, L"Phone reports itself as", s.learnedPhone, kColEmerald); yy += 20;
+    } else {
+        uiKv(dc, c2.left + 18, yy, colW - 40, L"Last dial", L"no failure recorded", kColDim); yy += 20;
+    }
+    if (!s.localAddress.empty()) {
+        uiKv(dc, c2.left + 18, yy, colW - 40, L"This PC on Bluetooth", uiUtf8ToWide("bt://" ) + s.localAddress, kColDim);
+    }
 
-    y += 192;
+    y += 230;
     RECT c3{24, y, 24 + colW, (std::min)(bot - 16, y + 150)};
     uiCard(dc, c3, L"Paired Bluetooth devices");
     yy = c3.top + 44;
