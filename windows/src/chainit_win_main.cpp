@@ -2306,7 +2306,12 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.5.0";
+static const char* const kChainItAppVersion = "1.5.1";
+/** Increases with every release (mirrors the APK versionCode). Published on the
+ *  File Manager window as the "ChainItBuild" property so that a newly launched
+ *  build can tell a *current* resident instance from an *older* one - and take
+ *  over from the older one instead of politely handing the user back to it. */
+static const int kChainItBuildNumber = 7;
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -3742,6 +3747,13 @@ static void hubRunAction(int idx) {
 // ===========================================================================
 
 static const wchar_t* kMainClass = L"ChainItMainWindowClass";
+
+// Window-class and IPC names shared by the File Manager, the hub window, the
+// tray window, the single-instance mutex and the setup program.
+static const wchar_t* kTrayClass = L"ChainItTrayHiddenWindowClass";
+static const wchar_t* kSingleInstanceMutex = L"Local\\ChainItSiblingEngineSingleInstance";
+static const wchar_t* kBuildProp = L"ChainItBuild";
+
 
 static const int kRowH = 28;
 static const int kColHeaderH = 27;
@@ -5271,8 +5283,8 @@ static void uiPaintAboutTab(HDC dc, const UiLayout& L) {
     else if (gMainIcon) uiDrawIcon(dc, 28, y + 2, gMainIcon, 48);
     uiText(dc, RECT{24 + 76, y, 24 + w, y + 30}, L"ChainIt", kColText, gFontTitle);
     uiText(dc, RECT{24 + 76, y + 30, 24 + w, y + 52},
-           std::wstring(L"Version ") + uiUtf8ToWide(kChainItAppVersion) +
-           L"  \u00B7  native Win32 build  \u00B7  no browser, no runtime",
+           std::wstring(L"Version ") + uiUtf8ToWide(kChainItAppVersion) + L"  (build " +
+           std::to_wstring(kChainItBuildNumber) + L")  \u00B7  native Win32  \u00B7  no browser, no runtime",
            kColDim, gFontUi);
     y += 74;
 
@@ -6026,6 +6038,9 @@ static void showNativeMainWindow() {
     }
 
     gMainHwnd = hwnd;
+    // Cross-process readable: another ChainIt launch reads this to decide whether
+    // the resident instance is current (hand off) or older (take over).
+    SetPropW(hwnd, kBuildProp, reinterpret_cast<HANDLE>(static_cast<INT_PTR>(kChainItBuildNumber)));
     SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(gMainIcon));
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(gMainIconSm ? gMainIconSm : gMainIcon));
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, reinterpret_cast<LPARAM>(gMainIconSm ? gMainIconSm : gMainIcon));
@@ -6039,6 +6054,36 @@ static void showNativeMainWindow() {
     if (gPane[PANE_PC].items.empty() && gPane[PANE_PC].dir.empty()) gPane[PANE_PC].dir = L"/";
     if (gPane[PANE_PHONE].dir.empty()) gPane[PANE_PHONE].dir = L"/";
     uiReloadBoth();
+}
+
+/**
+ * Stop a ChainIt process that is already resident.
+ *
+ * Two details make this non-obvious, and getting them wrong is what left an old
+ * build running (and launching a browser) after an update:
+ *
+ *   1. The tray window is created with HWND_MESSAGE, so it is a *message-only*
+ *      window. Plain FindWindow() never enumerates those - only
+ *      FindWindowEx(HWND_MESSAGE, ...) reaches it.
+ *   2. It is the only ChainIt window whose WM_DESTROY actually stops the engine.
+ *      The hub window and the File Manager both *hide* on WM_CLOSE by design,
+ *      because ChainIt is a resident service. Posting WM_CLOSE to them does
+ *      nothing but make the app look closed while the old process keeps running,
+ *      keeps port 4173, keeps the single-instance mutex and keeps the exe file
+ *      locked so setup cannot overwrite it.
+ *
+ * Closing the tray window therefore quits the old process cleanly (it deletes its
+ * own tray icon, unmounts nothing it should keep, and exits), releasing all four.
+ */
+static bool stopResidentChainIt(int waitMs) {
+    HWND tray = FindWindowExW(HWND_MESSAGE, nullptr, kTrayClass, nullptr);
+    if (!tray) return true;
+    PostMessageW(tray, WM_CLOSE, 0, 0);
+    for (int waited = 0; waited < waitMs; waited += 100) {
+        Sleep(100);
+        if (!FindWindowExW(HWND_MESSAGE, nullptr, kTrayClass, nullptr)) return true;
+    }
+    return false;
 }
 
 /** Kept as the single entry point the tray menu, the hub window and the
@@ -6174,6 +6219,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 // detached cmd.exe that waits for this process to disappear.
 // ---------------------------------------------------------------------------
 static int runUninstallMode(bool silent) {
+    // The resident engine holds ChainIt-Windows.exe open, so the delayed
+    // self-delete below would fail while it runs. Close it first.
+    stopResidentChainIt(9000);
     runHiddenCommand(L"cmd.exe /c net use Z: /delete /y");
 
     const std::wstring exe = currentExePath();
@@ -6246,23 +6294,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     }
 
     // Prevent duplicate instances; if already running, just bring up the ChainIt File Manager window!
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, L"Local\\ChainItSiblingEngineSingleInstance");
+    // One engine per machine: port 4173 and Z:\ can only have one owner.
+    HANDLE hMutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutex);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        // ChainIt is already running in another process. Creating a window here
-        // would give the user a File Manager with no engine behind it, so hand
-        // off to the live window and exit.
         HWND live = FindWindowW(kMainClass, nullptr);
-        if (live) {
+        const INT_PTR liveBuild = live ? reinterpret_cast<INT_PTR>(GetPropW(live, kBuildProp)) : 0;
+
+        if (live && liveBuild >= kChainItBuildNumber) {
+            // A current build is already running. Creating a window here would
+            // give the user a File Manager with no engine behind it, so hand off
+            // to the live window and exit.
             if (IsIconic(live)) ShowWindow(live, SW_RESTORE);
             ShowWindow(live, SW_SHOW);
             SetForegroundWindow(live);
             PostMessageW(live, WM_UI_REFRESH_ALL, 0, 0);
-        } else if (HWND hubLive = FindWindowW(kHubClass, nullptr)) {
-            ShowWindow(hubLive, SW_SHOW);
-            SetForegroundWindow(hubLive);
+            if (hMutex) CloseHandle(hMutex);
+            return 0;
         }
+
+        // Anything else that is resident is an OLDER build: it has no native
+        // window (or no build property), and its "Open File Manager" still
+        // launches a browser - precisely the globe-icon bug this version removes.
+        // Handing off to it would leave the user staring at the old behaviour no
+        // matter how many times they reinstall, so ask it to quit and take over.
+        stopResidentChainIt(9000);
         if (hMutex) CloseHandle(hMutex);
-        return 0;
+        hMutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutex);
+
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            // It would not leave. Starting a second engine anyway would fail to
+            // bind port 4173 and serve a dead Z:\, so say what to do instead.
+            HWND other = FindWindowW(kMainClass, nullptr);
+            if (!other) other = FindWindowW(kHubClass, nullptr);
+            if (other) { ShowWindow(other, SW_SHOW); SetForegroundWindow(other); }
+            MessageBoxW(nullptr,
+                        L"An older ChainIt is still running and did not close.\n\n"
+                        L"Right-click the ChainIt icon in the system tray and choose\n"
+                        L"\"Unmount Z:\\ && Exit ChainIt\", then start ChainIt again.",
+                        L"ChainIt", MB_OK | MB_ICONWARNING);
+            if (hMutex) CloseHandle(hMutex);
+            return 0;
+        }
     }
 
     WSADATA wsa{};
@@ -6316,7 +6388,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.hIcon = hAppIcon;
     wc.hIconSm = hAppIcon;
     wc.hCursor = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-    wc.lpszClassName = L"ChainItTrayHiddenWindowClass";
+    wc.lpszClassName = kTrayClass;
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"ChainIt Sibling", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);

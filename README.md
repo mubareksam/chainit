@@ -10,15 +10,47 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.36 MB | **v1.5.0** — Portable `.exe`. **Fully native: the File Manager is now a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. Dual-pane PC + `Z:\` browser with sortable columns, shell file-type icons, right-click menu, cut/copy/paste between devices, native rename prompt, and Link + About tabs. Bluetooth remains a full `Z:\` transport over three persistent RFCOMM keep-alive channels; parallel 2 MiB chunked transfers with SHA-256 gates; in-place self-updater; `/uninstall`. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.5.0.exe`](./releases/ChainIt-Setup-1.5.0.exe) | ~1.67 MB | **v1.5.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.5.0 (`versionCode 6`)** — V2+V3 signed Kotlin APK, same certificate as every previous build so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.37 MB | **v1.5.1** — Portable `.exe`. **Fully native: the File Manager is a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. v1.5.1 additionally **replaces a build that is already running**: a new launch closes an older resident instance instead of handing the user back to it, which is what kept the browser-opening build alive after an update. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + About tabs. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.5.1.exe`](./releases/ChainIt-Setup-1.5.1.exe) | ~1.68 MB | **v1.5.1** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. It now **closes a running ChainIt properly before overwriting the exe** (Windows locks a running image, so the old build used to survive the install). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~872 KB | **v1.5.0 (`versionCode 6`)** — unchanged by the v1.5.1 Windows fix, so there is no need to update your phone. V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.5.0.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.5.1.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.5.1
+
+> **A Windows-only patch.** The phone app is untouched at v1.5.0 (`versionCode 6`) — there is nothing to update there.
+
+v1.5.0 removed every browser launch from the source, but a machine that already had ChainIt running could still end
+up looking at Edge. Two separate bugs, both of which let the **old** build stay in charge:
+
+1. **Setup could not replace a running ChainIt, so the old exe survived the install.**
+   Windows locks the image file of a running executable, so writing the payload over an active install fails. The
+   installer’s fallback posted `WM_CLOSE` to the hub window — but ChainIt is a resident service and its windows
+   *hide* on `WM_CLOSE` rather than quitting, so the engine kept running, kept the file locked, and every retry
+   failed. Setup aborted while the **previous build stayed installed** and kept launching a browser.
+   - The window that actually stops the engine is the **tray window**, and because it is created with `HWND_MESSAGE`
+     it is *message-only*: plain `FindWindow` cannot see it at all, only `FindWindowEx(HWND_MESSAGE, …)` can.
+     Setup now finds it that way, closes it, and waits on the single-instance mutex until the process has really
+     gone — **before** it writes a single byte. If something still refuses to leave, it says so plainly instead of
+     failing with a locked file.
+   - `/uninstall` closes the resident engine first too, so the delayed self-delete of `ChainIt-Windows.exe` succeeds.
+2. **A new launch handed the user back to the old resident process.**
+   ChainIt allows only one engine (port 4173 and `Z:\` have a single owner), so a second launch used to find the
+   running instance and defer to it. If that instance was an older build, deferring meant the user got the old
+   behaviour — including “Open File Manager” launching Edge — no matter how many times they reinstalled.
+   - Each build now publishes its number on the File Manager window as the cross-process-readable `ChainItBuild`
+     property. A launch compares it with its own: **current or newer → hand off** (restore the window, refresh both
+     panes, exit); **older → close it and take over**, so the build you just installed is the one that runs.
+   - If an old instance cannot be closed, ChainIt says exactly what to do rather than starting a second engine that
+     cannot bind port 4173: *right-click the tray icon → “Unmount `Z:\` && Exit ChainIt”, then start again.*
+
+**How to tell which build you are actually running:** open the **About** tab. v1.5.1 reads
+`Version 1.5.1 (build 7) · native Win32 · no browser, no runtime`. If it says 1.5.0 or 1.4.0, the old process was
+still resident — quit it from the tray and start the new one.
 
 ### What is new in v1.5.0
 
@@ -274,7 +306,7 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.5.0.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.5.1.exe` (installer) & `ChainIt-Android.apk`, plus `version.txt` |
 | [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
 | [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |
