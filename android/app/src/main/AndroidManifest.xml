@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.chainit.android"
-    android:versionCode="6"
-    android:versionName="1.5.0">
+    android:versionCode="7"
+    android:versionName="1.6.0">
 
     <uses-sdk
         android:minSdkVersion="26"
@@ -66,6 +66,15 @@
             </intent-filter>
         </activity>
 
+        <!-- Native PC file browser: replaces the old "open http://<pc>:4173/mobile in a browser" jump.
+             Not exported - only ChainIt's own main screen starts it. -->
+        <activity
+            android:name=".ui.PcBrowserActivity"
+            android:exported="false"
+            android:label="PC files"
+            android:parentActivityName=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
         <service
             android:name=".service.SiblingDaemonService"
             android:enabled="true"
@@ -86,6 +95,14 @@
         <provider
             android:name=".update.UpdateFileProvider"
             android:authorities="com.chainit.android.updatefile"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- Serves a file ChainIt saved from the PC as content:// so "Open with another app" works
+             on Android 7+ without androidx. Confined to ChainIt's own folders. -->
+        <provider
+            android:name=".net.ChainItFileProvider"
+            android:authorities="com.chainit.android.files"
             android:exported="false"
             android:grantUriPermissions="true" />
     </application>

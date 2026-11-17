@@ -151,6 +151,8 @@ class MainActivity : Activity() {
         root.addView(Ds.spacer(this, 12f))
         root.addView(buildLinksCard())
         root.addView(Ds.spacer(this, 12f))
+        root.addView(buildPcFilesCard())
+        root.addView(Ds.spacer(this, 12f))
         root.addView(buildShareCard())
         root.addView(Ds.spacer(this, 12f))
         root.addView(buildKeyCard())
@@ -328,19 +330,69 @@ class MainActivity : Activity() {
         sendBtBtn.layoutParams = Ds.lp(this, topDp = 8f)
         card.addView(sendBtBtn)
 
-        browsePcBtn = Ds.button(this, "Browse PC files (C:\\)", Ds.ButtonVariant.GHOST) {
-            val ip = resolveTargetPcIp()
-            if (ip.isBlank()) {
-                toast("No link yet — connect Wi-Fi/hotspot, pair Bluetooth, or type the PC IP above")
-            } else {
-                runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://$ip:4173/mobile"))) }
-                    .onFailure { toast("No browser available to open http://$ip:4173/mobile") }
+        card.addView(
+            Ds.text(this, "Sends to the PC over Wi-Fi, and over Bluetooth RFCOMM when Wi-Fi is gone.", 11f, Ds.textMuted).apply {
+                layoutParams = Ds.lp(this@MainActivity, topDp = 8f)
+                setLineSpacing(0f, 1.3f)
             }
-        }
-        browsePcBtn.layoutParams = Ds.lp(this, topDp = 8f)
-        card.addView(browsePcBtn)
+        )
 
         return card
+    }
+
+    /**
+     * PC files — the native browser.
+     *
+     * This card used to hold a button that fired `Intent(ACTION_VIEW, http://<pc>:4173/mobile)`,
+     * i.e. it sent the user to Edge/Chrome and let a browser draw ChainIt's files. That is the same
+     * mistake Windows made before it grew its own file manager: the recent-apps tile belongs to the
+     * browser, and the feature dies with Wi-Fi. [PcBrowserActivity] now draws the listing itself and
+     * reaches the PC over Wi-Fi *or* Bluetooth RFCOMM, so no browser is involved at any point.
+     */
+    private fun buildPcFilesCard(): View {
+        val card = Ds.card(this)
+        card.addView(Ds.sectionLabel(this, "PC files"))
+
+        card.addView(
+            Ds.text(
+                this,
+                "Browse the folders ChainIt shares on your Windows PC. Drawn by ChainIt itself — no browser, no WebView.",
+                12f,
+                Ds.textSecondary
+            ).apply {
+                layoutParams = Ds.lp(this@MainActivity, topDp = 10f)
+                setLineSpacing(0f, 1.3f)
+            }
+        )
+
+        browsePcBtn = Ds.button(this, "Browse PC files", Ds.ButtonVariant.PRIMARY) { openPcBrowser() }
+        browsePcBtn.layoutParams = Ds.lp(this, topDp = 12f)
+        card.addView(browsePcBtn)
+
+        card.addView(
+            Ds.text(
+                this,
+                "Works over Wi-Fi, hotspot, USB tethering or paired Bluetooth. The PC shares your Windows profile folder as the root: Desktop, Documents, Downloads, Pictures…",
+                11f,
+                Ds.textMuted
+            ).apply {
+                layoutParams = Ds.lp(this@MainActivity, topDp = 8f)
+                setLineSpacing(0f, 1.3f)
+            }
+        )
+
+        return card
+    }
+
+    /** Opens the native browser. A blank IP is fine: Bluetooth alone can still reach a paired PC. */
+    private fun openPcBrowser() {
+        val ip = resolveTargetPcIp()
+        val pc = SiblingDaemonService.getDiscoveredPc()
+        val intent = Intent(this, PcBrowserActivity::class.java)
+        if (ip.isNotBlank()) intent.putExtra(PcBrowserActivity.EXTRA_IP, ip)
+        if (pc != null && pc.pcName.isNotBlank()) intent.putExtra(PcBrowserActivity.EXTRA_PC_NAME, pc.pcName)
+        val started = runCatching { startActivity(intent) }.isSuccess
+        if (!started) toast("ChainIt could not open its own PC file browser")
     }
 
     private fun buildKeyCard(): View {

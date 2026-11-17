@@ -171,9 +171,12 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
 1. **Android** — `./android/build-apk.sh`
    `aapt2` (resources) → generated `R.kt` → `kotlinc -Xlambdas=class -Xsam-conversions=class` (Kotlin 2.x
    must not emit `invokedynamic`: `dx` cannot lower it for API 26) → `android/tools/verify_dex_safety.py`
-   (stage 1: 68 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
+   (stage 1: 183 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
    stage 3: no source calls an indy-emulated stdlib method; stage 4: no runtime color parsing) →
    `dx --dex` → zipalign-style packer → `apksigner` (v2+v3) with `android/keystore/chainit-release.p12`.
+   The script also **fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`** and asserts
+   that `PcBrowserActivity`, `PcVfsClient` and `ChainItFileProvider` are present in the final `classes.dex`, so the
+   phone cannot quietly regress into borrowing a browser again (§9.6).
 2. **Windows** — `./windows/build.sh`
    `npm run build` (vite) → `scripts/gen_embedded_assets.py` (embeds `app/dist` as a C header) →
    `zig c++ -target x86_64-windows-gnu` over `windows/src/chainit_win_main.cpp` **and**
@@ -401,6 +404,12 @@ Both sides emit byte-identical listing JSON, and the native UI parses it directl
   "sizeBytes":3312,"modifiedMs":1763299200000,"mimeType":"image/jpeg","ext":".jpg"}]}
 ```
 
+`modifiedMs` is the entry's **real last-write time** in Unix milliseconds. It used to be `nowMs()` — every one of
+up to 400 rows claimed to have been modified *this instant*, so the Modified column showed the current time
+everywhere and "sort by date" shuffled arbitrarily (v1.6.0 reads `GetFileTime` with
+`FILE_FLAG_BACKUP_SEMANTICS` and converts FILETIME's 1601 epoch). Both native UIs sort on that field, and
+`app/server/selftest.ts` asserts the contract the phone relies on (§9.7).
+
 Filenames are UTF-8 on the wire (Android JSON, `fs::u8path` on Windows), so the UI converts with `CP_UTF8`
 explicitly rather than the ANSI code page — accents, Cyrillic, CJK and emoji survive. `\uXXXX` escapes are
 decoded during parsing. File-type icons come from `SHGetFileInfoW` with `SHGFI_USEFILEATTRIBUTES`, which
@@ -416,9 +425,10 @@ or borrowing a browser `prompt()`.
 
 ### 8.6 What the web bundle is still for
 
-`app/dist` stays embedded and served: `/mobile` is the phone's companion page, `/mini` still renders for remote
-use, and `/dav` is the WebDAV surface Explorer mounts as `Z:\`. The difference is that **nothing in the
-Windows app opens them any more** — the desktop experience is entirely the native window.
+`app/dist` stays embedded and served: `/mobile` remains available for anyone who *wants* the page in a browser,
+`/mini` still renders for remote use, and `/dav` is the WebDAV surface Explorer mounts as `Z:\`. The difference is
+that **neither app opens them any more** — the desktop experience is entirely the native Win32 window (§8) and, as of
+v1.6.0, the phone's PC browsing is entirely `PcBrowserActivity` (§9). Nothing in either binary launches a browser.
 
 ### 8.7 Replacing a build that is already running (v1.5.1)
 
@@ -467,6 +477,102 @@ build number mirrors the APK `versionCode` and rises with every release.
 The **About tab shows `Version <x.y.z> (build <n>)`** so a user can confirm in one glance which binary is actually
 running instead of guessing from behaviour.
 
-**v1.5.1 is a Windows-only patch.** The APK stays at v1.5.0 / `versionCode 6`; the Android updater compares the
+**v1.5.1 was a Windows-only patch** (the APK stayed at v1.5.0 / `versionCode 6`). The Android updater compares the
 *downloaded APK's own* `versionCode` with the installed one (`archive.second <= installedCode -> UpToDate`) and never
-reads the manifest's top-level `version`, so a mixed manifest cannot make the phone chase a no-op update.
+reads the manifest's top-level `version`, so a mixed manifest cannot make the phone chase a no-op update. **v1.6.0
+moves both platforms together** — Windows `1.6.0` / build 8 and Android `1.6.0` / `versionCode 7` — because the
+phone's browser jump was live code, not a stale process (§9).
+
+---
+
+## 9. The Native Android PC File Browser (v1.6.0)
+
+### 9.1 Why the phone's browser jump had to go
+
+Windows needed §8 because a browser-hosted UI means somebody else owns the window. The phone had the same defect in
+**live code**, not in a stale process:
+
+```kotlin
+// MainActivity.buildShareCard(), v1.5.0 and earlier
+browsePcBtn = Ds.button(this, "Browse PC files (C:\\)", Ds.ButtonVariant.GHOST) {
+    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("http://$ip:4173/mobile")))
+}
+```
+
+On a phone that costs more than on a desktop: the recent-apps tile and the switcher thumbnail belong to
+Edge/Chrome, the page needs Wi-Fi even when Bluetooth is paired and serving, there is no back-stack into ChainIt,
+and the label lied — the shared root is the Windows **profile** folder (`%USERPROFILE%`, i.e.
+`Desktop / Documents / Downloads / Pictures`), not `C:\`. `grep -rn ACTION_VIEW android/app/src/main/java` now
+returns exactly two legitimate uses: the APK-install intent in `UpdateManager`, and "open this *saved file* with
+another app" (§9.4). Neither hands ChainIt's own interface to a browser.
+
+### 9.2 One client, two real transports
+
+`net/PcVfsClient.kt` speaks the PC's existing HTTP/1.1 API — no new protocol, no WebView:
+
+| Link | How | Endpoints |
+| :--- | :--- | :--- |
+| Wi-Fi / hotspot / USB tethering | `HttpURLConnection` to `http://<pcIp>:4173` | `/api/vfs/pc/list`, `raw`, `text`, `mkdir`, `rename`, `delete`, `upload` |
+| Bluetooth RFCOMM, zero Wi-Fi | hand-written HTTP/1.1 over `createRfcommSocketToServiceRecord(c4a1b170-0002-…)` | the same paths — `bluetoothServerLoop()` hands every accepted socket to `handleHttpClient` |
+
+Bluetooth is a **full link, not a degraded fallback**: the PC publishes its whole HTTP API on the receiver UUID the
+phone already dials for file pushes, so browsing works with Wi-Fi, hotspot and USB all off. Order is Wi-Fi first,
+then RFCOMM; a `4xx`/`5xx` counts as an *answer* (never re-asked over Bluetooth) while a transport failure falls
+through. `connect()` runs on a worker thread joined with a 12 s deadline, because a paired-but-asleep radio
+otherwise blocks the dial for tens of seconds; secure RFCOMM is tried first and insecure second, matching the
+phone's own listener.
+
+### 9.3 Streaming, and why the sink is re-opened per attempt
+
+Downloads write straight to `FileOutputStream` and uploads read straight from the content resolver, so a 2 GB video
+never enters the heap (in-memory answers are capped at 24 MB and are only listings, JSON and text). `BodySink` is a
+*factory*, not a stream: each transport attempt opens its own file, so a Wi-Fi download that dies half-way cannot
+leave its bytes in front of the Bluetooth attempt's. Response framing is done by a small `ByteSource` that buffers
+one read at a time and handles fixed `Content-Length`, `Transfer-Encoding: chunked`, and read-to-close — the same
+three cases the Windows RFCOMM pool handles. Uploads must know their length before dialling (the PC reads a fixed
+`Content-Length`), so a file whose size Android will not report is buffered, and refused with an explanation when it
+is too large to buffer.
+
+### 9.4 The screen itself
+
+`ui/PcBrowserActivity.kt` is built from the same `Ds` tokens as the rest of the app (no XML, no androidx):
+
+- header with logo, target label and a live transport pill (`WI-FI` / `BLUETOOTH` / `NO LINK`);
+- path bar with **Up** (dimmed at the root) and **Refresh**, plus a tappable path offering the root and
+  `Desktop / Documents / Downloads / Pictures / Music / Videos`;
+- **New folder**, **Send file here** (upload into the folder being viewed) and **Sort**;
+- tappable `NAME · SIZE · MODIFIED` column headers — four sort modes, direction toggles on a second tap, folders
+  first, and an explicit `Comparator` (never `compareBy { }`, which is `invokedynamic` in the published stdlib);
+- type badges (`DIR`, `PDF`, `JPG`, …) tinted by category instead of icon fonts, so nothing depends on a glyph a
+  device may not ship;
+- tap a file for an action sheet, long-press for multi-select with a **Save / Delete / Clear** bar;
+- text opens in a native selectable `TextView` via `/api/vfs/pc/text`; images are downloaded to cache and decoded
+  with `inSampleSize` into an `ImageView`; anything else can be saved to Downloads and handed to another app as
+  `content://` through `net/ChainItFileProvider.kt`, which resolves and then confines every path to ChainIt's own
+  directories;
+- saves land in `Downloads/ChainIt` when the app may write public storage, otherwise in app-private storage, and the
+  toast says which — followed by `MediaScannerConnection.scanFile` so the file shows up in Files/Gallery at once.
+
+### 9.5 Refusals are sentences
+
+The empty state is a card, not a blank list: it repeats the transport's own explanation and offers **Try again**
+(with an IP field), **Bluetooth settings** and **Wi-Fi settings**. Distinct wording exists for no radio, radio off,
+nothing paired, a 12 s dial timeout, a refused service, 401 (Pairing Key mismatch), 403 (Sibling Mode off on the
+PC), 429 (30 s lockout), 404 (file vanished), 503, a truncated body ("sent N of M bytes"), and a phone that cannot
+write its own storage. The status line always shows item count, folder count, total bytes, transport and round-trip
+milliseconds, so "it worked" is observable rather than assumed.
+
+### 9.6 The guard that keeps it that way
+
+`android/build-apk.sh` fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`, and the
+final `classes.dex` is asserted to contain `PcBrowserActivity`, `PcVfsClient` and `ChainItFileProvider` alongside
+the classes already guarded. `verify_dex_safety.py` still proves all 183 first-party classes are
+`invokedynamic`-free and that no source touches an indy-emulated stdlib method or parses a colour at runtime.
+
+### 9.7 Contract test
+
+`app/server/selftest.ts` §6 exercises exactly what the phone calls: the listing shape (all seven item fields,
+virtual paths inside the root, folders before files, `modifiedMs` finite and never in the future), then
+`mkdir → upload → list → raw?download=1` (with `Content-Disposition: attachment`) `→ text → rename →` a **404** for
+the renamed-away file `→ delete`. If that shape changes, the phone's native browser breaks on a device nobody can
+debug from a PC — so the test fails first.
