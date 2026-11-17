@@ -7,8 +7,8 @@ channel=stable
 released=2026-11-17
 
 exe=ChainIt-Windows.exe
-exe_sha256=f0ac3688e39297023562117046e6bc6d0badc99cd84fdd2736019f88361e92b6
-exe_bytes=1588736
+exe_sha256=885d408f95b9e8523dd2fd9e40dbebda3f5a673d4cd7125f9a0ef79df9c29f51
+exe_bytes=1589248
 
 apk=ChainIt-Android.apk
 apk_sha256=8a754d9925330cea00f941f9f2be0914bfb0675914e2f194d6824b765903e642
@@ -16,7 +16,7 @@ apk_bytes=962916
 apk_version_code=8
 
 setup=ChainIt-Setup-1.7.0.exe
-setup_sha256=ba9543c95b86132e6dda997b46ef20f7ea018ecc1ce0822b29f575e47ffb9cb6
-setup_bytes=1910324
+setup_sha256=ce756d1606bcaae9d0669c3e1796d38dfdd4586d709c4d800a83e75ce17b0de8
+setup_bytes=1910836
 setup_silent_flag=/S
 setup_uninstall_flag=/uninstall

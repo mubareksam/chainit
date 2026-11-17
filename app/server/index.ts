@@ -585,6 +585,12 @@ app.post('/api/vfs/:target/upload', async (req, res) => {
     const transportUsed = engine.activeTransportId || 'wifi_lan';
     const link = engine.buildTransportTelemetry().find((t) => t.id === transportUsed);
 
+    // The rate is derived from the same two numbers the entry reports, so a reader can check
+    // it: bytes / durationMs. Quoting the link's nominal speed here made a 44-byte upload claim
+    // 94.5 MB/s while the download of the same file correctly measured 0.02 MB/s.
+    const uploadDurationMs = Math.max(1, Date.now() - uploadStartedMs);
+    const uploadMBps = bytes / (1024 * 1024) / (uploadDurationMs / 1000);
+
     engine.pushTransfer({
       id: crypto.randomUUID().slice(0, 8),
       label: safeName,
@@ -593,8 +599,8 @@ app.post('/api/vfs/:target/upload', async (req, res) => {
       transportUsed,
       promotedHotspot,
       bytes,
-      durationMs: Math.max(1, Date.now() - uploadStartedMs),
-      effectiveSpeedMBps: link?.speedMBps || 85,
+      durationMs: uploadDurationMs,
+      effectiveSpeedMBps: Number.isFinite(uploadMBps) ? Number(uploadMBps.toFixed(2)) : 0,
       status: 'completed',
       timestampMs: Date.now(),
       source: target === 'pc' ? 'phone-upload' : 'api',
