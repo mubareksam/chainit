@@ -192,9 +192,18 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
    packaging tool. Install is per-user (`%LOCALAPPDATA%\Programs\ChainIt`, no UAC prompt) and in-place:
    re-running setup overwrites the same file, asking the running instance to exit first if it holds a lock.
    Flags: `/S` silent, `/UNINSTALL` remove.
-4. **Release manifest** — `python3 scripts/publish_release_manifest.py` rewrites
+4. **Release manifest** — `python3 scripts/publish_release_manifest.py --version <v> --code <n>` rewrites
    `releases/version.txt` (version + SHA-256 of all three artifacts). The Windows in-place updater and the
    Android `UpdateManager` both trust this file to decide "up to date" vs "replace in place".
+
+   Before writing anything it **reads the compiled `VERSIONINFO` back out of the binaries** and refuses to
+   publish unless every `VS_FIXEDFILEINFO` in the exe and in the installer (the packed setup carries two: its
+   own stub resource plus the appended payload's) matches `--version`, and unless the UTF-16 `FileVersion`
+   string is present too. `windows/res/*.rc` state the version twice — numeric `FILEVERSION`/`PRODUCTVERSION`
+   and the `FileVersion`/`ProductVersion` strings — and a hand bump can update one without the other. Explorer's
+   *Details* tab shows the string, so that mistake is invisible in the UI while `GetFileVersionInfo` and anything
+   comparing versions numerically still report the previous release; v1.7.0 shipped that way once, and the check
+   turns it into a build failure (`exit 1`, manifest left untouched) instead.
 
 ---
 
