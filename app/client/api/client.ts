@@ -1,12 +1,29 @@
 import {
   DriveTarget,
   EnvironmentSimulation,
+  PcVolume,
   SelectionMode,
   SiblingConfig,
   SystemSnapshot,
+  TransferRecord,
   TransportId,
   VfsItem,
 } from '../../shared/types';
+
+/** What `/api/vfs/:target/list` answers from v1.7.0 on: rows plus the volumes they live on. */
+export interface VfsListing {
+  currentPath: string;
+  items: VfsItem[];
+  /** Every volume the PC reports, so a client can offer "switch to D:" without another round trip. */
+  drives?: PcVolume[];
+  allowOtherDrives?: boolean;
+  pcRoot?: string;
+  /**
+   * Set when the PC refused the path: a volume with no media, an offline share, or reach switched
+   * off. Showing this sentence beats showing an empty folder that looks like a bug.
+   */
+  error?: string;
+}
 
 async function parseJsonOrThrow<T>(res: Response): Promise<T> {
   const data = await res.json().catch(() => ({}));
@@ -49,7 +66,50 @@ export const api = {
 
   listDir: (target: DriveTarget, dirPath: string) =>
     fetch(`/api/vfs/${target}/list?path=${encodeURIComponent(dirPath)}`).then((r) =>
-      parseJsonOrThrow<{ currentPath: string; items: VfsItem[] }>(r)
+      parseJsonOrThrow<VfsListing>(r)
+    ),
+
+  /** The PC's volumes and whether "/" may name one of them. */
+  listDrives: () =>
+    fetch('/api/drives').then((r) =>
+      parseJsonOrThrow<{
+        allowOtherDrives: boolean;
+        pcRoot: string;
+        pcRootLetter: string;
+        pcRootCaption: string;
+        drives: PcVolume[];
+      }>(r)
+    ),
+
+  /** Widens or narrows what the PC shares; persisted on the PC, not in this tab. */
+  setDriveScope: (allowOtherDrives: boolean) =>
+    fetch('/api/drives/scope', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowOtherDrives }),
+    }).then((r) =>
+      parseJsonOrThrow<{ ok: boolean; allowOtherDrives: boolean; drives: PcVolume[] }>(r)
+    ),
+
+  /** Recent shared files, newest first, as the PC records them. */
+  history: (limit = 25) =>
+    fetch(`/api/history?limit=${limit}`).then((r) =>
+      parseJsonOrThrow<{ items: TransferRecord[]; historyFile: string; servedLetters?: string[] }>(r)
+    ),
+
+  clearHistory: () =>
+    fetch('/api/history/clear', { method: 'POST' }).then((r) =>
+      parseJsonOrThrow<{ ok: boolean; removed: number; items: TransferRecord[] }>(r)
+    ),
+
+  /** Asks the PC to select a path in Explorer - "show me where that landed". */
+  revealOnPc: (virtualPath: string) =>
+    fetch('/api/pc/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: virtualPath }),
+    }).then((r) =>
+      parseJsonOrThrow<{ ok: boolean; path?: string; localPath?: string; error?: string }>(r)
     ),
 
   readText: (target: DriveTarget, filePath: string) =>

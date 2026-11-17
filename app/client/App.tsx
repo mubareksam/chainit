@@ -34,10 +34,19 @@ import { FilePreviewModal } from './components/FilePreviewModal';
 import { MobileCompanionPage } from './components/MobileCompanionPage';
 import { MiniPanel } from './components/MiniPanel';
 import { SiblingAndMountView } from './components/SiblingAndMountView';
-import { formatBytes, formatShortTime, toWindowsDisplayPath } from './utils/format';
+import {
+  batteryTint,
+  batteryTooltip,
+  chargeLabel,
+  formatBytes,
+  formatShortTime,
+  sourceExplain,
+  sourceLabel,
+  toWindowsDisplayPath,
+} from './utils/format';
 
 /** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
-export const APP_VERSION = '1.6.0';
+export const APP_VERSION = '1.7.0';
 
 type MainTab = 'explorer' | 'connectivity' | 'sibling' | 'about';
 type ExplorerLayout = 'dual' | 'single_z';
@@ -314,9 +323,20 @@ export const App: React.FC = () => {
                 }`}
               />
               <span className="font-semibold text-slate-200">{snapshot.sibling.peerDeviceName}</span>
-              <span className="text-slate-500 inline-flex items-center gap-1">
-                <BatteryCharging className="w-3.5 h-3.5 text-emerald-400" />
+              <span
+                className="text-slate-500 inline-flex items-center gap-1"
+                title={batteryTooltip(snapshot.environment)}
+              >
+                <BatteryCharging
+                  className={`w-3.5 h-3.5 ${batteryTint(snapshot.environment)}`}
+                />
                 {snapshot.environment.phoneBatteryPct}%
+                {snapshot.environment.phoneCharging ? (
+                  <span className="text-emerald-400/90">· {chargeLabel(snapshot.environment)}</span>
+                ) : null}
+                {snapshot.environment.phoneTelemetryLive === false ? (
+                  <span className="text-amber-400/90">· stale</span>
+                ) : null}
               </span>
             </div>
           </div>
@@ -778,12 +798,36 @@ export const App: React.FC = () => {
 
           {showTelemetry && (
             <div className="mt-2.5 grid grid-cols-1 lg:grid-cols-2 gap-3 max-h-36 overflow-y-auto pr-1">
-              {/* Recent Transfers */}
+              {/* Recent shared files */}
               <div className="space-y-1">
+                <div className="flex items-center justify-between gap-2 px-1">
+                  <span className="text-[10px] uppercase tracking-wide text-slate-500">
+                    Recent shared files · {snapshot.transfers.length} kept
+                  </span>
+                  {snapshot.transfers.length > 0 && (
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.clearHistory();
+                          const next = await api.getState();
+                          setSnapshot(next);
+                          notify('Shared-file history cleared', 'info');
+                        } catch (err) {
+                          notify(err instanceof Error ? err.message : 'Could not clear history', 'error');
+                        }
+                      }}
+                      className="text-[10px] text-slate-500 hover:text-rose-300 transition"
+                      title="Removes every recorded share from the PC's history file"
+                    >
+                      Clear history
+                    </button>
+                  )}
+                </div>
                 {snapshot.transfers.length === 0 ? (
                   <div className="text-[11px] text-slate-500 py-2">
                     Drag & drop, Copy/Paste (Ctrl+C / Ctrl+V), or click "Copy to Z:\" above to see live
-                    multi-transport transfer telemetry.
+                    multi-transport transfer telemetry. The Windows engine keeps this list in
+                    %APPDATA%\ChainIt, so it survives a restart.
                   </div>
                 ) : (
                   snapshot.transfers.slice(0, 4).map((tr) => (
@@ -794,6 +838,19 @@ export const App: React.FC = () => {
                       <div className="flex items-center gap-2 min-w-0">
                         <ArrowRightLeft className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                         <span className="font-medium text-slate-200 truncate">{tr.label}</span>
+                        {tr.source && (
+                          <span
+                            className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 text-[10px] shrink-0"
+                            title={sourceExplain(tr.source)}
+                          >
+                            {sourceLabel(tr.source)}
+                          </span>
+                        )}
+                        {tr.virtualPath && (
+                          <span className="font-mono text-[10px] text-slate-500 truncate" title={tr.virtualPath}>
+                            {tr.virtualPath}
+                          </span>
+                        )}
                         {tr.promotedHotspot && (
                           <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-semibold shrink-0">
                             BLE → 5GHz Boost
@@ -801,7 +858,8 @@ export const App: React.FC = () => {
                         )}
                       </div>
                       <div className="font-mono text-slate-400 shrink-0">
-                        {formatBytes(tr.bytes)} • {tr.transportUsed} ({tr.effectiveSpeedMBps} MB/s)
+                        {formatBytes(tr.bytes)} • {tr.transportUsed} ({tr.effectiveSpeedMBps} MB/s) •{' '}
+                        {formatShortTime(tr.timestampMs)}
                       </div>
                     </div>
                   ))

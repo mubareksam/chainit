@@ -261,8 +261,18 @@ echo "==> apksigner (v2 + v3) with the committed release key"
 # ------------------------------------------------------------------ verify
 echo "==> verifying"
 # The phone must never hand its own UI to a browser again: no ACTION_VIEW jump to the PC's web UI.
-if grep -rn 'ACTION_VIEW' "$SRC/java" | grep -v 'PcBrowserActivity.kt:.*content://' | grep -vE '^\s*\*' | grep -q '4173'; then
+#
+# The `path:line:` prefix that grep -rn adds used to defeat the comment filter below, so this guard
+# failed on the KDoc that *documents* the removed browser jump. Strip the prefix first, then drop
+# comment lines, so only live code is judged - the guard still fails on any real ACTION_VIEW to :4173.
+BROWSER_JUMP="$(grep -rn 'ACTION_VIEW' "$SRC/java" \
+  | grep -v 'PcBrowserActivity.kt:.*content://' \
+  | sed -E 's/^[^:]+:[0-9]+://' \
+  | grep -vE '^[[:space:]]*(\*|//|/\*)' \
+  | grep '4173' || true)"
+if [ -n "$BROWSER_JUMP" ]; then
   echo "FATAL: an Android source still opens http://<pc>:4173 in a browser. Use PcBrowserActivity." >&2
+  echo "$BROWSER_JUMP" >&2
   exit 1
 fi
 "$JAVA" -jar "$APKSIGNER" verify --verbose "$FINAL_APK" | sed 's/^/    /'

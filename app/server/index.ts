@@ -13,8 +13,10 @@ import {
   getMimeType,
   isEditableTextFile,
   listDirectory,
+  listVolumes,
   renameVfsItem,
   resolveSafePath,
+  servedLetters,
   toVfsItem,
 } from './vfsService.js';
 import { handleWebDavRequest } from './webdavHandler.js';
@@ -25,6 +27,9 @@ const PORT = Number(process.env.PORT || 4173);
 engine.serverPort = PORT;
 
 const app = express();
+
+/** Where this runtime keeps the shared-file history, reported by /api/history. */
+const HISTORY_FILE_LABEL = path.resolve(process.cwd(), '.runtime', 'transfer-history.json');
 
 // Ensure preview iframe & cross-origin LAN mobile requests always work cleanly
 app.use((req, res, next) => {
@@ -113,7 +118,7 @@ const normalizeBtLink = (raw: string): string | null => {
   return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
 };
 
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 
 app.get('/api/app/version', (_req, res) => {
   res.json({ version: APP_VERSION, runtime: 'node-preview', channel: 'stable' });
@@ -249,6 +254,85 @@ app.post('/api/approvals/:id/resolve', (req, res) => {
   }
 });
 
+// --- Volumes (v1.7.0) -------------------------------------------------------
+//
+// The PC side is not only C:: "/" is the profile folder, and any other volume is addressed as
+// "/D:", "/E:" - a second partition, a card reader, a USB stick or a mapped share. These endpoints
+// expose the volume list and the reach switch; every listing carries the same array inline, so a
+// client over Bluetooth does not need a second round trip to offer the choice.
+app.get('/api/drives', (_req, res) => {
+  const volumes = listVolumes(engine.allowOtherDrives);
+  const root = volumes.find((v) => v.isPcRoot) ?? volumes[0];
+  res.json({
+    allowOtherDrives: engine.allowOtherDrives,
+    pcRoot: root ? root.rootPath : '',
+    pcRootLetter: root ? root.letter : '?',
+    pcRootCaption: root ? root.label : '',
+    drives: volumes,
+  });
+});
+
+app.post('/api/drives/scope', (req, res) => {
+  const allow = req.body?.allowOtherDrives !== false && req.body?.allowOtherDrives !== 'false';
+  engine.setAllowOtherDrives(allow);
+  res.json({ ok: true, allowOtherDrives: engine.allowOtherDrives, drives: engine.pcVolumes() });
+});
+
+/**
+ * "Show me where that landed on the PC." The Windows engine selects the path in Explorer; this
+ * preview has no Explorer, so it answers with the resolved path and says plainly that it cannot open
+ * a window - a fake success here would be worse than an honest refusal.
+ */
+app.post('/api/pc/reveal', (req, res) => {
+  const virtual = String(req.body?.path ?? '');
+  try {
+    const resolved = resolveSafePath('pc', virtual);
+    if (!virtual || !fs.existsSync(resolved.fullPath)) {
+      res.status(404).json({ ok: false, error: 'That path is not on this PC (any more).' });
+      return;
+    }
+    res.status(501).json({
+      ok: false,
+      path: resolved.virtualPath,
+      localPath: resolved.fullPath,
+      error: 'The node preview cannot open Explorer; the Windows engine selects this path for real.',
+    });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Unresolvable path' });
+  }
+});
+
+// --- Recent shared files (v1.7.0) -------------------------------------------
+app.get('/api/history', (req, res) => {
+  const parsed = Number.parseInt(String(req.query.limit ?? '25'), 10);
+  const limit = Number.isFinite(parsed) && parsed > 0 && parsed <= 200 ? parsed : 25;
+  const items = [...engine.transfers]
+    .sort((a, b) => b.timestampMs - a.timestampMs)
+    .slice(0, limit)
+    .map((t) => ({
+      id: t.id,
+      label: t.label,
+      op: t.op,
+      direction: t.direction,
+      transportUsed: t.transportUsed,
+      localPath: t.localPath ?? '',
+      virtualPath: t.virtualPath ?? '',
+      source: t.source ?? '',
+      promotedHotspot: t.promotedHotspot,
+      bytes: t.bytes,
+      durationMs: t.durationMs,
+      effectiveSpeedMBps: t.effectiveSpeedMBps,
+      status: t.status,
+      timestampMs: t.timestampMs,
+    }));
+  res.json({ items, historyFile: HISTORY_FILE_LABEL, servedLetters: servedLetters() });
+});
+
+app.post('/api/history/clear', (_req, res) => {
+  const removed = engine.clearHistory();
+  res.json({ ok: true, removed, items: [] });
+});
+
 app.get('/api/vfs/:target/list', (req, res) => {
   try {
     const target = parseDriveTarget(req.params.target);
@@ -260,7 +344,7 @@ app.get('/api/vfs/:target/list', (req, res) => {
       }
     }
     const dirPath = String(req.query.path || '/');
-    const listing = listDirectory(target, dirPath);
+    const listing = listDirectory(target, dirPath, engine.allowOtherDrives);
     res.json(listing);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to list directory' });
@@ -284,12 +368,30 @@ app.get('/api/vfs/:target/raw', (req, res) => {
       return;
     }
     res.setHeader('Content-Type', getMimeType(resolved.fullPath));
-    if (req.query.download === '1') {
+    const explicitSave = req.query.download === '1';
+    if (explicitSave) {
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${encodeURIComponent(path.basename(resolved.fullPath))}"`
       );
     }
+    const startedMs = Date.now();
+    const sizeBytes = fs.statSync(resolved.fullPath).size;
+    res.on('finish', () => {
+      // Only an explicit save counts as a share. The phone also fetches /raw to preview images, and
+      // recording every look would bury the files somebody actually took.
+      if (!explicitSave || target !== 'pc') return;
+      engine.recordSharedFile({
+        op: 'download',
+        direction: 'pc_to_phone',
+        label: path.basename(resolved.fullPath),
+        bytes: sizeBytes,
+        startedMs,
+        source: 'phone-download',
+        virtualPath: resolved.virtualPath,
+        localPath: resolved.fullPath,
+      });
+    });
     fs.createReadStream(resolved.fullPath).pipe(res);
   } catch (err) {
     res.status(400).send(err instanceof Error ? err.message : 'Failed to read file');
@@ -460,6 +562,7 @@ app.post('/api/vfs/:target/upload', async (req, res) => {
         return;
       }
     }
+    const uploadStartedMs = Date.now();
     const dir = String(req.query.dir || '/');
     const rawName = String(req.query.filename || `upload_${Date.now()}.bin`);
     const safeName = path.basename(rawName).replace(/[<>:"/\\|?*]/g, '_');
@@ -482,7 +585,7 @@ app.post('/api/vfs/:target/upload', async (req, res) => {
     const transportUsed = engine.activeTransportId || 'wifi_lan';
     const link = engine.buildTransportTelemetry().find((t) => t.id === transportUsed);
 
-    engine.transfers.unshift({
+    engine.pushTransfer({
       id: crypto.randomUUID().slice(0, 8),
       label: safeName,
       op: 'upload',
@@ -490,10 +593,13 @@ app.post('/api/vfs/:target/upload', async (req, res) => {
       transportUsed,
       promotedHotspot,
       bytes,
-      durationMs: 2,
+      durationMs: Math.max(1, Date.now() - uploadStartedMs),
       effectiveSpeedMBps: link?.speedMBps || 85,
       status: 'completed',
       timestampMs: Date.now(),
+      source: target === 'pc' ? 'phone-upload' : 'api',
+      virtualPath: target === 'pc' ? `${dirResolved.virtualPath === '/' ? '' : dirResolved.virtualPath}/${safeName}` : undefined,
+      localPath: target === 'pc' ? destFull : undefined,
     });
 
     engine.addLog(

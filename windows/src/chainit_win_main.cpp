@@ -406,6 +406,18 @@ struct TransferItem {
     int64_t bytes;
     double speedMBps;
     int64_t ts;
+    // v1.7.0 - a "recent shared files" list is only useful if an entry is actionable and honest
+    // about where it came from:
+    //   localPath  the PC-side path this entry refers to (destination for phone -> PC, source for
+    //              PC -> phone), so the UI can offer "Open containing folder" on any entry;
+    //   source     who moved the bytes: "ui" (File Manager), "api" (a client call), "phone-upload"
+    //              or "phone-download" (the phone started it, possibly with the screen off).
+    std::string localPath;
+    std::string source;
+    // The same entry expressed the way the VFS addresses it ("/Downloads/x.pdf", or "/D:/Games/x.zip"
+    // on another volume), so the phone can fetch a recently shared file again or ask the PC to reveal
+    // it without ever seeing a Windows path.
+    std::string virtualPath;
 };
 
 struct DiscoveredEndpoint {
@@ -436,6 +448,15 @@ struct GlobalState {
     bool phoneScreenLocked = true;
     int phoneBatteryPct = 88;
 
+    // v1.7.0: a percentage alone is not enough to judge whether the link will survive the night, so
+    // the phone also reports how it is being powered and how warm it is. All of it comes from the
+    // real BatteryManager / sticky ACTION_BATTERY_CHANGED broadcast - nothing here is simulated once
+    // a phone has answered a ping (phoneSeenMs == 0 means "never heard from a real phone").
+    bool phoneCharging = false;
+    std::string phoneChargeSource = "none";   // ac | usb | wireless | none
+    double phoneTempC = 0.0;
+    int64_t phoneSeenMs = 0;
+
     // Sibling configuration
     bool siblingEnabled = true;
     bool autoConnectOnRange = true;
@@ -461,6 +482,14 @@ struct GlobalState {
 
     fs::path pcRoot;
     fs::path fallbackPhoneRoot;
+
+    // v1.7.0: "/" means pcRoot, but a virtual path may name another volume outright ("/D:/Games"),
+    // which is what lets the File Manager and the phone reach D:, E:, a card reader or a USB stick
+    // instead of only the profile folder on C:. This flag is the single switch for that reach, it is
+    // persisted, and the Link tab shows its state - a wider filesystem is the user's decision, not a
+    // default nobody asked for. Mirrored into gAllowOtherDrives so path resolution never has to take
+    // gState.mtx (resolveLocalSafe runs on request threads that may already hold it).
+    bool allowOtherDrives = true;
 
     /** Set once a real phone answers, so Z: stops serving the "waiting" placeholder. */
     bool everDiscoveredPhone = false;
@@ -1139,13 +1168,225 @@ static bool isEditableTextExt(const std::string& filename) {
            ext == ".ps1" || ext == ".ts" || ext == ".js" || ext == ".rs" || ext == ".kt";
 }
 
+// --- Volumes (v1.7.0) --------------------------------------------------------
+//
+// The PC side used to have exactly one root - %USERPROFILE% on C: - so neither the File Manager nor
+// the phone could see a second partition, a USB stick or a card reader. Everything below keeps that
+// default ("/" is still the profile folder, so every existing client keeps working) and adds direct
+// addressing of any other volume, plus the enumeration both UIs need to offer a choice.
+
+/** Wide -> UTF-8 for volume labels. `uiWideToUtf8` lives further down with the UI code. */
+static std::string drvUtf8(const std::wstring& in) {
+    if (in.empty()) return std::string();
+    const int need = WideCharToMultiByte(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, in.c_str(), static_cast<int>(in.size()), out.data(), need, nullptr, nullptr);
+    return out;
+}
+
+struct DriveInfo {
+    wchar_t letter = 0;
+    std::wstring root;      // "D:\\"
+    std::wstring label;     // volume label, empty when the volume does not report one
+    std::wstring kind;      // fixed | removable | cdrom | network | ramdisk | unknown
+    bool ready = false;     // media present and the volume answered
+    uint64_t totalBytes = 0;
+    uint64_t freeBytes = 0;
+};
+
+static std::atomic<bool> gAllowOtherDrives{true};
+
+/**
+ * Enumerates the volumes Windows reports, without ever blocking on one.
+ *
+ * GetVolumeInformationW / GetDiskFreeSpaceExW on a mapped network share whose server is gone can
+ * stall for seconds, and this runs on the UI thread for the drive menu - so DRIVE_REMOTE volumes are
+ * listed from GetDriveTypeW alone and marked not-ready instead of being probed.
+ */
+static std::vector<DriveInfo> enumerateDrives() {
+    std::vector<DriveInfo> out;
+    wchar_t buf[1024] = {};
+    const DWORD chars = GetLogicalDriveStringsW(1023, buf);
+    if (chars == 0 || chars > 1023) return out;
+    for (const wchar_t* p = buf; *p != L'\0'; p += wcslen(p) + 1) {
+        DriveInfo d;
+        d.root = p;
+        if (d.root.size() < 2 || d.root[1] != L':') continue;
+        d.letter = static_cast<wchar_t>(towupper(d.root[0]));
+
+        const UINT type = GetDriveTypeW(d.root.c_str());
+        d.kind = (type == DRIVE_FIXED)     ? L"fixed"
+                 : (type == DRIVE_REMOVABLE) ? L"removable"
+                 : (type == DRIVE_CDROM)     ? L"cdrom"
+                 : (type == DRIVE_REMOTE)    ? L"network"
+                 : (type == DRIVE_RAMDISK)   ? L"ramdisk"
+                                             : L"unknown";
+        if (type == DRIVE_UNKNOWN || type == DRIVE_NO_ROOT_DIR) continue;
+
+        if (type != DRIVE_REMOTE) {
+            wchar_t volName[MAX_PATH + 1] = {};
+            wchar_t fsName[MAX_PATH + 1] = {};
+            DWORD serial = 0, maxComp = 0, flags = 0;
+            if (GetVolumeInformationW(d.root.c_str(), volName, MAX_PATH, &serial, &maxComp, &flags, fsName, MAX_PATH)) {
+                d.label = volName;
+                d.ready = true;
+            }
+            ULARGE_INTEGER freeToCaller{}, total{}, freeB{};
+            if (GetDiskFreeSpaceExW(d.root.c_str(), &freeToCaller, &total, &freeB)) {
+                d.totalBytes = total.QuadPart;
+                d.freeBytes = freeB.QuadPart;
+                d.ready = true;
+            }
+        }
+        out.push_back(d);
+    }
+    return out;
+}
+
+/** Recognises "/D:", "/d:/", "/D:/Games" and "D:\\Games" -> 'D'. */
+static bool virtualDrivePrefix(const std::string& virtualPath, wchar_t& driveOut, size_t& restOffsetOut) {
+    size_t i = 0;
+    while (i < virtualPath.size() && (virtualPath[i] == '/' || virtualPath[i] == '\\')) ++i;
+    if (i + 1 >= virtualPath.size()) return false;
+    const unsigned char c = static_cast<unsigned char>(virtualPath[i]);
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) return false;
+    if (virtualPath[i + 1] != ':') return false;
+    const size_t after = i + 2;
+    if (after < virtualPath.size() && virtualPath[after] != '/' && virtualPath[after] != '\\') return false;
+    driveOut = static_cast<wchar_t>(toupper(c));
+    restOffsetOut = after;
+    return true;
+}
+
+/** Volume letter of the PC root ("C"), or "?" when the profile sits somewhere unusual. */
+static std::string pcRootLetter() {
+    const fs::path root = gState.pcRoot;
+    const std::wstring rn = root.has_root_name() ? root.root_name().wstring() : std::wstring();
+    if (rn.size() >= 2 && rn[1] == L':') return std::string(1, static_cast<char>(towupper(rn[0])));
+    return "?";
+}
+
+/** Caption for "/" - the profile folder, with its volume named so multi-drive PCs are unambiguous. */
+static std::string pcRootCaption() {
+    const fs::path root = gState.pcRoot;
+    std::string who = root.filename().u8string();
+    if (who.empty()) who = root.generic_u8string();
+    wchar_t volName[MAX_PATH + 1] = {};
+    std::wstring label;
+    const std::wstring rn = root.has_root_name() ? root.root_name().wstring() : std::wstring();
+    if (rn.size() >= 2 && rn[1] == L':') {
+        std::wstring volRoot = rn.substr(0, 1) + L":\\";
+        wchar_t fsName[MAX_PATH + 1] = {};
+        DWORD serial = 0, maxComp = 0, flags = 0;
+        if (GetVolumeInformationW(volRoot.c_str(), volName, MAX_PATH, &serial, &maxComp, &flags, fsName, MAX_PATH)) label = volName;
+    }
+    std::string cap = "Windows User Profile (" + who + ")";
+    if (!label.empty()) cap += " on " + drvUtf8(label);
+    cap += " [" + pcRootLetter() + ":]";
+    return cap;
+}
+
+/**
+ * JSON array of every volume, newest-information cached for 3 s.
+ *
+ * The profile root is listed first with virtualPath "/" (so existing clients see exactly what they
+ * saw before), then every other volume with virtualPath "/D:" - the address resolveLocalSafe accepts.
+ * A volume with no media reports ready:false and zero sizes rather than a fabricated capacity, and a
+ * mapped network drive is never probed here because that call can block for seconds.
+ */
+static std::string buildPcVolumesJson() {
+    const fs::path root = gState.pcRoot;
+    const std::string rootLetter = pcRootLetter();
+    std::string out = "[";
+    bool first = true;
+
+    ULARGE_INTEGER freeToCaller{}, total{}, freeB{};
+    const bool rootSized = GetDiskFreeSpaceExW(root.c_str(), &freeToCaller, &total, &freeB) ? true : false;
+
+    out += "{\"letter\":\"" + jsonEscape(rootLetter) + "\","
+           "\"virtualPath\":\"/\","
+           "\"label\":\"" + jsonEscape(pcRootCaption()) + "\","
+           "\"rootPath\":\"" + jsonEscape(root.generic_u8string()) + "\","
+           "\"kind\":\"profile\","
+           "\"isPcRoot\":true,"
+           "\"ready\":true,"
+           "\"totalBytes\":" + std::to_string(rootSized ? total.QuadPart : 0) + ","
+           "\"freeBytes\":" + std::to_string(rootSized ? freeB.QuadPart : 0) + "}";
+    first = false;
+
+    for (const DriveInfo& d : enumerateDrives()) {
+        const std::string letter(1, static_cast<char>(d.letter));
+        if (letter == rootLetter) continue;   // already listed as "/"
+        if (!first) out += ",";
+        first = false;
+        out += "{\"letter\":\"" + jsonEscape(letter) + "\","
+               "\"virtualPath\":\"/" + jsonEscape(letter) + ":\","
+               "\"label\":\"" + jsonEscape(d.label.empty() ? (letter + ": drive") : drvUtf8(d.label)) + "\","
+               "\"rootPath\":\"" + jsonEscape(drvUtf8(d.root)) + "\","
+               "\"kind\":\"" + jsonEscape(drvUtf8(d.kind)) + "\","
+               "\"isPcRoot\":false,"
+               "\"ready\":" + (d.ready ? "true" : "false") + ","
+               "\"totalBytes\":" + std::to_string(d.totalBytes) + ","
+               "\"freeBytes\":" + std::to_string(d.freeBytes) + "}";
+    }
+    out += "]";
+    return out;
+}
+
+static std::mutex gDrivesCacheMtx;
+static std::string gDrivesCacheJson;
+static int64_t gDrivesCacheMs = 0;
+
+static std::string pcVolumesJson() {
+    {
+        std::lock_guard<std::mutex> lk(gDrivesCacheMtx);
+        if (!gDrivesCacheJson.empty() && (nowMs() - gDrivesCacheMs) < 3000) return gDrivesCacheJson;
+    }
+    const std::string js = buildPcVolumesJson();
+    {
+        std::lock_guard<std::mutex> lk(gDrivesCacheMtx);
+        gDrivesCacheJson = js;
+        gDrivesCacheMs = nowMs();
+    }
+    return js;
+}
+
 static fs::path resolveLocalSafe(const fs::path& root, const std::string& virtualPath) {
     std::string clean = virtualPath;
     std::replace(clean.begin(), clean.end(), '\\', '/');
+
+    std::error_code ec;
+    const fs::path normRoot = fs::weakly_canonical(root, ec);
+
+    // An explicit volume ("/D:/Games") resolves inside *that* volume, never inside the profile root.
+    wchar_t drive = 0;
+    size_t restAt = 0;
+    if (virtualDrivePrefix(clean, drive, restAt)) {
+        std::wstring volRootW(1, drive);
+        volRootW += L":\\";
+        const fs::path volRoot(volRootW);
+        const std::wstring rootDrive = normRoot.has_root_name() ? normRoot.root_name().wstring() : std::wstring();
+        const bool sameVolume = !rootDrive.empty() && rootDrive.size() >= 2 &&
+                                static_cast<wchar_t>(towupper(rootDrive[0])) == drive;
+        // Refusing means falling back to the profile root, exactly like any other out-of-bounds path:
+        // the caller gets a real directory listing rather than an error it has to understand.
+        if (!sameVolume && !gAllowOtherDrives.load()) return normRoot;
+        if (GetDriveTypeW(volRoot.c_str()) == DRIVE_UNKNOWN) return normRoot;
+
+        std::string rest = clean.substr((std::min)(restAt, clean.size()));
+        while (!rest.empty() && (rest.front() == '/' || rest.front() == '\\')) rest.erase(rest.begin());
+        fs::path candidate = rest.empty() ? volRoot : (volRoot / fs::u8path(rest));
+        fs::path normVol = fs::weakly_canonical(volRoot, ec);
+        fs::path normCand = fs::weakly_canonical(candidate, ec);
+        const std::wstring vStr = normVol.wstring();
+        const std::wstring cStr = normCand.wstring();
+        if (cStr.size() < vStr.size() || cStr.compare(0, vStr.size(), vStr) != 0) return normVol;
+        return normCand;
+    }
+
     while (!clean.empty() && clean.front() == '/') clean.erase(clean.begin());
     fs::path candidate = clean.empty() ? root : (root / fs::u8path(clean));
-    std::error_code ec;
-    fs::path normRoot = fs::weakly_canonical(root, ec);
     fs::path normCand = fs::weakly_canonical(candidate, ec);
     std::wstring rStr = normRoot.wstring();
     std::wstring cStr = normCand.wstring();
@@ -1155,8 +1396,222 @@ static fs::path resolveLocalSafe(const fs::path& root, const std::string& virtua
     return normCand;
 }
 
+// --- Persisted settings and transfer history (v1.7.0) ------------------------
+//
+// A "recent shared files" list that empties when the process exits is a session log, not a history,
+// and the drive-reach switch has to survive an upgrade - so both live in %APPDATA%\ChainIt, the
+// directory the uninstaller already removes (ARCHITECTURE §8). Plain flat JSON written by this
+// process only; every read tolerates a missing, truncated or hand-edited file.
+static fs::path chainItAppDataDir() {
+    std::error_code ec;
+    fs::path dir;
+    const char* appdata = getenv("APPDATA");
+    if (appdata && *appdata) {
+        dir = fs::path(appdata) / "ChainIt";
+    } else {
+        wchar_t buf[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, buf))) dir = fs::path(buf) / L"ChainIt";
+        else dir = fs::temp_directory_path(ec) / L"ChainIt";
+    }
+    fs::create_directories(dir, ec);
+    return dir;
+}
+static fs::path chainItSettingsFile() { return chainItAppDataDir() / L"settings.json"; }
+static fs::path chainItHistoryFile() { return chainItAppDataDir() / L"transfer-history.json"; }
+
+static void persistSettings() {
+    std::string js = "{\n";
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        js += "  \"allowOtherDrives\": " + std::string(gState.allowOtherDrives ? "true" : "false") + ",\n";
+    }
+    js += "  \"schema\": 2\n}\n";
+    std::ofstream f(chainItSettingsFile(), std::ios::binary | std::ios::trunc);
+    if (f.is_open()) { f << js; f.close(); }
+}
+
+static void loadPersistedSettings() {
+    std::ifstream f(chainItSettingsFile(), std::ios::binary);
+    if (!f.is_open()) return;
+    const std::string js((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (js.find("\"allowOtherDrives\"") == std::string::npos) return;
+    const bool allow = jsonExtractBool(js, "allowOtherDrives", true);
+    { std::lock_guard<std::mutex> lk(gState.mtx); gState.allowOtherDrives = allow; }
+    gAllowOtherDrives.store(allow);
+}
+
+/** Defined with the VFS path helpers below; the history needs it to store a volume-aware path. */
+static std::string toVirtualPosix(const fs::path& root, const fs::path& full);
+
+/** Flat objects only - nothing ChainIt writes nests, so the next closing brace ends the entry. */
+static bool parseTransferList(const std::string& js, std::vector<TransferItem>& out) {
+    size_t pos = 0;
+    for (;;) {
+        const size_t open = js.find('{', pos);
+        if (open == std::string::npos) return !out.empty();
+        const size_t close = js.find('}', open);
+        if (close == std::string::npos) return !out.empty();
+        const std::string obj = js.substr(open, close - open + 1);
+        TransferItem t;
+        t.id = jsonExtractString(obj, "id", "");
+        if (t.id.empty()) { pos = close + 1; continue; }
+        t.label = jsonExtractString(obj, "label", "");
+        t.op = jsonExtractString(obj, "op", "transfer");
+        t.direction = jsonExtractString(obj, "direction", "up");
+        t.transportUsed = jsonExtractString(obj, "transportUsed", "");
+        t.localPath = jsonExtractString(obj, "localPath", "");
+        t.virtualPath = jsonExtractString(obj, "virtualPath", "");
+        t.source = jsonExtractString(obj, "source", "");
+        t.bytes = jsonExtractInt(obj, "bytes", 0);
+        t.speedMBps = static_cast<double>(jsonExtractInt(obj, "speedKBps", 0)) / 1024.0;
+        t.ts = jsonExtractInt(obj, "ts", 0);
+        out.push_back(t);
+        pos = close + 1;
+    }
+}
+
+/** Builds the history JSON array. Called with gState.mtx held; performs no IO. */
+static std::string transfersJsonLocked() {
+    std::string out = "[";
+    bool first = true;
+    for (size_t i = 0; i < gState.transfers.size(); ++i) {
+        const TransferItem& t = gState.transfers[i];
+        if (!first) out += ",";
+        first = false;
+        out += "{\"id\":\"" + jsonEscape(t.id.empty() ? ("t" + std::to_string(t.ts)) : t.id) + "\"";
+        out += ",\"label\":\"" + jsonEscape(t.label) + "\"";
+        out += ",\"op\":\"" + jsonEscape(t.op) + "\"";
+        out += ",\"direction\":\"" + jsonEscape(t.direction) + "\"";
+        out += ",\"transportUsed\":\"" + jsonEscape(t.transportUsed) + "\"";
+        out += ",\"localPath\":\"" + jsonEscape(t.localPath) + "\"";
+        out += ",\"virtualPath\":\"" + jsonEscape(t.virtualPath) + "\"";
+        out += ",\"source\":\"" + jsonEscape(t.source) + "\"";
+        out += ",\"bytes\":" + std::to_string(t.bytes);
+        out += ",\"speedKBps\":" + std::to_string(static_cast<int64_t>(t.speedMBps * 1024.0));
+        out += ",\"ts\":" + std::to_string(t.ts);
+        out += "}";
+    }
+    out += "]";
+    return out;
+}
+
+/**
+ * The recent-shared-files array, newest first.
+ *
+ * durationMs is derived from the bytes and the measured rate rather than the constant the old code
+ * stored; localPath and source say where the file landed and who moved it ("ui" File Manager, "api"
+ * client call, "phone-upload"/"phone-download" the phone itself - which is how a share that happened
+ * with the PC screen off still shows up). Called with gState.mtx held; performs no IO.
+ */
+static std::string historyJsonLocked(int limit) {
+    std::vector<const TransferItem*> ordered;
+    ordered.reserve(gState.transfers.size());
+    for (const auto& tr : gState.transfers) ordered.push_back(&tr);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const TransferItem* a, const TransferItem* b) { return a->ts > b->ts; });
+    if (limit > 0 && static_cast<int>(ordered.size()) > limit) ordered.resize(static_cast<size_t>(limit));
+
+    std::string out = "[";
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (i > 0) out += ",";
+        const TransferItem& tr = *ordered[i];
+        const int64_t durMs = (tr.speedMBps > 0.01 && tr.bytes > 0)
+                                  ? static_cast<int64_t>((static_cast<double>(tr.bytes) / (1048576.0)) / tr.speedMBps * 1000.0)
+                                  : 0;
+        out += "{\"id\":\"" + jsonEscape(tr.id) + "\"";
+        out += ",\"label\":\"" + jsonEscape(tr.label) + "\"";
+        out += ",\"op\":\"" + jsonEscape(tr.op) + "\"";
+        out += ",\"direction\":\"" + jsonEscape(tr.direction) + "\"";
+        out += ",\"transportUsed\":\"" + jsonEscape(tr.transportUsed) + "\"";
+        out += ",\"localPath\":\"" + jsonEscape(tr.localPath) + "\"";
+        out += ",\"virtualPath\":\"" + jsonEscape(tr.virtualPath) + "\"";
+        out += ",\"source\":\"" + jsonEscape(tr.source) + "\"";
+        out += ",\"promotedHotspot\":false";
+        out += ",\"bytes\":" + std::to_string(tr.bytes);
+        out += ",\"durationMs\":" + std::to_string(durMs);
+        out += ",\"effectiveSpeedMBps\":" + std::to_string(tr.speedMBps);
+        out += ",\"status\":\"completed\"";
+        out += ",\"timestampMs\":" + std::to_string(tr.ts);
+        out += "}";
+    }
+    out += "]";
+    return out;
+}
+
+/**
+ * Appends one shared-file entry to the bounded history and writes it out.
+ * `source` records who moved the bytes ("ui", "api", "phone-upload", "phone-download") and
+ * `localPath` is the PC-side path, so a row can offer "Open containing folder" instead of being
+ * text the user can only read.
+ */
+static void recordTransfer(const std::string& op, const std::string& direction, const std::string& label,
+                           int64_t bytes, double mbps, const std::string& transport,
+                           const std::string& source = "api", const std::string& localPath = "") {
+    std::string json;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        TransferItem t;
+        t.id = "t" + std::to_string(nowMs()) + "-" + std::to_string(gState.transfers.size());
+        t.op = op;
+        t.direction = direction;
+        t.label = label;
+        t.bytes = bytes;
+        t.speedMBps = mbps;
+        t.ts = nowMs();
+        t.transportUsed = transport.empty() ? gState.activeTransportId : transport;
+        t.source = source;
+        t.localPath = localPath;
+        if (!localPath.empty()) {
+            std::error_code vec;
+            const fs::path real = fs::u8path(localPath);
+            const fs::path root = gState.pcRoot;
+            // Only a path on this PC gets a virtual form; a phone-to-phone entry has none.
+            if (real.is_absolute() && real.root_name() == root.root_name()) t.virtualPath = toVirtualPosix(root, real);
+            else if (real.is_absolute()) t.virtualPath = toVirtualPosix(root, real);   // "/D:/..." form
+            (void)vec;
+        }
+        gState.transfers.push_back(t);
+        if (gState.transfers.size() > 60u) gState.transfers.erase(gState.transfers.begin(), gState.transfers.end() - 60);
+        json = "{\"schema\":2,\"transfers\":" + transfersJsonLocked() + "}";
+    }
+    std::ofstream f(chainItHistoryFile(), std::ios::binary | std::ios::trunc);
+    if (f.is_open()) { f << json; f.close(); }
+}
+
+/** Loads the history at startup; a corrupt file is ignored rather than blocking the engine. */
+static void loadPersistedHistory() {
+    std::ifstream f(chainItHistoryFile(), std::ios::binary);
+    if (!f.is_open()) return;
+    const std::string js((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<TransferItem> loaded;
+    if (!parseTransferList(js, loaded)) return;
+    std::lock_guard<std::mutex> lk(gState.mtx);
+    for (auto& t : loaded) {
+        if (gState.transfers.size() >= 60u) break;
+        gState.transfers.push_back(t);
+    }
+    // Newest first: the list renders top-down and the most recent share is the useful one.
+    std::sort(gState.transfers.begin(), gState.transfers.end(),
+              [](const TransferItem& a, const TransferItem& b) { return a.ts > b.ts; });
+}
+
 static std::string toVirtualPosix(const fs::path& root, const fs::path& full) {
     std::error_code ec;
+
+    // An entry on a different volume than the current root keeps its drive letter ("/D:/Games"),
+    // so a listing can never be misread as a path under the profile folder - and resolveLocalSafe
+    // round-trips it back to the same file.
+    const std::wstring rn = root.has_root_name() ? root.root_name().wstring() : std::wstring();
+    const std::wstring fn = full.has_root_name() ? full.root_name().wstring() : std::wstring();
+    if (rn.size() >= 2 && fn.size() >= 2 && rn[1] == L':' && fn[1] == L':' &&
+        towupper(rn[0]) != towupper(fn[0])) {
+        fs::path rel = fs::relative(full, full.root_path(), ec);
+        std::string s = (ec || rel.empty() || rel == L".") ? full.filename().u8string() : rel.generic_u8string();
+        std::string out = std::string("/") + static_cast<char>(towupper(fn[0])) + ":";
+        if (!s.empty() && s != ".") out += (s.front() == '/') ? s : ("/" + s);
+        return out;
+    }
+
     fs::path rel = fs::relative(full, root, ec);
     if (ec || rel.empty() || rel == ".") return "/";
     std::string s = rel.generic_u8string();
@@ -1211,6 +1666,27 @@ static std::string buildVfsItemJson(const fs::path& root, const fs::path& full) 
 static std::string listLocalDirJson(const fs::path& root, const std::string& dirPath) {
     fs::path full = resolveLocalSafe(root, dirPath);
     std::error_code ec;
+
+    // A named volume that is not there (card pulled, share offline, scope switched off) gets an
+    // explanation instead of a silent jump back to the profile folder - the phone cannot tell the
+    // difference between "empty drive" and "wrong drive" without it.
+    wchar_t wantDrive = 0;
+    size_t restAt = 0;
+    if (virtualDrivePrefix(dirPath, wantDrive, restAt) && (!fs::exists(full, ec) || !fs::is_directory(full, ec))) {
+        const std::string letter(1, static_cast<char>(wantDrive));
+        std::string why;
+        std::wstring volRootW(1, wantDrive);
+        volRootW += L":\\";
+        if (!gAllowOtherDrives.load()) why = "Access to drives other than " + pcRootLetter() + ": is switched off on the PC (Link tab).";
+        else if (GetDriveTypeW(volRootW.c_str()) == DRIVE_UNKNOWN) why = "Drive " + letter + ": is not present.";
+        else why = "Drive " + letter + ": did not answer - no media, or the share is offline.";
+        std::ostringstream bad;
+        bad << "{\"currentPath\":\"/" << jsonEscape(letter) << ":\",\"items\":[],\"error\":\"" << jsonEscape(why) << "\","
+            << "\"allowOtherDrives\":" << (gAllowOtherDrives.load() ? "true" : "false") << ","
+            << "\"drives\":" << pcVolumesJson() << "}";
+        return bad.str();
+    }
+
     if (!fs::exists(full, ec) || !fs::is_directory(full, ec)) {
         full = root;
     }
@@ -1242,7 +1718,12 @@ static std::string listLocalDirJson(const fs::path& root, const std::string& dir
         if (i > 0) oss << ",";
         oss << rows[i].json;
     }
-    oss << "]}";
+    oss << "],";
+    // v1.7.0: every listing carries the volume list, so a client can offer "switch to D:" without a
+    // second round trip - over Bluetooth that round trip is the expensive part.
+    oss << "\"pcRoot\":\"" << jsonEscape(toVirtualPosix(root, root)) << "\","
+        << "\"allowOtherDrives\":" << (gAllowOtherDrives.load() ? "true" : "false") << ","
+        << "\"drives\":" << pcVolumesJson() << "}";
     return oss.str();
 }
 
@@ -1277,6 +1758,12 @@ static std::vector<std::string> getLocalLanIps() {
     }
     return ips;
 }
+
+// v1.7.0: volume enumeration and its JSON live down with the VFS path helpers (they need the
+// Win32 drive APIs); the snapshot only consumes the rendered JSON and the profile-root caption.
+static std::string pcVolumesJson();
+static std::string pcRootCaption();
+static std::string pcRootLetter();
 
 static std::string buildStateSnapshotJson() {
     std::lock_guard<std::mutex> lk(gState.mtx);
@@ -1422,7 +1909,17 @@ static std::string buildStateSnapshotJson() {
         << "\"bluetoothEnabled\":" << (b.first ? "true" : "false") << ","
         << "\"onlineP2pEnabled\":" << (o.first ? "true" : "false") << ","
         << "\"phoneScreenLocked\":" << (gState.phoneScreenLocked ? "true" : "false") << ","
-        << "\"phoneBatteryPct\":" << gState.phoneBatteryPct << "},";
+        << "\"phoneBatteryPct\":" << gState.phoneBatteryPct << ","
+        // Battery detail is reported by the phone itself (BatteryManager / sticky
+        // ACTION_BATTERY_CHANGED) from v1.7.0 on. phoneSeenMs == 0 means no real phone has ever
+        // answered a ping, so the UI shows "awaiting telemetry" rather than a plausible-looking
+        // number nobody measured.
+        << "\"phoneCharging\":" << (gState.phoneCharging ? "true" : "false") << ","
+        << "\"phoneChargeSource\":\"" << jsonEscape(gState.phoneChargeSource) << "\","
+        << "\"phoneTemperatureC\":" << gState.phoneTempC << ","
+        << "\"phoneSeenMs\":" << gState.phoneSeenMs << ","
+        << "\"phoneTelemetryAgeMs\":" << (gState.phoneSeenMs > 0 ? (nowMs() - gState.phoneSeenMs) : 0) << ","
+        << "\"phoneTelemetryLive\":" << ((gState.phoneSeenMs > 0 && (nowMs() - gState.phoneSeenMs) < 180000) ? "true" : "false") << "},";
 
     // Native Bluetooth (AF_BTH / RFCOMM) live status
     gState.btRadioPresent = gBtRadioPresent.load();
@@ -1471,32 +1968,31 @@ static std::string buildStateSnapshotJson() {
         << "\"currentBleBeaconHex\":\"A74C91E05B2D8814\","
         << "\"beaconSecondsRemaining\":" << epochRem << "},";
 
+    // Immediate children of the PC root, counted rather than guessed (one directory pass).
+    uint64_t pcFiles = 0, pcFolders = 0;
+    {
+        std::error_code ec;
+        for (fs::directory_iterator it(gState.pcRoot, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->is_directory(ec)) ++pcFolders; else ++pcFiles;
+        }
+    }
+
     oss << "\"drives\":{"
-        << "\"pc\":{\"target\":\"pc\",\"driveLetter\":\"C:\",\"label\":\"Windows User Profile (" << jsonEscape(gState.pcRoot.filename().u8string()) << ")\","
-        << "\"totalCapacityBytes\":" << pcTotal << ",\"usedBytes\":" << pcUsed << ",\"fileCount\":24,\"folderCount\":8},"
+        << "\"pc\":{\"target\":\"pc\",\"driveLetter\":\"" << jsonEscape(pcRootLetter()) << ":\",\"label\":\"" << jsonEscape(pcRootCaption()) << "\","
+        << "\"rootPath\":\"" << jsonEscape(gState.pcRoot.generic_u8string()) << "\","
+        << "\"totalCapacityBytes\":" << pcTotal << ",\"usedBytes\":" << pcUsed << ",\"fileCount\":" << pcFiles << ",\"folderCount\":" << pcFolders << "},"
         << "\"phone\":{\"target\":\"phone\",\"driveLetter\":\"Z:\",\"label\":\"" << jsonEscape(gState.peerDeviceName) << " [Sibling VFS]\","
         << "\"totalCapacityBytes\":" << gState.phoneTotalBytes << ",\"usedBytes\":" << gState.phoneUsedBytes << ",\"fileCount\":18,\"folderCount\":6}"
         << "},";
 
+    // Every volume Windows reports, plus the switch that decides whether "/" may name one of them.
+    oss << "\"pcVolumes\":" << pcVolumesJson() << ","
+        << "\"allowOtherDrives\":" << (gState.allowOtherDrives ? "true" : "false") << ",";
+
     oss << "\"pendingApprovals\":[],";
 
-    oss << "\"transfers\":[";
-    for (size_t i = 0; i < gState.transfers.size(); ++i) {
-        if (i > 0) oss << ",";
-        const auto& tr = gState.transfers[i];
-        oss << "{\"id\":\"" << tr.id << "\","
-            << "\"label\":\"" << jsonEscape(tr.label) << "\","
-            << "\"op\":\"" << tr.op << "\","
-            << "\"direction\":\"" << tr.direction << "\","
-            << "\"transportUsed\":\"" << tr.transportUsed << "\","
-            << "\"promotedHotspot\":false,"
-            << "\"bytes\":" << tr.bytes << ","
-            << "\"durationMs\":8,"
-            << "\"effectiveSpeedMBps\":" << tr.speedMBps << ","
-            << "\"status\":\"completed\","
-            << "\"timestampMs\":" << tr.ts << "}";
-    }
-    oss << "],";
+    // Recent shared files, newest first (see historyJsonLocked for the field meanings).
+    oss << "\"transfers\":" << historyJsonLocked(60) << ",";
 
     oss << "\"logs\":[";
     for (size_t i = 0; i < gState.logs.size(); ++i) {
@@ -1549,6 +2045,21 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int
         gState.peerAndroidVersion = jsonExtractString(rep.body, "androidVersion", "Android");
         gState.phoneBatteryPct = static_cast<int>(jsonExtractInt(rep.body, "batteryPct", 88));
         gState.phoneScreenLocked = jsonExtractBool(rep.body, "screenLocked", false);
+        // v1.7.0: charging state, plug and temperature. Each field is taken only when this reply
+        // actually carries it - an APK from before 1.7.0 reports the percentage alone, and inventing
+        // the rest would be a lie about hardware we cannot see.
+        {
+            const std::string src = jsonExtractString(rep.body, "chargeSource", "");
+            if (!src.empty()) {
+                gState.phoneChargeSource = src;
+                gState.phoneCharging = (src == "ac" || src == "usb" || src == "wireless");
+            }
+            if (rep.body.find("\"temperatureC\"") != std::string::npos) {
+                gState.phoneTempC = static_cast<double>(jsonExtractInt(rep.body, "temperatureC",
+                                                                       static_cast<int64_t>(gState.phoneTempC)));
+            }
+            gState.phoneSeenMs = nowMs();
+        }
         gState.phoneTotalBytes = static_cast<uint64_t>(jsonExtractInt(rep.body, "totalBytes", static_cast<int64_t>(gState.phoneTotalBytes)));
         gState.phoneUsedBytes = static_cast<uint64_t>(jsonExtractInt(rep.body, "usedBytes", static_cast<int64_t>(gState.phoneUsedBytes)));
 
@@ -2327,12 +2838,12 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.6.0";
+static const char* const kChainItAppVersion = "1.7.0";
 /** Increases with every release (mirrors the APK versionCode). Published on the
  *  File Manager window as the "ChainItBuild" property so that a newly launched
  *  build can tell a *current* resident instance from an *older* one - and take
  *  over from the older one instead of politely handing the user back to it. */
-static const int kChainItBuildNumber = 8;
+static const int kChainItBuildNumber = 9;
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -3021,6 +3532,93 @@ static void handleHttpClient(SOCKET client) {
         if (result.restart) scheduleRestartForUpdate();
         return;
     }
+    // --- Volumes (v1.7.0) -----------------------------------------------------
+    //
+    // The phone cannot guess which drives exist, and switching between them costs a round trip that
+    // over Bluetooth is the slow part of the interaction - so the volume list and the reach switch
+    // both have their own endpoint, and every listing carries the same array inline.
+    if (urlPath == "/api/drives" && method == "GET") {
+        std::string js;
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            js = "{\"allowOtherDrives\":" + std::string(gState.allowOtherDrives ? "true" : "false") + ","
+                 "\"pcRoot\":\"" + jsonEscape(gState.pcRoot.generic_u8string()) + "\","
+                 "\"pcRootLetter\":\"" + jsonEscape(pcRootLetter()) + "\","
+                 "\"pcRootCaption\":\"" + jsonEscape(pcRootCaption()) + "\",";
+        }
+        js += "\"drives\":" + pcVolumesJson() + "}";
+        sendJsonStr(client, 200, js);
+        closesocket(client);
+        return;
+    }
+
+    if (urlPath == "/api/drives/scope" && method == "POST") {
+        const bool allow = jsonExtractBool(body, "allowOtherDrives", true);
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            gState.allowOtherDrives = allow;
+        }
+        gAllowOtherDrives.store(allow);
+        persistSettings();
+        addLogLocked("VFS", allow ? "Other drives reachable" : "Other drives blocked",
+                     allow ? "Virtual paths may now name any volume (/D:, /E:, removable and mapped drives)."
+                           : "Only the profile folder on " + pcRootLetter() + ": is reachable again.");
+        // No PostMessage here: gMainHwnd and WM_UI_REFRESH_ALL belong to the UI section further down,
+        // and the hub repaints the Link tab on its 1 s tick anyway.
+        sendJsonStr(client, 200, "{\"ok\":true,\"allowOtherDrives\":" + std::string(allow ? "true" : "false") +
+                                 ",\"drives\":" + pcVolumesJson() + "}");
+        closesocket(client);
+        return;
+    }
+
+    // Reveal a PC path in Explorer. The phone asks for this after a save so the user can see where a
+    // file actually landed; a path that is not there is reported instead of opening a stray window.
+    if (urlPath == "/api/pc/reveal" && method == "POST") {
+        const std::string virt = jsonExtractString(body, "path", "");
+        std::error_code ec;
+        fs::path real = resolveLocalSafe(gState.pcRoot, virt);
+        if (virt.empty() || !fs::exists(real, ec)) {
+            sendJsonStr(client, 404, "{\"ok\":false,\"error\":\"That path is not on this PC (any more).\"}");
+            closesocket(client);
+            return;
+        }
+        std::wstring args = L"/select,\"" + real.wstring() + L"\"";
+        const HINSTANCE h = ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+        const bool ok = (reinterpret_cast<INT_PTR>(h) > 32);
+        sendJsonStr(client, ok ? 200 : 500,
+                    std::string("{\"ok\":") + (ok ? "true" : "false") + ",\"path\":\"" +
+                    jsonEscape(real.generic_u8string()) + "\"}");
+        closesocket(client);
+        return;
+    }
+
+    // --- Recent shared files (v1.7.0) -----------------------------------------
+    if (urlPath == "/api/history" && method == "GET") {
+        const int limit = static_cast<int>(jsonExtractInt(std::string("{\"l\":") + getQueryParam(queryStr, "limit", "25") + "}", "l", 25));
+        std::string js;
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            js = "{\"items\":" + historyJsonLocked(limit > 0 && limit <= 200 ? limit : 25) + ",";
+        }
+        js += "\"historyFile\":\"" + jsonEscape(chainItHistoryFile().generic_u8string()) + "\"}";
+        sendJsonStr(client, 200, js);
+        closesocket(client);
+        return;
+    }
+
+    if (urlPath == "/api/history/clear" && method == "POST") {
+        {
+            std::lock_guard<std::mutex> lk(gState.mtx);
+            gState.transfers.clear();
+        }
+        std::ofstream f(chainItHistoryFile(), std::ios::binary | std::ios::trunc);
+        if (f.is_open()) { f << "{\"schema\":2,\"transfers\":[]}"; f.close(); }
+        addLogLocked("VFS", "Shared-file history cleared", "Removed every recorded transfer from this PC.");
+        sendJsonStr(client, 200, "{\"ok\":true,\"items\":[]}");
+        closesocket(client);
+        return;
+    }
+
     if (urlPath == "/api/state" && method == "GET") {
         sendJsonStr(client, 200, buildStateSnapshotJson());
         closesocket(client);
@@ -3126,18 +3724,29 @@ static void handleHttpClient(SOCKET client) {
 
         uint64_t totalBytes = 0;
         std::error_code ec;
+        // v1.7.0: every file that actually moved is recorded on its own in the shared-file history,
+        // with the PC-side path it refers to, and the speed is measured over this call instead of the
+        // constant the old code stored.
+        const int64_t startedMs = nowMs();
+        struct Shared { std::string label; std::string localPath; int64_t bytes; };
+        std::vector<Shared> shared;
 
         if (!phoneIp.empty() && (fromTarget == "phone" || toTarget == "phone")) {
             if (fromTarget == "pc" && toTarget == "phone") {
                 for (const auto& p : fromPaths) {
                     fs::path src = resolveLocalSafe(gState.pcRoot, p);
-                    totalBytes += uploadLocalPathToPhone(src, phoneIp, toDir);
+                    const uint64_t n = uploadLocalPathToPhone(src, phoneIp, toDir);
+                    totalBytes += n;
+                    shared.push_back({src.filename().u8string(), src.generic_u8string(), static_cast<int64_t>(n)});
                     if (op == "move") fs::remove_all(src, ec);
                 }
             } else if (fromTarget == "phone" && toTarget == "pc") {
                 fs::path dstDir = resolveLocalSafe(gState.pcRoot, toDir);
                 for (const auto& p : fromPaths) {
-                    totalBytes += downloadPhonePathToLocal(phoneIp, p, dstDir);
+                    const uint64_t n = downloadPhonePathToLocal(phoneIp, p, dstDir);
+                    totalBytes += n;
+                    const fs::path landed = dstDir / fs::u8path(p).filename();
+                    shared.push_back({fs::u8path(p).filename().u8string(), landed.generic_u8string(), static_cast<int64_t>(n)});
                 }
                 if (op == "move") {
                     std::ostringstream delJson;
@@ -3152,6 +3761,10 @@ static void handleHttpClient(SOCKET client) {
             } else if (fromTarget == "phone" && toTarget == "phone") {
                 HttpReply r = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/transfer", body, {{"Content-Type", "application/json"}}, 30000);
                 totalBytes = static_cast<uint64_t>(jsonExtractInt(r.body, "totalBytes", 1024));
+                // Nothing landed on this PC, so there is no local path to offer for this entry.
+                shared.push_back({fromPaths.empty() ? std::string("phone-to-phone items")
+                                                    : fs::u8path(fromPaths[0]).filename().u8string(),
+                                  "", static_cast<int64_t>(totalBytes)});
             }
         } else {
             // Local PC -> PC (or local demo phone folder before real phone pairs)
@@ -3172,19 +3785,34 @@ static void handleHttpClient(SOCKET client) {
                 } else {
                     fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
                 }
-                totalBytes += fs::is_regular_file(dst, ec) ? fs::file_size(dst, ec) : 4096;
+                const uint64_t n = fs::is_regular_file(dst, ec) ? fs::file_size(dst, ec) : 4096;
+                totalBytes += n;
+                shared.push_back({src.filename().u8string(), dst.generic_u8string(), static_cast<int64_t>(n)});
             }
         }
 
+        const std::string label = fromPaths.empty() ? "Items" : fs::u8path(fromPaths[0]).filename().u8string();
+        const std::string dir = (fromTarget == "pc" && toTarget == "phone") ? "pc_to_phone" :
+                                (fromTarget == "phone" && toTarget == "pc") ? "phone_to_pc" : "internal_pc";
         {
+            const int64_t elapsed = (std::max)(static_cast<int64_t>(1), nowMs() - startedMs);
+            const double mbps = (static_cast<double>(totalBytes) / (1048576.0)) / (static_cast<double>(elapsed) / 1000.0);
+            // A batch records its files, not one aggregate row - but bounded, so copying a whole
+            // folder cannot push the useful end of the history out in a single operation.
+            size_t kept = 0;
+            for (const Shared& sh : shared) {
+                if (kept >= 24u) break;
+                if (sh.bytes <= 0 && sh.localPath.empty()) continue;
+                recordTransfer(op, dir, sh.label, sh.bytes, mbps, activeTr, "api", sh.localPath);
+                ++kept;
+            }
+            if (kept == 0) recordTransfer(op, dir, label, static_cast<int64_t>(totalBytes), mbps, activeTr, "api", "");
+
+            char spd[32];
+            std::snprintf(spd, sizeof(spd), "%.1f MB/s", mbps);
             std::lock_guard<std::mutex> lk(gState.mtx);
-            std::string label = fromPaths.empty() ? "Items" : fs::u8path(fromPaths[0]).filename().u8string();
-            char idBuf[16];
-            std::snprintf(idBuf, sizeof(idBuf), "%08x", static_cast<unsigned>(nowMs() & 0xFFFFFFFF));
-            std::string dir = (fromTarget == "pc" && toTarget == "phone") ? "pc_to_phone" :
-                              (fromTarget == "phone" && toTarget == "pc") ? "phone_to_pc" : "internal_pc";
-            gState.transfers.insert(gState.transfers.begin(), {idBuf, label, op, dir, activeTr, static_cast<int64_t>(totalBytes), 88.5, nowMs()});
-            addLogLocked("VFS", (op == "move" ? "Moved " : "Copied ") + label, "Completed over " + activeTr);
+            addLogLocked("VFS", (op == "move" ? "Moved " : "Copied ") + label,
+                         "Completed over " + activeTr + " at " + spd);
         }
 
         std::string resp = "{\"status\":\"completed\",\"snapshot\":" + buildStateSnapshotJson() + "}";
@@ -3249,6 +3877,15 @@ static void handleHttpClient(SOCKET client) {
             std::string data = ss.str();
             std::map<std::string, std::string> extra;
             if (dl) extra["Content-Disposition"] = "attachment; filename=\"" + urlEncode(full.filename().u8string()) + "\"";
+            // Only an explicit save is a share. The phone also fetches /raw to preview images, and
+            // recording those would bury the files the user actually took.
+            if (dl && !isPhone) {
+                std::string transport;
+                { std::lock_guard<std::mutex> lk(gState.mtx); transport = gState.activeTransportId; }
+                recordTransfer("download", "pc_to_phone", full.filename().u8string(),
+                               static_cast<int64_t>(data.size()), 0.0, transport, "phone-download",
+                               full.generic_u8string());
+            }
             sendHttpResponse(client, 200, "OK", guessMime(full.filename().u8string()), data.data(), data.size(), extra);
             closesocket(client);
             return;
@@ -3335,9 +3972,21 @@ static void handleHttpClient(SOCKET client) {
             fs::path dstDir = resolveLocalSafe(root, dir);
             fs::create_directories(dstDir, ec);
             fs::path dst = dstDir / fs::u8path(fname).filename();
+            const int64_t upStarted = nowMs();
             std::ofstream ofs(dst, std::ios::binary);
             ofs.write(body.data(), static_cast<std::streamsize>(body.size()));
             ofs.close();
+            // The phone pushed this file (possibly with its screen off, over Bluetooth). It belongs in
+            // the recent-shared-files list with the exact folder it landed in.
+            if (!isPhone) {
+                const int64_t elapsed = (std::max)(static_cast<int64_t>(1), nowMs() - upStarted);
+                const double mbps = (static_cast<double>(body.size()) / (1048576.0)) / (static_cast<double>(elapsed) / 1000.0);
+                std::string transport;
+                { std::lock_guard<std::mutex> lk(gState.mtx); transport = gState.activeTransportId; }
+                recordTransfer("upload", "phone_to_pc", dst.filename().u8string(),
+                               static_cast<int64_t>(body.size()), mbps, transport, "phone-upload",
+                               dst.generic_u8string());
+            }
             std::string snap = buildStateSnapshotJson();
             sendJsonStr(client, 200, "{\"item\":" + buildVfsItemJson(root, dst) + ",\"snapshot\":" + snap + "}");
             closesocket(client);
@@ -3783,7 +4432,7 @@ static const int kColTypeW = 92;
 static const int kColModW = 138;
 
 enum UiSortKey { SORT_NAME = 0, SORT_SIZE = 1, SORT_TYPE = 2, SORT_MODIFIED = 3 };
-enum UiTab { TAB_FILES = 0, TAB_LINK = 1, TAB_ABOUT = 2 };
+enum UiTab { TAB_FILES = 0, TAB_LINK = 1, TAB_RECENT = 2, TAB_ABOUT = 3 };
 enum UiPaneId { PANE_PC = 0, PANE_PHONE = 1 };
 
 struct UiItem {
@@ -3828,11 +4477,7 @@ static HICON gMainIconSm = nullptr;  // 16 px - caption / alt-tab
 static HICON gMainIconLg = nullptr;  // 64 px - About tab
 static HINSTANCE gMainInstance = nullptr;
 static UiList gPane[2];
-static int gActivePane = PANE_PHONE;
-static int gTab = TAB_FILES;
-static int gToolHover = -1;
-static int gLinkHover = -1;
-static bool gDualPane = true;
+
 static std::wstring gMainToast;
 static std::atomic<int64_t> gMainToastUntil{0};
 static std::wstring gClipboardOp;
@@ -4040,6 +4685,67 @@ static std::string uiCurrentPhoneIp() {
 // Listing the phone can take seconds over Bluetooth, so it never happens on the
 // UI thread. The worker hands the parsed result back with WM_UI_LISTDONE.
 
+
+/**
+ * The PC pane's volume level, Explorer's "This PC" (v1.7.0).
+ *
+ * Real virtual paths always start with '/', so this value can never collide with a folder name. At
+ * this level the pane lists the volumes Windows reports instead of files, which is how the user gets
+ * to D:, E:, a card reader or a mapped share - and pressing Up from the profile folder lands here
+ * rather than doing nothing.
+ */
+static const std::wstring kPcThisPc = L"@thispc";
+
+/** True when the PC pane is showing volumes, where file operations make no sense. */
+static bool uiAtThisPc(int pane) { return pane == PANE_PC && gPane[PANE_PC].dir == kPcThisPc; }
+
+/** Refuses a file operation at the volume level and says why, instead of failing obscurely. */
+static bool uiBlockAtThisPc(int pane, const std::wstring& what) {
+    if (!uiAtThisPc(pane)) return false;
+    uiToast(what + L" does not apply to a drive. Double-click a drive first, then try again.", 5000);
+    return true;
+}
+
+/** One row of the This PC listing per volume, with real capacity instead of a guessed one. */
+static std::vector<UiItem> uiThisPcItems() {
+    std::vector<UiItem> out;
+    const std::string rootLetter = pcRootLetter();
+    for (const DriveInfo& d : enumerateDrives()) {
+        const std::wstring letter(1, static_cast<wchar_t>(d.letter));
+        std::wstring kindName = (d.kind == L"fixed") ? L"Local Disk"
+                              : (d.kind == L"removable") ? L"Removable"
+                              : (d.kind == L"cdrom") ? L"DVD Drive"
+                              : (d.kind == L"network") ? L"Network Location"
+                              : (d.kind == L"ramdisk") ? L"RAM Disk"
+                                                       : L"Drive";
+        std::wstring name = d.label.empty() ? kindName : uiUtf8ToWide(drvUtf8(d.label));
+        name += L" (" + letter + L":)";
+        if (letter == uiUtf8ToWide(rootLetter)) name += L"  \u2014  ChainIt profile root";
+        if (!d.ready) name += (d.kind == L"network") ? L"  \u2014  not probed (remote share)"
+                                                     : L"  \u2014  no media";
+        else if (d.totalBytes > 0) {
+            name += L"  \u2014  " + uiFormatBytes(d.freeBytes) + L" free of " + uiFormatBytes(d.totalBytes);
+        }
+
+        UiItem it;
+        it.name = name;
+        // The profile volume is addressed as "/" so existing behaviour is unchanged; every other
+        // volume gets "/X:", which resolveLocalSafe confines to that volume.
+        it.path = (letter == uiUtf8ToWide(rootLetter)) ? std::wstring(L"/") : (L"/" + letter + L":");
+        it.isDir = true;
+        it.size = d.totalBytes;
+        it.modifiedMs = 0;
+        out.push_back(it);
+    }
+    return out;
+}
+static int gActivePane = PANE_PHONE;
+static int gTab = TAB_FILES;
+static int gToolHover = -1;
+static int gLinkHover = -1;
+static bool gDualPane = true;
+
+
 static void uiLoadPaneAsync(int pane, const std::wstring& dir) {
     UiList& l = gPane[pane];
     l.loading = true;
@@ -4053,9 +4759,19 @@ static void uiLoadPaneAsync(int pane, const std::wstring& dir) {
         pay->dir = dir;
         try {
             if (pane == PANE_PC) {
-                fs::path root;
-                { std::lock_guard<std::mutex> lk(gState.mtx); root = gState.pcRoot; }
-                pay->items = parseVfsListing(listLocalDirJson(root, uiWideToUtf8(dir)));
+                if (dir == kPcThisPc) {
+                    // No listing call at all: the volumes come straight from the drive APIs.
+                    pay->items = uiThisPcItems();
+                } else {
+                    fs::path root;
+                    { std::lock_guard<std::mutex> lk(gState.mtx); root = gState.pcRoot; }
+                    const std::string js = listLocalDirJson(root, uiWideToUtf8(dir));
+                    pay->items = parseVfsListing(js);
+                    // A volume that is not there reports why (no media, share offline, reach switched
+                    // off) - an empty list with no explanation reads as a bug.
+                    const std::string err = jsonExtractString(js, "error", "");
+                    if (!err.empty()) pay->error = uiUtf8ToWide(err);
+                }
             } else {
                 const std::string ip = uiCurrentPhoneIp();
                 if (ip.empty()) {
@@ -4149,7 +4865,10 @@ static void uiNavigate(int pane, const std::wstring& dir) {
 
 static void uiGoUp(int pane) {
     const std::wstring d = gPane[pane].dir;
-    if (d.empty() || d == L"/") return;
+    if (d.empty() || d == kPcThisPc) return;
+    // Up from the profile root, or from a volume root, is the volume level - exactly like Explorer.
+    if (pane == PANE_PC && d == L"/") { uiNavigate(pane, kPcThisPc); return; }
+    if (pane == PANE_PC && d.size() == 3 && d[0] == L'/' && d[2] == L':') { uiNavigate(pane, kPcThisPc); return; }
     std::vector<std::wstring> parts;
     size_t i = 0;
     while (i < d.size()) {
@@ -4297,6 +5016,7 @@ static fs::path uiRealPcPath(const std::wstring& virtualPath) {
 }
 
 static void uiOpNewFolder(int pane) {
+    if (uiBlockAtThisPc(pane, L"New folder")) return;
     std::wstring name = L"New Folder";
     if (!uiPrompt(gMainHwnd, L"New folder", L"Folder name:", name)) return;
     const std::wstring dir = gPane[pane].dir;
@@ -4327,6 +5047,7 @@ static void uiOpNewFolder(int pane) {
 }
 
 static void uiOpRename(int pane) {
+    if (uiBlockAtThisPc(pane, L"Rename")) return;
     const std::vector<int> sel = uiSelectedIndices(gPane[pane]);
     if (sel.size() != 1) { uiToast(L"Select exactly one item to rename."); return; }
     const UiItem it = gPane[pane].items[sel[0]];
@@ -4359,6 +5080,7 @@ static void uiOpRename(int pane) {
 }
 
 static void uiOpDelete(int pane) {
+    if (uiBlockAtThisPc(pane, L"Delete")) return;
     std::vector<UiItem> targets;
     for (const int i : uiSelectedIndices(gPane[pane])) targets.push_back(gPane[pane].items[i]);
     if (targets.empty()) { uiToast(L"Nothing selected."); return; }
@@ -4407,6 +5129,7 @@ static void uiOpDelete(int pane) {
 
 /** Copy (or move) the selection of one pane into the other pane's current folder. */
 static void uiOpTransfer(int fromPane, bool move) {
+    if (uiBlockAtThisPc(fromPane, move ? L"Move" : L"Copy")) return;
     const int toPane = (fromPane == PANE_PC) ? PANE_PHONE : PANE_PC;
     std::vector<UiItem> targets;
     for (const int i : uiSelectedIndices(gPane[fromPane])) targets.push_back(gPane[fromPane].items[i]);
@@ -4420,6 +5143,11 @@ static void uiOpTransfer(int fromPane, bool move) {
     std::thread([fromPane, toPane, targets, toDir, move, bytes]() {
         uint64_t done = 0;
         std::wstring fail;
+        // v1.7.0: the File Manager writes the same shared-file history the API does - one entry per
+        // file that really moved, with its PC-side path and a speed measured over this operation.
+        const int64_t startedMs = nowMs();
+        struct Shared { std::string label; std::string localPath; int64_t bytes; };
+        std::vector<Shared> shared;
         for (const auto& t : targets) {
             if (fromPane == PANE_PC) {
                 // PC -> phone
@@ -4429,6 +5157,7 @@ static void uiOpTransfer(int fromPane, bool move) {
                 const uint64_t n = uploadLocalPathToPhone(real, ip, uiWideToUtf8(toDir));
                 if (n == 0 && !t.isDir) { fail = L"Upload refused for " + t.name; }
                 done += n;
+                if (n > 0) shared.push_back({uiWideToUtf8(t.name), real.generic_u8string(), static_cast<int64_t>(n)});
                 if (move && n > 0) { std::error_code ec; fs::remove_all(real, ec); }
             } else {
                 // phone -> PC
@@ -4446,6 +5175,8 @@ static void uiOpTransfer(int fromPane, bool move) {
                     if (fail.empty()) fail = L"Transfer failed for " + t.name + L" (integrity gate or link loss)";
                 } else {
                     done += n;
+                    shared.push_back({uiWideToUtf8(t.name), (destDir / fs::u8path(uiWideToUtf8(t.path)).filename()).generic_u8string(),
+                                      static_cast<int64_t>(n)});
                     if (move) {
                         std::ostringstream b;
                         b << "{\"paths\":[\"" << jsonEscape(uiWideToUtf8(t.path)) << "\"]}";
@@ -4464,11 +5195,18 @@ static void uiOpTransfer(int fromPane, bool move) {
                   uiFormatBytes(bytes) + L" \u2014 every chunk SHA-256 verified";
         }
         {
+            std::string transport;
+            { std::lock_guard<std::mutex> lk(gState.mtx); transport = gState.activeTransportId; }
+            const int64_t elapsed = (std::max)(static_cast<int64_t>(1), nowMs() - startedMs);
+            const double mbps = (static_cast<double>(done) / (1048576.0)) / (static_cast<double>(elapsed) / 1000.0);
+            size_t kept = 0;
+            for (const Shared& sh : shared) {
+                if (kept >= 24u) break;
+                recordTransfer(move ? "move" : "copy", fromPane == PANE_PC ? "pc_to_phone" : "phone_to_pc",
+                               sh.label, sh.bytes, mbps, transport, "ui", sh.localPath);
+                ++kept;
+            }
             std::lock_guard<std::mutex> lk(gState.mtx);
-            gState.transfers.insert(gState.transfers.begin(),
-                                    {std::string("ui"), uiWideToUtf8(targets[0].name), move ? "move" : "copy",
-                                     fromPane == PANE_PC ? "pc_to_phone" : "phone_to_pc",
-                                     gState.activeTransportId, static_cast<int64_t>(done), 0.0, nowMs()});
             if (fail.empty()) gState.phoneLinkProblem.clear();
         }
         addLogLocked("VFS", (move ? "Moved " : "Copied ") + uiWideToUtf8(targets[0].name),
@@ -4531,6 +5269,7 @@ static void uiOpDownloadToPc(int pane) {
 }
 
 static void uiOpSetClipboard(int pane, const std::wstring& op) {
+    if (uiBlockAtThisPc(pane, op == L"move" ? L"Cut" : L"Copy")) return;
     gClipboardPaths.clear();
     for (const int i : uiSelectedIndices(gPane[pane])) gClipboardPaths.push_back(gPane[pane].items[i].path);
     if (gClipboardPaths.empty()) { uiToast(L"Nothing selected."); return; }
@@ -4541,6 +5280,7 @@ static void uiOpSetClipboard(int pane, const std::wstring& op) {
 }
 
 static void uiOpPaste(int pane) {
+    if (uiBlockAtThisPc(pane, L"Paste")) return;
     if (gClipboardPaths.empty()) { uiToast(L"The ChainIt clipboard is empty."); return; }
     if (gClipboardPane == pane) { uiToast(L"Paste into the other pane to copy between PC and phone."); return; }
 
@@ -4716,7 +5456,8 @@ struct ToolBtn {
     bool separator = false;
 };
 
-enum UiHitKind { HIT_NONE = 0, HIT_TAB, HIT_TOOL, HIT_PANE, HIT_HEAD, HIT_ROW, HIT_LINK, HIT_ABOUT };
+enum UiHitKind { HIT_NONE = 0, HIT_TAB, HIT_TOOL, HIT_PANE, HIT_HEAD, HIT_ROW, HIT_LINK, HIT_ABOUT,
+                 HIT_RECENT, HIT_RECENTBTN };
 struct UiHit {
     int kind = HIT_NONE;
     int id = 0;
@@ -4735,20 +5476,26 @@ struct UiLayout {
     RECT head[2]{};      // column header
     RECT list[2]{};      // rows
     RECT tabs{};
-    RECT tab[3]{};
+    RECT tab[4]{};
     RECT toolbar{};
     RECT status{};
     std::vector<ToolBtn> tools;
     RECT linkBtns[8]{};
     int linkBtnCount = 0;
+    // Recent tab (v1.7.0): the row area plus its two actions.
+    RECT recentList{};
+    RECT recentBtns[2]{};
+    int recentBtnCount = 0;
 };
 
 static const wchar_t* kToolLabels[] = {
-    L"Up", L"Refresh", L"New folder", L"Cut", L"Copy", L"Paste", L"Rename", L"Delete",
+    L"Up", L"Drives", L"Refresh", L"New folder", L"Cut", L"Copy", L"Paste", L"Rename", L"Delete",
     L"Send to phone", L"Save to PC", L"PC", L"Phone", L"Split view",
 };
-static const int kToolIds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-static const int kToolCount = 13;
+// Ids, not positions: 13 is the v1.7.0 volume chooser, drawn next to Up but keeping every existing id
+// stable so the enable rules and the uiRunTool cases do not move.
+static const int kToolIds[] = {0, 13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+static const int kToolCount = 14;
 
 static UiLayout uiComputeLayout(HWND hwnd) {
     UiLayout L;
@@ -4758,10 +5505,10 @@ static UiLayout uiComputeLayout(HWND hwnd) {
     L.cy = rc.bottom - rc.top;
 
     L.tabs = RECT{0, 0, L.cx, kTabH};
-    const wchar_t* tabNames[3] = {L"Files", L"Link", L"About"};
+    const wchar_t* tabNames[4] = {L"Files", L"Link", L"Recent", L"About"};
     HDC dc = GetDC(hwnd);
     int tx = 12;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         int w = uiTextW(dc, tabNames[i], gFontBold) + 34;
         L.tab[i] = RECT{tx, 6, tx + w, kTabH - 4};
         tx += w + 4;
@@ -4777,7 +5524,7 @@ static UiLayout uiComputeLayout(HWND hwnd) {
         ToolBtn b;
         b.id = kToolIds[i];
         b.label = kToolLabels[i];
-        if (i == 3 || i == 8 || i == 10) { bx += 10; }   // group gaps
+        if (i == 4 || i == 9 || i == 11) { bx += 10; }   // group gaps
         int w = uiTextW(dc, b.label, gFontUi) + 24;
         b.rc = RECT{bx, by, bx + w, by + 28};
         bx += w + 6;
@@ -4797,10 +5544,20 @@ static UiLayout uiComputeLayout(HWND hwnd) {
             const int bw = 232, bh = 30;
             const int xx = L.cx - bw - 24;
             int yy = top + 20;
-            for (int i = 0; i < 7 && yy + bh <= bot - 8; ++i) {
+            for (int i = 0; i < 8 && yy + bh <= bot - 8; ++i) {
                 L.linkBtns[L.linkBtnCount++] = RECT{xx, yy, xx + bw, yy + bh};
                 yy += bh + 8;
             }
+        }
+        if (gTab == TAB_RECENT) {
+            // Actions sit on the title line; rows fill whatever is left above the status bar.
+            const int bw = 132, bh = 28;
+            int xx = L.cx - 24 - bw;
+            for (int i = 0; i < 2; ++i) {
+                L.recentBtns[L.recentBtnCount++] = RECT{xx, top + 22, xx + bw, top + 22 + bh};
+                xx -= bw + 8;
+            }
+            L.recentList = RECT{24, top + 92, L.cx - 24, bot - 12};
         }
         return L;
     }
@@ -4833,7 +5590,8 @@ static int uiPaneSlot(const UiLayout& L, int paneId) {
 }
 
 static std::wstring uiPathCrumb(const std::wstring& dir) {
-    if (dir.empty() || dir == L"/") return L"Root";
+    if (dir == kPcThisPc) return L"This PC";
+    if (dir.empty()) return L"Root";
     std::wstring out;
     size_t i = 0;
     while (i < dir.size()) {
@@ -4842,6 +5600,13 @@ static std::wstring uiPathCrumb(const std::wstring& dir) {
         if (j > i) { if (!out.empty()) out += L"  \u203A  "; out += dir.substr(i, j - i); }
         i = j + 1;
     }
+    if (dir == L"/") {
+        // Name the volume the profile lives on, so "/" is not mistaken for "the whole PC".
+        return std::wstring(L"This PC  \u203A  ") + uiUtf8ToWide(pcRootLetter()) + L":  \u203A  " +
+               uiUtf8ToWide(gState.pcRoot.filename().u8string());
+    }
+    // "/D:/Games" reads as a volume, not as a folder under the profile.
+    if (dir.size() >= 3 && dir[0] == L'/' && dir[2] == L':') return L"This PC  \u203A  " + (out.empty() ? std::wstring(L"Root") : out);
     return out.empty() ? L"Root" : out;
 }
 
@@ -4868,6 +5633,20 @@ struct UiLinkInfo {
     std::vector<std::wstring> paired;
     std::vector<std::wstring> lan;
     uint64_t phoneTotal = 0, phoneUsed = 0;
+
+    // v1.7.0 - the phone's own battery telemetry (BatteryManager), plus the PC-side reach and the
+    // size of the shared-file history, so one card can answer "will this link survive the night?".
+    int batteryPct = 0;
+    bool batteryCharging = false;
+    std::wstring batterySource;      // ac | usb | wireless | none
+    double batteryTempC = 0.0;
+    int64_t batteryAgeMs = 0;        // 0 with batteryEver == false means "no phone has reported yet"
+    bool batteryEver = false;
+    bool screenLocked = true;
+    bool allowOtherDrives = true;
+    std::wstring pcRootLetter;
+    int volumeCount = 0;
+    size_t recentCount = 0;
 };
 
 static UiLinkInfo uiLinkInfo() {
@@ -4884,9 +5663,20 @@ static UiLinkInfo uiLinkInfo() {
         s.btListening = gState.btReceiverListening;
         s.phoneTotal = gState.phoneTotalBytes;
         s.phoneUsed = gState.phoneUsedBytes;
+        s.batteryPct = gState.phoneBatteryPct;
+        s.batteryCharging = gState.phoneCharging;
+        s.batterySource = uiUtf8ToWide(gState.phoneChargeSource);
+        s.batteryTempC = gState.phoneTempC;
+        s.batteryEver = (gState.phoneSeenMs > 0);
+        s.batteryAgeMs = (gState.phoneSeenMs > 0) ? (nowMs() - gState.phoneSeenMs) : 0;
+        s.screenLocked = gState.phoneScreenLocked;
+        s.allowOtherDrives = gState.allowOtherDrives;
+        s.pcRootLetter = uiUtf8ToWide(pcRootLetter());
+        s.recentCount = gState.transfers.size();
         for (const auto& d : gState.btPairedDevices) s.paired.push_back(uiUtf8ToWide(d));
         for (const auto& kv : gState.phoneEndpoints) s.lan.push_back(uiUtf8ToWide(kv.second.kind) + L"  " + uiUtf8ToWide(kv.first));
     }
+    s.volumeCount = static_cast<int>(enumerateDrives().size());
     s.pooled = static_cast<int>(btPooledChannels());
     s.maxCh = static_cast<int>(kBtChannelCount);
     s.cachedCh = static_cast<int>(gBtCachedPort.load());
@@ -4911,13 +5701,15 @@ static const wchar_t* kLinkBtnLabels[] = {
     L"Rescan all transports", L"Mount / refresh Z:", L"Open Z: in Explorer",
     L"Create desktop shortcut", L"Show mini hub panel", L"Update ChainIt in place",
     L"Copy pairing key",
+    // Index 7 is drawn from live state (see uiPaintLinkTab): it names the drive-reach switch.
+    L"Other drives",
 };
 
 static void uiPaintTabs(HDC dc, const UiLayout& L) {
     uiFill(dc, L.tabs, kColChrome);
     uiLine(dc, 0, kTabH - 1, L.cx, kTabH - 1, kColLine);
-    const wchar_t* names[3] = {L"Files", L"Link", L"About"};
-    for (int i = 0; i < 3; ++i) {
+    const wchar_t* names[4] = {L"Files", L"Link", L"Recent", L"About"};
+    for (int i = 0; i < 4; ++i) {
         const RECT r = L.tab[i];
         const bool on = (gTab == i);
         if (on) {
@@ -4944,20 +5736,24 @@ static void uiPaintToolbar(HDC dc, UiLayout& L) {
     const bool sel = !uiSelectedIndices(ap).empty();
     const bool pcSel = !uiSelectedIndices(gPane[PANE_PC]).empty();
     const bool phSel = !uiSelectedIndices(gPane[PANE_PHONE]).empty();
+    const bool atThisPc = uiAtThisPc(gActivePane);
 
     for (size_t i = 0; i < L.tools.size(); ++i) {
         ToolBtn b = L.tools[i];
         switch (b.id) {
-            case 0: b.enabled = (ap.dir != L"/" && !ap.dir.empty() && gTab == TAB_FILES); break;
+            // At the This PC level the pane lists volumes, so everything that acts on files is dimmed
+            // instead of being left to fail; Up is dimmed too, there is nothing above the volumes.
+            case 0: b.enabled = (ap.dir != kPcThisPc && !ap.dir.empty() && gTab == TAB_FILES); break;
+            case 13: b.enabled = (gTab == TAB_FILES); break;
             case 1: b.enabled = (gTab == TAB_FILES); break;
-            case 2: b.enabled = (gTab == TAB_FILES); break;
-            case 3: b.enabled = sel && gTab == TAB_FILES; break;
-            case 4: b.enabled = sel && gTab == TAB_FILES; break;
-            case 5: b.enabled = !gClipboardPaths.empty() && gTab == TAB_FILES; break;
-            case 6: b.enabled = (uiSelectedIndices(ap).size() == 1 && gTab == TAB_FILES); break;
-            case 7: b.enabled = sel && gTab == TAB_FILES; break;
-            case 8: b.enabled = pcSel && gTab == TAB_FILES; break;
-            case 9: b.enabled = phSel && gTab == TAB_FILES; break;
+            case 2: b.enabled = (gTab == TAB_FILES) && !atThisPc; break;
+            case 3: b.enabled = sel && gTab == TAB_FILES && !atThisPc; break;
+            case 4: b.enabled = sel && gTab == TAB_FILES && !atThisPc; break;
+            case 5: b.enabled = !gClipboardPaths.empty() && gTab == TAB_FILES && !atThisPc; break;
+            case 6: b.enabled = (uiSelectedIndices(ap).size() == 1 && gTab == TAB_FILES && !atThisPc); break;
+            case 7: b.enabled = sel && gTab == TAB_FILES && !atThisPc; break;
+            case 8: b.enabled = pcSel && gTab == TAB_FILES && !atThisPc; break;
+            case 9: b.enabled = phSel && gTab == TAB_FILES && !atThisPc; break;
             case 10: case 11: b.enabled = (gTab == TAB_FILES); b.active = (!gDualPane && gActivePane == (b.id - 10)); break;
             case 12: b.enabled = (gTab == TAB_FILES && L.cx >= 900); b.active = gDualPane; break;
             default: break;
@@ -5149,23 +5945,404 @@ static void uiPaintPaneRows(HDC dc, const UiLayout& L, int slot, int paneId) {
     DeleteObject(clip);
 }
 
+/** "just now" / "4 min ago" / "3 h ago" - how old the phone's last telemetry is. */
+static std::wstring uiAgoText(int64_t ageMs) {
+    if (ageMs <= 0) return L"just now";
+    const int64_t sec = ageMs / 1000;
+    if (sec < 45) return L"just now";
+    if (sec < 90) return L"1 min ago";
+    if (sec < 5400) return std::to_wstring(sec / 60) + L" min ago";
+    if (sec < 86400) return std::to_wstring(sec / 3600) + L" h ago";
+    return std::to_wstring(sec / 86400) + L" d ago";
+}
+
+static std::wstring uiChargeSourceText(const std::wstring& src) {
+    if (src == L"ac") return L"mains (AC)";
+    if (src == L"usb") return L"USB";
+    if (src == L"wireless") return L"wireless pad";
+    return L"";
+}
+
+/** Colour for a battery percentage: emerald when healthy, amber when low, red when critical. */
+static COLORREF uiBatteryColor(int pct, bool charging) {
+    if (charging || pct >= 40) return kColEmerald;
+    if (pct >= 15) return kColAmber;
+    return kColDanger;
+}
+
+/**
+ * The battery line, in full (Link tab card) or short (status bar).
+ * Nothing is invented: when no phone has ever answered a ping the text says so, and when the last
+ * report is older than three minutes the age is shown next to the number.
+ */
+static std::wstring uiBatteryText(const UiLinkInfo& s, bool full, COLORREF& col) {
+    if (!s.batteryEver) {
+        col = kColFaint;
+        return full ? L"awaiting the phone's first report" : L"";
+    }
+    col = uiBatteryColor(s.batteryPct, s.batteryCharging);
+    std::wstring t = std::to_wstring(s.batteryPct) + L"%";
+    if (s.batteryCharging) {
+        const std::wstring how = uiChargeSourceText(s.batterySource);
+        t += full ? (L"  \u00B7  charging from " + (how.empty() ? std::wstring(L"the charger") : how))
+                  : L"  \u00B7  charging";
+    } else if (full) {
+        t += L"  \u00B7  on battery";
+    }
+    if (full && s.batteryTempC > 1.0) {
+        wchar_t b[32]; swprintf(b, 32, L"  \u00B7  %.1f\u00B0C", s.batteryTempC);
+        t += b;
+    }
+    if (s.batteryAgeMs > 180000) {
+        t += full ? (L"  \u00B7  last reported " + uiAgoText(s.batteryAgeMs))
+                  : (L"  (" + uiAgoText(s.batteryAgeMs) + L")");
+        col = kColDim;
+    } else if (full) {
+        t += L"  \u00B7  reported " + uiAgoText(s.batteryAgeMs);
+    }
+    return t;
+}
+
+/** Small battery gauge: outline + cap + fill proportional to the charge. */
+static void uiDrawBattery(HDC dc, int x, int y, int pct, bool charging, bool live) {
+    const int w = 46, h = 20;
+    const COLORREF col = live ? uiBatteryColor(pct, charging) : kColFaint;
+    uiLine(dc, x, y, x + w, y, col);
+    uiLine(dc, x, y + h, x + w, y + h, col);
+    uiLine(dc, x, y, x, y + h, col);
+    uiLine(dc, x + w, y, x + w, y + h, col);
+    uiFill(dc, RECT{x + w + 1, y + 6, x + w + 4, y + h - 6}, col);   // positive terminal
+    const int inner = w - 6;
+    int clamped = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    if (live && clamped == 0) clamped = 1;                          // never an invisible fill
+    const int fw = live ? (inner * clamped) / 100 : 0;
+    if (fw > 0) uiFill(dc, RECT{x + 3, y + 3, x + 3 + fw, y + h - 3}, col);
+    if (charging && live) {
+        // A plus sign inside the gauge reads as "on charge" without needing a symbol font.
+        const int cxm = x + w / 2, cym = y + h / 2;
+        uiLine(dc, cxm - 4, cym, cxm + 4, cym, kColBg);
+        uiLine(dc, cxm, cym - 4, cxm, cym + 4, kColBg);
+    }
+}
+
+// --- Recent shared files tab (v1.7.0) ---------------------------------------
+//
+// One row per file that actually moved between this PC and the phone: where it went, what carried it,
+// who started it and where it landed. The rows come from the same bounded history the API serves
+// (%APPDATA%\ChainIt\transfer-history.json, loaded at startup), so a share that happened while the
+// hub was closed or the phone's screen was off is still here after a restart.
+
+static const int kRecentRowH = 46;
+
+struct UiRecentRow {
+    std::wstring name;      // file name
+    std::wstring detail;    // direction, transport, who started it, clock time
+    std::wstring when;      // "3 min ago"
+    std::wstring size;      // human size, with the measured rate when there was one
+    std::wstring path;      // PC-side path; empty when nothing landed on this PC
+    bool toPc = false;      // arrow direction
+    bool hasPath = false;
+};
+
+static std::vector<UiRecentRow> gRecentRows;
+static int gRecentSel = -1;
+static int gRecentHover = -1;
+static int gRecentScroll = 0;
+static int64_t gRecentBuiltMs = 0;
+
+static std::wstring uiDirectionText(const std::wstring& dir) {
+    if (dir == L"pc_to_phone") return L"PC \u2192 Phone";
+    if (dir == L"phone_to_pc") return L"Phone \u2192 PC";
+    if (dir == L"internal_pc") return L"Within this PC";
+    return dir.empty() ? std::wstring(L"Transfer") : dir;
+}
+
+static std::wstring uiOpText(const std::wstring& op) {
+    if (op == L"move") return L"Moved";
+    if (op == L"copy") return L"Copied";
+    if (op == L"upload") return L"Received";
+    if (op == L"download") return L"Sent";
+    return L"Transferred";
+}
+
+static std::wstring uiSourceText(const std::wstring& src) {
+    if (src == L"ui") return L"started in the File Manager";
+    if (src == L"api") return L"started by a client call";
+    if (src == L"phone-upload") return L"pushed by the phone";
+    if (src == L"phone-download") return L"pulled by the phone";
+    return L"";
+}
+
+/** Rebuilds the rows from state. Cheap (a bounded copy), so it is simply refreshed twice a second. */
+static void uiRebuildRecent(bool force = false) {
+    if (!force && gRecentBuiltMs > 0 && (nowMs() - gRecentBuiltMs) < 500) return;
+    gRecentBuiltMs = nowMs();
+
+    std::vector<TransferItem> items;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        items = gState.transfers;
+    }
+    std::sort(items.begin(), items.end(),
+              [](const TransferItem& a, const TransferItem& b) { return a.ts > b.ts; });
+
+    std::vector<UiRecentRow> rows;
+    rows.reserve(items.size());
+    for (const TransferItem& t : items) {
+        UiRecentRow r;
+        r.name = uiUtf8ToWide(t.label.empty() ? std::string("(unnamed)") : t.label);
+        const std::wstring dir = uiUtf8ToWide(t.direction);
+        const std::wstring op = uiUtf8ToWide(t.op);
+        r.toPc = (t.direction == "phone_to_pc" || t.direction == "internal_pc");
+
+        std::wstring d = uiOpText(op) + L"  \u00B7  " + uiDirectionText(dir);
+        const std::wstring tr = uiTransportPretty(uiUtf8ToWide(t.transportUsed));
+        if (!tr.empty()) d += L"  \u00B7  " + tr;
+        const std::wstring src = uiSourceText(uiUtf8ToWide(t.source));
+        if (!src.empty()) d += L"  \u00B7  " + src;
+        if (t.ts > 0) d += L"  \u00B7  at " + uiFormatTime(t.ts);
+        r.detail = d;
+
+        r.when = (t.ts > 0) ? uiAgoText(nowMs() - t.ts) : L"";
+        r.size = uiFormatBytes(static_cast<uint64_t>(t.bytes > 0 ? t.bytes : 0));
+        if (t.speedMBps > 0.05) {
+            wchar_t b[32]; swprintf(b, 32, L"  \u00B7  %.1f MB/s", t.speedMBps);
+            r.size += b;
+        }
+        r.path = uiUtf8ToWide(t.localPath);
+        r.hasPath = !t.localPath.empty();
+        rows.push_back(r);
+    }
+    gRecentRows.swap(rows);
+    if (gRecentSel >= static_cast<int>(gRecentRows.size())) gRecentSel = -1;
+}
+
+/** Row index under a y coordinate, or -1 for the gap below the last row. */
+static int uiRecentRowAt(const RECT& listRc, int y) {
+    uiRebuildRecent();
+    const int idx = (y - listRc.top + gRecentScroll) / kRecentRowH;
+    if (idx < 0 || idx >= static_cast<int>(gRecentRows.size())) return -1;
+    return idx;
+}
+
+/** Opens the file, or its folder when the file itself is gone or is a folder. */
+static void uiRecentOpen(int row, bool revealFolder) {
+    uiRebuildRecent();
+    if (row < 0 || row >= static_cast<int>(gRecentRows.size())) return;
+    const UiRecentRow r = gRecentRows[row];
+    if (!r.hasPath) {
+        uiToast(L"That entry did not land on this PC, so there is no folder to open.", 5000);
+        return;
+    }
+    const fs::path real = fs::u8path(uiWideToUtf8(r.path));
+    std::error_code ec;
+    if (!fs::exists(real, ec)) {
+        uiToast(r.name + L" is not at that path any more \u2014 it was moved, renamed or deleted since.", 6000);
+        return;
+    }
+    if (revealFolder || fs::is_directory(real, ec)) {
+        const fs::path target = fs::is_directory(real, ec) ? real : real.parent_path();
+        std::wstring args = fs::is_directory(real, ec) ? (L"\"" + real.wstring() + L"\"")
+                                                       : (L"/select,\"" + real.wstring() + L"\"");
+        ShellExecuteW(gMainHwnd, L"open", L"explorer.exe", args.c_str(), target.c_str(), SW_SHOWNORMAL);
+        return;
+    }
+    ShellExecuteW(gMainHwnd, L"open", real.c_str(), nullptr, real.parent_path().c_str(), SW_SHOWNORMAL);
+}
+
+static void uiRecentCopyPath(int row) {
+    uiRebuildRecent();
+    if (row < 0 || row >= static_cast<int>(gRecentRows.size())) return;
+    const std::wstring w = gRecentRows[row].path;
+    if (w.empty()) { uiToast(L"No PC path recorded for that entry.", 4000); return; }
+    if (OpenClipboard(gMainHwnd)) {
+        EmptyClipboard();
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
+        if (g) {
+            wchar_t* p = static_cast<wchar_t*>(GlobalLock(g));
+            if (p) { memcpy(p, w.c_str(), (w.size() + 1) * sizeof(wchar_t)); GlobalUnlock(g); }
+            SetClipboardData(CF_UNICODETEXT, g);
+        }
+        CloseClipboard();
+    }
+    uiToast(L"Path copied: " + w, 5000);
+}
+
+static void uiRecentClear(HWND hwnd) {
+    const int n = static_cast<int>(gRecentRows.size());
+    if (n == 0) { uiToast(L"The shared-file history is already empty.", 3500); return; }
+    wchar_t q[160];
+    swprintf(q, 160, L"Remove all %d entries from the shared-file history on this PC?", n);
+    if (MessageBoxW(hwnd, q, L"Clear recent shared files", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
+    {
+        std::lock_guard<std::mutex> lk(gState.mtx);
+        gState.transfers.clear();
+    }
+    std::ofstream f(chainItHistoryFile(), std::ios::binary | std::ios::trunc);
+    if (f.is_open()) { f << "{\"schema\":2,\"transfers\":[]}"; f.close(); }
+    addLogLocked("VFS", "Shared-file history cleared", std::to_string(n) + " entry/entries removed from this PC.");
+    gRecentSel = -1;
+    gRecentScroll = 0;
+    uiRebuildRecent(true);
+    uiToast(L"Shared-file history cleared.", 4000);
+    if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void uiRecentMenu(HWND hwnd, int row, const POINT* screenPt) {
+    uiRebuildRecent();
+    if (row >= 0 && row < static_cast<int>(gRecentRows.size())) gRecentSel = row;
+    const bool one = (row >= 0 && row < static_cast<int>(gRecentRows.size()));
+    const bool hasPath = one && gRecentRows[row].hasPath;
+
+    HMENU m = CreatePopupMenu();
+    auto add = [&](UINT id, const wchar_t* text, bool enable) {
+        AppendMenuW(m, MF_STRING | (enable ? MF_ENABLED : MF_GRAYED), id, text);
+    };
+    add(1, L"Open", hasPath);
+    add(2, L"Open containing folder", hasPath);
+    add(3, L"Copy PC path", hasPath);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    add(4, L"Clear history\u2026", !gRecentRows.empty());
+
+    POINT pt{};
+    if (screenPt) pt = *screenPt; else GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    const UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    switch (cmd) {
+        case 1: uiRecentOpen(row, false); break;
+        case 2: uiRecentOpen(row, true); break;
+        case 3: uiRecentCopyPath(row); break;
+        case 4: uiRecentClear(hwnd); break;
+        default: break;
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static const wchar_t* kRecentBtnLabels[2] = {L"Clear history\u2026", L"Refresh"};
+
+static void uiPaintRecentTab(HDC dc, const UiLayout& L) {
+    const int top = kTabH + kToolH;
+    const int bot = L.status.top;
+    uiFill(dc, RECT{0, top, L.cx, bot}, kColBg);
+    uiRebuildRecent();
+
+    const int n = static_cast<int>(gRecentRows.size());
+
+    // title line
+    uiText(dc, RECT{24, top + 18, L.cx - 320, top + 44}, L"Recent shared files", kColText, gFontBold);
+    std::wstring sub;
+    if (n == 0) {
+        sub = L"Nothing has moved between this PC and the phone yet \u2014 copy a file on the Files tab and it lands here.";
+    } else {
+        sub = std::to_wstring(n) + (n == 1 ? L" file" : L" files") + L", newest first  \u00B7  kept in " +
+              uiUtf8ToWide(chainItHistoryFile().generic_u8string()) + L"  \u00B7  survives a restart";
+    }
+    uiText(dc, RECT{24, top + 46, L.cx - 320, top + 68}, sub, kColDim, gFontSmall);
+
+    // buttons
+    for (int i = 0; i < L.recentBtnCount; ++i) {
+        const RECT r = L.recentBtns[i];
+        const bool hov = (gRecentHover == 1000 + i);
+        const bool enable = (i == 0) ? (n > 0) : true;
+        uiRound(dc, r, hov ? kColBtnHover : kColBtn, hov ? kColEmerald : kColLine, 7);
+        uiText(dc, RECT{r.left + 12, r.top, r.right - 12, r.bottom}, kRecentBtnLabels[i],
+               enable ? kColText : kColFaint, gFontUi);
+    }
+
+    // column header
+    const RECT lr = L.recentList;
+    const int rowW = lr.right - lr.left;
+    uiLine(dc, lr.left, lr.top - 8, lr.right, lr.top - 8, kColLine);
+    uiText(dc, RECT{lr.left + 38, lr.top - 30, lr.left + 300, lr.top - 10}, L"File", kColFaint, gFontSmall);
+    uiText(dc, RECT{lr.right - 300, lr.top - 30, lr.right - 170, lr.top - 10}, L"Size / rate", kColFaint, gFontSmall,
+           DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    uiText(dc, RECT{lr.right - 160, lr.top - 30, lr.right - 4, lr.top - 10}, L"When", kColFaint, gFontSmall,
+           DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+    if (n == 0) {
+        RECT empty{lr.left + 24, lr.top + 40, lr.right - 24, lr.top + 150};
+        uiRound(dc, empty, kColChrome, kColLine, 10);
+        uiText(dc, RECT{empty.left + 20, empty.top + 18, empty.right - 20, empty.top + 46},
+               L"No shared files recorded on this PC yet", kColText, gFontBold);
+        uiText(dc, RECT{empty.left + 20, empty.top + 52, empty.right - 20, empty.bottom - 16},
+               L"Send to phone, Save to PC, or let the phone push a file while its screen is off \u2014 every one of "
+               L"those is written here with the transport that carried it and the folder it landed in.",
+               kColDim, gFontSmall);
+        (void)rowW;
+        return;
+    }
+
+    const int maxScroll = (std::max)(0, n * kRecentRowH - static_cast<int>(lr.bottom - lr.top));
+    if (gRecentScroll > maxScroll) gRecentScroll = maxScroll;
+    if (gRecentScroll < 0) gRecentScroll = 0;
+
+    for (int i = 0; i < n; ++i) {
+        const int ry = lr.top - gRecentScroll + i * kRecentRowH;
+        if (ry + kRecentRowH < lr.top || ry > lr.bottom) continue;
+        const RECT rr{lr.left, ry, lr.right, ry + kRecentRowH - 2};
+        const bool sel = (gRecentSel == i);
+        const bool hov = (gRecentHover == i);
+        if (sel) uiFill(dc, rr, kColSel);
+        else if (hov) uiFill(dc, rr, kColHover);
+        if (i > 0) uiLine(dc, rr.left, rr.top, rr.right, rr.top, kColLineSoft);
+
+        const UiRecentRow& r = gRecentRows[i];
+        // direction glyph: down arrow when the bytes landed here, up arrow when they left
+        uiText(dc, RECT{rr.left + 12, rr.top + 4, rr.left + 34, rr.top + 26},
+               r.toPc ? L"\u2193" : L"\u2191", r.toPc ? kColEmerald : kColCyan, gFontBold);
+        uiText(dc, RECT{rr.left + 38, rr.top + 3, rr.right - 320, rr.top + 24}, r.name.c_str(),
+               sel ? kColText : kColText, gFontUi, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        uiText(dc, RECT{rr.left + 38, rr.top + 23, rr.right - 320, rr.top + 42}, r.detail.c_str(),
+               kColDim, gFontSmall, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        uiText(dc, RECT{rr.right - 300, rr.top + 3, rr.right - 170, rr.top + 24}, r.size.c_str(), kColDim, gFontSmall,
+               DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        uiText(dc, RECT{rr.right - 160, rr.top + 3, rr.right - 14, rr.top + 24}, r.when.c_str(),
+               sel ? kColEmerald : kColDim, gFontSmall, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        if (!r.hasPath) {
+            uiText(dc, RECT{rr.right - 300, rr.top + 23, rr.right - 14, rr.top + 42},
+                   L"no path on this PC", kColFaint, gFontSmall,
+                   DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
+    }
+    (void)rowW;
+}
+
 static void uiPaintStatus(HDC dc, const UiLayout& L) {
     uiFill(dc, L.status, kColChrome);
     uiLine(dc, 0, L.status.top, L.cx, L.status.top, kColLine);
 
     UiList& l = gPane[gActivePane];
     std::vector<int> sel = uiSelectedIndices(l);
-    std::wstring left = std::to_wstring(l.items.size()) +
-                        (!l.filter.empty() && l.allItems.size() != l.items.size()
-                             ? (L" of " + std::to_wstring(l.allItems.size()) + L" matching")
-                             : L"") +
-                        L" items";
-    if (l.loading) left += L"  \u00B7  reading\u2026";
-    if (!sel.empty()) {
-        left += L"  \u00B7  " + std::to_wstring(sel.size()) + L" selected";
-        if (sel.size() > 1 || !l.items[sel[0]].isDir) left += L"  \u00B7  " + uiFormatBytes(uiSelectedBytes(l));
+    std::wstring left;
+    if (gTab == TAB_RECENT) {
+        // The Recent tab has no panes, so the counter that would otherwise read "0 items" is replaced
+        // by the thing this tab is actually about.
+        uiRebuildRecent();
+        const int n = static_cast<int>(gRecentRows.size());
+        left = std::to_wstring(n) + (n == 1 ? L" shared file" : L" shared files");
+        if (n > 0) left += L"  \u00B7  newest " + gRecentRows[0].when;
+        if (gRecentSel >= 0 && gRecentSel < n) left += L"  \u00B7  1 selected";
+        left += L"  \u00B7  double-click opens the file, right-click for its folder";
+    } else {
+        left = std::to_wstring(l.items.size()) +
+               (!l.filter.empty() && l.allItems.size() != l.items.size()
+                    ? (L" of " + std::to_wstring(l.allItems.size()) + L" matching")
+                    : L"") +
+               L" items";
+        if (l.loading) left += L"  \u00B7  reading\u2026";
+        if (!sel.empty()) {
+            left += L"  \u00B7  " + std::to_wstring(sel.size()) + L" selected";
+            if (sel.size() > 1 || !l.items[sel[0]].isDir) left += L"  \u00B7  " + uiFormatBytes(uiSelectedBytes(l));
+        }
+        if (gTab == TAB_LINK) {
+            left += L"  \u00B7  " + std::to_wstring(uiLinkInfo().volumeCount) + L" volume(s) on this PC  \u00B7  " +
+                    (gAllowOtherDrives.load() ? L"other drives reachable" : L"profile folder only");
+        }
     }
-    uiText(dc, RECT{14, L.status.top, L.cx / 2, L.status.bottom}, left, kColDim, gFontSmall);
+    uiText(dc, RECT{14, L.status.top, L.cx / 2, L.status.bottom}, left, kColDim, gFontSmall,
+           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
     const UiLinkInfo li = uiLinkInfo();
     std::wstring mid = uiTransportPretty(li.transport);
@@ -5174,7 +6351,10 @@ static void uiPaintStatus(HDC dc, const UiLayout& L) {
         wchar_t b[32]; swprintf(b, 32, L"%.0f ms", li.rttMs);
         mid += L"  \u00B7  " + std::wstring(b);
     }
-    uiText(dc, RECT{L.cx / 2 - 200, L.status.top, L.cx / 2 + 200, L.status.bottom}, mid,
+    COLORREF bcol = kColEmerald;
+    const std::wstring bt = uiBatteryText(li, false, bcol);
+    if (!bt.empty()) mid += L"  \u00B7  phone " + bt;
+    uiText(dc, RECT{L.cx / 2 - 260, L.status.top, L.cx / 2 + 200, L.status.bottom}, mid,
            li.problem.empty() ? kColEmerald : kColAmber, gFontSmall,
            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -5228,19 +6408,47 @@ static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
     uiText(dc, RECT{hl.left + 18, hl.top + 10, hl.right - 18, hl.top + 32},
            ok ? L"Linked and serving files" : (s.endpoint.empty() ? L"Searching for your phone" : L"Linked, but the phone is not answering"),
            ok ? kColEmerald : kColAmber, gFontBold);
-    uiText(dc, RECT{hl.left + 18, hl.top + 34, hl.right - 18, hl.bottom - 8},
+    uiText(dc, RECT{hl.left + 18, hl.top + 34, hl.right - 200, hl.bottom - 8},
            s.problem.empty()
                ? (s.peer.empty() ? std::wstring(L"No device name reported yet") : s.peer)
                : s.problem,
            kColDim, gFontSmall);
+
+    // The phone's charge, drawn where the link state is: a long session over Bluetooth is exactly
+    // when a dying phone stops answering, so this is link information, not decoration.
+    {
+        COLORREF bcol = kColFaint;
+        const std::wstring bt = uiBatteryText(s, false, bcol);
+        const int gx = hl.right - 18 - 50;
+        const int gy = hl.top + (62 - 20) / 2;
+        uiDrawBattery(dc, gx, gy, s.batteryPct, s.batteryCharging, s.batteryEver);
+        if (!bt.empty()) {
+            uiText(dc, RECT{gx - 150, gy - 2, gx - 8, gy + 22}, bt, bcol, gFontSmall,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        } else {
+            uiText(dc, RECT{gx - 150, gy - 2, gx - 8, gy + 22}, L"no phone report yet", kColFaint, gFontSmall,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
     y += 78;
 
-    RECT c1{24, y, 24 + colW, y + 214};
+    RECT c1{24, y, 24 + colW, y + 262};
     uiCard(dc, c1, L"Transport");
     int yy = c1.top + 46;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Active transport", uiTransportPretty(s.transport), kColCyan); yy += 24;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone endpoint", s.endpoint, kColText); yy += 24;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Peer device", s.peer, kColText); yy += 24;
+    {
+        COLORREF bcol = kColFaint;
+        const std::wstring bt = uiBatteryText(s, true, bcol);
+        uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone battery", bt, bcol);
+        uiDrawBattery(dc, c1.right - 78, yy - 1, s.batteryPct, s.batteryCharging, s.batteryEver);
+    }
+    yy += 24;
+    uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone screen",
+         s.batteryEver ? (s.screenLocked ? L"locked (transfers still run)" : L"unlocked and awake")
+                       : L"unknown \u2014 no report yet",
+         s.batteryEver ? (s.screenLocked ? kColDim : kColText) : kColFaint); yy += 24;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Sibling Mode", s.siblingOn ? L"on" : L"off", s.siblingOn ? kColEmerald : kColAmber); yy += 24;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Z: drive", s.zMounted ? L"mounted" : L"not mounted", s.zMounted ? kColEmerald : kColAmber); yy += 24;
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone storage",
@@ -5248,7 +6456,7 @@ static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
     uiKv(dc, c1.left + 18, yy, colW - 40, L"Discovered endpoints",
          s.lan.empty() ? L"none yet" : std::to_wstring(s.lan.size()) + L" candidate(s)", kColDim);
 
-    y += 230;
+    y += 278;
     RECT c2{24, y, 24 + colW, y + 176};
     uiCard(dc, c2, L"Bluetooth RFCOMM link");
     yy = c2.top + 46;
@@ -5286,7 +6494,15 @@ static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
         if (r.top > bot - 8) break;
         const bool hov = (gLinkHover == i);
         uiRound(dc, r, hov ? kColBtnHover : kColBtn, hov ? kColEmerald : kColLine, 7);
-        uiText(dc, RECT{r.left + 14, r.top, r.right - 14, r.bottom}, kLinkBtnLabels[i], kColText, gFontUi);
+        // The last button reports the drive-reach switch it toggles, so its label cannot be static.
+        std::wstring label = kLinkBtnLabels[i];
+        if (i == 7) {
+            label = s.allowOtherDrives
+                        ? (L"Other drives: reachable (" + std::to_wstring(s.volumeCount) + L")")
+                        : (L"Other drives: blocked (" + s.pcRootLetter + L": only)");
+        }
+        uiText(dc, RECT{r.left + 14, r.top, r.right - 14, r.bottom}, label,
+               (i == 7 && !s.allowOtherDrives) ? kColAmber : kColText, gFontUi);
     }
 }
 
@@ -5386,8 +6602,19 @@ static int uiColumnAt(const UiLayout& L, int slot, int x) {
 
 static UiHit uiHitTest(const UiLayout& L, int x, int y) {
     UiHit h;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (PtInRect(&L.tab[i], POINT{x, y})) { h.kind = HIT_TAB; h.id = i; return h; }
+    }
+    if (gTab == TAB_RECENT) {
+        for (int i = 0; i < L.recentBtnCount; ++i) {
+            if (PtInRect(&L.recentBtns[i], POINT{x, y})) { h.kind = HIT_RECENTBTN; h.id = i; return h; }
+        }
+        if (PtInRect(&L.recentList, POINT{x, y})) {
+            h.kind = HIT_RECENT;
+            h.row = uiRecentRowAt(L.recentList, y);
+            return h;
+        }
+        return h;
     }
     for (size_t i = 0; i < L.tools.size(); ++i) {
         if (PtInRect(&L.tools[i].rc, POINT{x, y})) { h.kind = HIT_TOOL; h.id = static_cast<int>(i); return h; }
@@ -5415,6 +6642,81 @@ static UiHit uiHitTest(const UiLayout& L, int x, int y) {
 
 // --- toolbar + link actions -------------------------------------------------
 
+/** Defined with the Link tab actions; the Drives menu reuses its reach toggle. */
+static void uiRunLink(int id);
+
+/**
+ * Volume chooser for the PC pane (v1.7.0).
+ *
+ * Lists every volume Windows reports with its real free/total space, marks the one currently shown,
+ * and offers Explorer's "This PC" level plus the reach switch. A volume with no media is listed as
+ * such rather than hidden, so an empty card reader is visible instead of mysterious.
+ */
+static void uiShowDrivesMenu() {
+    if (!gMainHwnd) return;
+    const std::vector<DriveInfo> ds = enumerateDrives();
+    const std::wstring cur = gPane[PANE_PC].dir;
+    const std::wstring rootLetter = uiUtf8ToWide(pcRootLetter());
+    bool allow = false;
+    { std::lock_guard<std::mutex> lk(gState.mtx); allow = gState.allowOtherDrives; }
+
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | MF_ENABLED | (cur == kPcThisPc ? MF_CHECKED : 0), 100,
+                L"This PC  \u2014  choose a drive");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+
+    int idx = 0;
+    for (const DriveInfo& d : ds) {
+        const std::wstring letter(1, static_cast<wchar_t>(d.letter));
+        const std::wstring virt = (letter == rootLetter) ? std::wstring(L"/") : (L"/" + letter + L":");
+        std::wstring label = letter + L":\\";
+        if (!d.label.empty()) label += L"  " + uiUtf8ToWide(drvUtf8(d.label));
+        if (letter == rootLetter) label += L"   (ChainIt profile root)";
+        if (!d.ready) label += (d.kind == L"network") ? L"   \u2014  remote, not probed" : L"   \u2014  no media";
+        else if (d.totalBytes > 0) label += L"   \u2014  " + uiFormatBytes(d.freeBytes) + L" free of " + uiFormatBytes(d.totalBytes);
+
+        const bool on = (cur == virt) || (virt != L"/" && cur.size() > virt.size() && cur.compare(0, virt.size(), virt) == 0);
+        UINT flags = MF_STRING;
+        // Choosing a blocked volume would silently land back on the profile folder, so say so instead.
+        if (!allow && letter != rootLetter) label += L"   (blocked)";
+        else flags |= MF_ENABLED;
+        if (on) flags |= MF_CHECKED;
+        AppendMenuW(m, flags, static_cast<UINT>(200 + idx), label.c_str());
+        ++idx;
+    }
+
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | MF_ENABLED | (allow ? MF_CHECKED : 0), 900,
+                allow ? L"Block other drives (profile folder only)"
+                      : L"Allow other drives (/D:, /E:, removable, mapped)");
+
+    POINT pt{};
+    GetCursorPos(&pt);
+    SetForegroundWindow(gMainHwnd);
+    const UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, gMainHwnd, nullptr);
+    DestroyMenu(m);
+    PostMessageW(gMainHwnd, WM_NULL, 0, 0);
+
+    if (cmd == 100) {
+        uiNavigate(PANE_PC, kPcThisPc);
+    } else if (cmd == 900) {
+        uiRunLink(7);
+    } else if (cmd >= 200 && cmd < 200u + ds.size()) {
+        const DriveInfo& d = ds[cmd - 200];
+        const std::wstring letter(1, static_cast<wchar_t>(d.letter));
+        if (!allow && letter != rootLetter) {
+            uiToast(L"Other drives are blocked on this PC. Allow them first \u2014 the last item in this "
+                    L"menu, or the button on the Link tab.", 7000);
+        } else if (!d.ready) {
+            uiToast(letter + L": has no media or did not answer, so there is nothing to list.", 6000);
+        } else {
+            gActivePane = PANE_PC;
+            uiNavigate(PANE_PC, (letter == rootLetter) ? std::wstring(L"/") : (L"/" + letter + L":"));
+        }
+    }
+    InvalidateRect(gMainHwnd, nullptr, FALSE);
+}
+
 static void uiRunTool(int id) {
     const int pane = gActivePane;
     switch (id) {
@@ -5439,6 +6741,7 @@ static void uiRunTool(int id) {
             if (gDualPane && gPane[PANE_PC].items.empty()) uiReload(PANE_PC);
             if (gDualPane && gPane[PANE_PHONE].items.empty()) uiReload(PANE_PHONE);
             break;
+        case 13: uiShowDrivesMenu(); break;
         default: break;
     }
     if (gMainHwnd) InvalidateRect(gMainHwnd, nullptr, FALSE);
@@ -5494,6 +6797,30 @@ static void uiRunLink(int id) {
                 CloseClipboard();
             }
             uiToast(L"Pairing key copied \u2014 paste the same value into ChainIt on the phone.");
+            break;
+        }
+        case 7: {
+            // Reach of "/" on this PC: profile folder only, or any volume by name (/D:, /E:, ...).
+            bool allow = false;
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                gState.allowOtherDrives = !gState.allowOtherDrives;
+                allow = gState.allowOtherDrives;
+            }
+            gAllowOtherDrives.store(allow);
+            persistSettings();
+            if (allow) {
+                const int n = static_cast<int>(enumerateDrives().size());
+                addLogLocked("VFS", "Other drives reachable",
+                             std::to_string(n) + " volume(s) can now be addressed as /D:, /E:, ... from the phone and the File Manager.");
+                uiToast(L"Other drives reachable \u2014 press Drives in the Files toolbar to switch volume.", 6000);
+                uiLoadPaneAsync(PANE_PC, gPane[PANE_PC].dir);
+            } else {
+                addLogLocked("VFS", "Other drives blocked",
+                             "Only the profile folder on " + pcRootLetter() + ": is reachable; /D: style paths fall back to it.");
+                uiToast(L"Other drives blocked \u2014 only the profile folder is reachable now.", 6000);
+                uiLoadPaneAsync(PANE_PC, gPane[PANE_PC].dir);
+            }
             break;
         }
         default: break;
@@ -5632,9 +6959,15 @@ static bool uiOnKey(HWND hwnd, UINT vk, bool ctrl, bool shift, bool alt) {
     const int pane = gActivePane;
     if (gTab != TAB_FILES) {
         if (vk == VK_F5) { triggerTransportRescan(); uiReloadBoth(); return true; }
+        if (gTab == TAB_RECENT) {
+            if (vk == VK_F5) { uiRebuildRecent(true); InvalidateRect(hwnd, nullptr, FALSE); return true; }
+            if (vk == VK_RETURN && gRecentSel >= 0) { uiRecentOpen(gRecentSel, false); return true; }
+            if (vk == VK_BACK && gRecentSel >= 0) { uiRecentOpen(gRecentSel, true); return true; }
+        }
         if (vk == '1') { gTab = TAB_FILES; InvalidateRect(hwnd, nullptr, FALSE); return true; }
         if (vk == '2') { gTab = TAB_LINK; InvalidateRect(hwnd, nullptr, FALSE); return true; }
-        if (vk == '3') { gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true; }
+        if (vk == '3') { gTab = TAB_RECENT; InvalidateRect(hwnd, nullptr, FALSE); return true; }
+        if (vk == '4') { gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true; }
         return false;
     }
     switch (vk) {
@@ -5691,7 +7024,8 @@ static bool uiOnKey(HWND hwnd, UINT vk, bool ctrl, bool shift, bool alt) {
         case 'T': if (ctrl) { gTab = (gTab + 1) % 3; InvalidateRect(hwnd, nullptr, FALSE); return true; } break;
         case '1': gTab = TAB_FILES; InvalidateRect(hwnd, nullptr, FALSE); return true;
         case '2': gTab = TAB_LINK; InvalidateRect(hwnd, nullptr, FALSE); return true;
-        case '3': gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true;
+        case '3': gTab = TAB_RECENT; InvalidateRect(hwnd, nullptr, FALSE); return true;
+        case '4': gTab = TAB_ABOUT; InvalidateRect(hwnd, nullptr, FALSE); return true;
         default: break;
     }
     return false;
@@ -5794,6 +7128,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 if (gLayout.dual) uiLine(dc, cx / 2, gLayout.pane[0].top, cx / 2, gLayout.pane[0].bottom, kColLine);
             } else if (gTab == TAB_LINK) {
                 uiPaintLinkTab(dc, gLayout);
+            } else if (gTab == TAB_RECENT) {
+                uiPaintRecentTab(dc, gLayout);
             } else {
                 uiPaintAboutTab(dc, gLayout);
             }
@@ -5811,15 +7147,19 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_MOUSEMOVE: {
             const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
             const UiHit h = uiHitTest(gLayout, x, y);
-            int tool = -1, link = -1;
+            int tool = -1, link = -1, recent = -1;
             if (h.kind == HIT_TOOL) tool = h.id;
             if (h.kind == HIT_LINK) link = h.id;
-            bool changed = (tool != gToolHover) || (link != gLinkHover);
+            if (h.kind == HIT_RECENT) recent = h.row;
+            if (h.kind == HIT_RECENTBTN) recent = 1000 + h.id;
+            bool changed = (tool != gToolHover) || (link != gLinkHover) || (recent != gRecentHover);
             gToolHover = tool;
             gLinkHover = link;
+            gRecentHover = recent;
 
             HCURSOR cur = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_ARROW));
-            if (h.kind == HIT_TAB || h.kind == HIT_TOOL || h.kind == HIT_LINK || h.kind == HIT_HEAD || h.kind == HIT_ROW)
+            if (h.kind == HIT_TAB || h.kind == HIT_TOOL || h.kind == HIT_LINK || h.kind == HIT_HEAD || h.kind == HIT_ROW ||
+                h.kind == HIT_RECENT || h.kind == HIT_RECENTBTN)
                 cur = LoadCursorW(nullptr, reinterpret_cast<LPCWSTR>(IDC_HAND));
             SetCursor(cur);
 
@@ -5838,6 +7178,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_MOUSELEAVE:
             gToolHover = -1;
             gLinkHover = -1;
+            gRecentHover = -1;
             for (int i = 0; i < 2; ++i) gPane[i].hover = -1;
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
@@ -5855,6 +7196,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 return 0;
             }
             if (h.kind == HIT_LINK) { uiRunLink(h.id); return 0; }
+            if (h.kind == HIT_RECENTBTN) {
+                if (h.id == 0) uiRecentClear(hwnd);
+                else { uiRebuildRecent(true); uiToast(L"Shared-file history reloaded.", 2500); }
+                return 0;
+            }
+            if (h.kind == HIT_RECENT) {
+                gRecentSel = h.row;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (h.pane >= 0 && h.pane != gActivePane) {
                 gActivePane = h.pane;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -5904,6 +7255,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
             const UiHit h = uiHitTest(gLayout, x, y);
             if (h.kind == HIT_ROW) uiOpOpen(h.pane, h.row);
+            if (h.kind == HIT_RECENT) uiRecentOpen(h.row, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
             return 0;
         }
 
@@ -5911,6 +7263,16 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             POINT p{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ScreenToClient(hwnd, &p);
             const UiHit h = uiHitTest(gLayout, p.x, p.y);
+            if (gTab == TAB_RECENT) {
+                uiRebuildRecent();
+                const int height = gLayout.recentList.bottom - gLayout.recentList.top;
+                const int maxScroll = (std::max)(0, static_cast<int>(gRecentRows.size()) * kRecentRowH - height);
+                gRecentScroll += (GET_WHEEL_DELTA_WPARAM(wParam) > 0) ? -2 * kRecentRowH : 2 * kRecentRowH;
+                if (gRecentScroll < 0) gRecentScroll = 0;
+                if (gRecentScroll > maxScroll) gRecentScroll = maxScroll;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             const int pane = (h.pane >= 0) ? h.pane : gActivePane;
             UiList& l = gPane[pane];
             const int slot = uiPaneSlot(gLayout, pane);
@@ -5941,6 +7303,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             POINT p{static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
             ScreenToClient(hwnd, &p);
             const UiHit h = uiHitTest(gLayout, p.x, p.y);
+            if (h.kind == HIT_RECENT) { uiRecentMenu(hwnd, h.row, &p); return 0; }
+            if (gTab == TAB_RECENT) { uiRecentMenu(hwnd, gRecentSel, &p); return 0; }
             if (h.pane >= 0) uiShowContextMenu(hwnd, h.pane, h.row);
             return 0;
         }
@@ -5948,6 +7312,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_RBUTTONUP: {
             const int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
             const UiHit h = uiHitTest(gLayout, x, y);
+            if (h.kind == HIT_RECENT) { uiRecentMenu(hwnd, h.row, nullptr); return 0; }
+            if (gTab == TAB_RECENT) return 0;
             if (h.pane >= 0) uiShowContextMenu(hwnd, h.pane, h.row);
             return 0;
         }
@@ -6365,6 +7731,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     GetEnvironmentVariableW(L"USERPROFILE", userProf, MAX_PATH);
     gState.pcRoot = fs::path(userProf);
     gState.fallbackPhoneRoot = gState.pcRoot / L".chainit" / L"sibling-staging";
+
+    // v1.7.0: restore what the user decided last run - whether "/" may name another volume, and the
+    // shared-file history that outlives the process (%APPDATA%\ChainIt).
+    loadPersistedSettings();
+    gAllowOtherDrives.store(gState.allowOtherDrives);
+    loadPersistedHistory();
 
     std::error_code ec;
     fs::create_directories(gState.fallbackPhoneRoot / L"DCIM" / L"Camera", ec);

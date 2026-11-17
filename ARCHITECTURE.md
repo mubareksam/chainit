@@ -171,7 +171,7 @@ Both deliverables are produced by deterministic scripts (no IDE, no Gradle, no V
 1. **Android** — `./android/build-apk.sh`
    `aapt2` (resources) → generated `R.kt` → `kotlinc -Xlambdas=class -Xsam-conversions=class` (Kotlin 2.x
    must not emit `invokedynamic`: `dx` cannot lower it for API 26) → `android/tools/verify_dex_safety.py`
-   (stage 1: 183 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
+   (stage 1: 208 first-party classes indy-free; stage 2: runtime jar indy users are `dx`-lowerable;
    stage 3: no source calls an indy-emulated stdlib method; stage 4: no runtime color parsing) →
    `dx --dex` → zipalign-style packer → `apksigner` (v2+v3) with `android/keystore/chainit-release.p12`.
    The script also **fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`** and asserts
@@ -359,14 +359,20 @@ Consequences that are now guaranteed by construction:
 paints into a memory bitmap and blits once, so there is no flicker and no partial frame. Every visual is GDI:
 
 ```
-tab strip (Files | Link | About) + brand          kTabH    = 38
-toolbar (13 measured buttons, live enabled state)  kToolH   = 42
+tab strip (Files | Link | Recent | About) + brand  kTabH    = 38
+toolbar (14 measured buttons, live enabled state)  kToolH   = 42
 per pane: breadcrumb strip                         kPathH   = 26
           column header (Name | Size | Type | Mod) kColHeaderH = 27
           rows                                     kRowH    = 28
 status bar (counts · transport · version)           kStatusH = 28
 toast pill (amber on refusal, emerald on success), drawn above the status bar
 ```
+
+Two of those strips are v1.7.0 additions: the tab strip grew **Recent** (keys `1`–`4` select the tabs), and the
+Recent tab draws its own taller rows (`kRecentRowH = 46`) because each entry is two lines — the file name, then
+`Received · Phone → PC · Bluetooth · pushed by the phone · at 2026-11-17 16:04` — with size, measured MB/s and a
+relative timestamp on the right (§10.4). The Files pane also has a **This PC** level above the profile folder,
+reached with **Up** or the **Drives** toolbar button (§10.1).
 
 Rows are hand-drawn rather than `SysListView32` on purpose: full control of the dark theme, no header/theming
 quirks, identical metrics on every build, and only the visible slice of a 400-row listing is drawn. Columns
@@ -404,7 +410,9 @@ Both sides emit byte-identical listing JSON, and the native UI parses it directl
   "sizeBytes":3312,"modifiedMs":1763299200000,"mimeType":"image/jpeg","ext":".jpg"}]}
 ```
 
-`modifiedMs` is the entry's **real last-write time** in Unix milliseconds. It used to be `nowMs()` — every one of
+Since v1.7.0 the same reply also carries `drives[]`, `allowOtherDrives` and `pcRoot`, and may carry `error`
+instead of items when a named volume cannot be served — see §10.5. `modifiedMs` is the entry's **real last-write
+time** in Unix milliseconds. It used to be `nowMs()` — every one of
 up to 400 rows claimed to have been modified *this instant*, so the Modified column showed the current time
 everywhere and "sort by date" shuffled arbitrarily (v1.6.0 reads `GetFileTime` with
 `FILE_FLAG_BACKUP_SEMANTICS` and converts FILETIME's 1601 epoch). Both native UIs sort on that field, and
@@ -566,7 +574,8 @@ milliseconds, so "it worked" is observable rather than assumed.
 
 `android/build-apk.sh` fails the build if any Android source opens `http://…:4173` with `ACTION_VIEW`, and the
 final `classes.dex` is asserted to contain `PcBrowserActivity`, `PcVfsClient` and `ChainItFileProvider` alongside
-the classes already guarded. `verify_dex_safety.py` still proves all 183 first-party classes are
+the classes already guarded. `verify_dex_safety.py` still proves all 208 first-party classes (183 at v1.6.0, +25 in
+v1.7.0) are
 `invokedynamic`-free and that no source touches an indy-emulated stdlib method or parses a colour at runtime.
 
 ### 9.7 Contract test
@@ -576,3 +585,150 @@ virtual paths inside the root, folders before files, `modifiedMs` finite and nev
 `mkdir → upload → list → raw?download=1` (with `Content-Disposition: attachment`) `→ text → rename →` a **404** for
 the renamed-away file `→ delete`. If that shape changes, the phone's native browser breaks on a device nobody can
 debug from a PC — so the test fails first.
+
+
+---
+
+## 10. Volumes, Provenance and Battery Telemetry (v1.7.0)
+
+Three separate gaps closed in one release, all of them "the feature looked done in the web preview but the native
+apps did not have it":
+
+| Ask | What was true before | What is true now |
+| :--- | :--- | :--- |
+| "Show my phone's battery again" | Engine parsed `batteryPct` from `/chainit/ping`; only the **web** UI drew it. The native Win32 window had no battery anywhere. | Native gauge + rows on the Link tab, status-bar text on every tab, an Android BATTERY tile, plus charge/plug/temperature — and an explicit *not live* state when no real phone has answered. |
+| "Recent shared files" | `gState.transfers` held one aggregate row per batch, was cleared at exit, and reported a hard-coded `88.5 MB/s` / `durationMs: 8`. | One row **per file** with direction, transport, measured MB/s, `localPath`, `virtualPath` and `source` (who moved the bytes), capped at 60, persisted in `%APPDATA%\ChainIt\transfer-history.json` and reloaded at startup. |
+| "Access other drives, not only C:" | `/` mapped to `%USERPROFILE%` and `resolveLocalSafe()` confined everything inside it — no second partition, card reader, USB stick or mapped share was reachable. | `/` still means the profile folder; a virtual path may name a volume (`/D:/Games`), confined to *that* volume. Volumes are enumerated and published inline with every listing. |
+
+### 10.1 Addressing a volume without breaking any existing client
+
+The VFS root has always been `%USERPROFILE%`, not `C:\`. Every client — the native pane, `Z:\`, the phone's
+`PcVfsClient` — sends `/`, `/Documents`, `/DCIM/Camera`. So the change had to be **additive at the parser level**:
+
+```
+resolveLocalSafe("/D:/Games/x.txt")  →  D:\Games\x.txt      (canonical, confined to D:\)
+resolveLocalSafe("/Documents/a.txt") →  %USERPROFILE%\Documents\a.txt   (unchanged)
+resolveLocalSafe("D:\Games")        →  D:\Games\x.txt      (a Windows path is accepted too)
+```
+
+`virtualDrivePrefix()` detects a leading `<letter>:` (with or without the slash) and hands back the volume root plus
+the remainder; the remainder is then canonicalised **inside that volume** and rejected if the canonical path escapes
+it — a `..` walk lands on the volume root rather than on the profile folder or another drive. `toVirtualPosix()` is the
+inverse and is volume-aware, so a listing under `D:\Games` reports `virtualPath: "/D:/Games"` and the phone can feed
+that string straight back.
+
+One path is deliberately **not** real: the native UI's *This PC* level uses the synthetic `kPcThisPc = L"@thispc"`.
+It cannot collide with anything because real virtual paths start with `/`, and it keeps Explorer's navigation model
+(**Up** from the profile folder → the drive list → double-click a drive → back into files) without inventing a
+second root in the wire protocol. Every `uiOp*` action is guarded by `uiBlockAtThisPc()` so a file operation at that
+level is dimmed instead of acting on "no file".
+
+### 10.2 Enumeration must never block the thread that draws
+
+`enumerateDrives()` is `GetLogicalDrives` → per bit `GetDriveTypeW` → for local types only, `GetVolumeInformationW`
+(label, filesystem) and `GetDiskFreeSpaceExW` (capacity). Two rules came out of testing against a dead mapped share:
+
+1. **`DRIVE_REMOTE` is listed from `GetDriveTypeW` alone** with `ready: false` and zero sizes. Probing a network
+   volume whose server is gone blocks the caller for seconds — and this runs on the UI thread, so the window freezes.
+2. **No capacity is invented.** An empty card reader reports `ready: false` and `0` bytes; the UI prints
+   `(no media)` instead of a plausible total.
+
+The result is cached for 3 s (`pcVolumesJson()`), because the Files pane repaints on hover and a repaint must not
+re-walk the volume table.
+
+### 10.3 Widening reach is a decision, so it is a switch that lives on the PC
+
+Exposing every volume to a phone over Bluetooth is a real privacy change, so it is not a silent default and it is not
+a client-side preference either:
+
+- `%APPDATA%\ChainIt\settings.json` stores `allowOtherDrives` (default **on** for a PC that has never been asked,
+  because the user's own machine and their own phone are the only parties).
+- `POST /api/drives/scope {"allowOtherDrives":bool}` flips it, persists it, logs it, toasts it and returns the new
+  volume table. The native Link tab's 8th button and the phone's Drives sheet both call it — the phone can ask, but
+  the state and the UI that shows it belong to the PC.
+- When it is off, `/D:/…` is refused with the PC's own sentence rather than a bare `400` or a silent fallback to the
+  profile folder (§10.5).
+
+### 10.4 Shared-file history: per file, measured, attributed, persisted
+
+`recordTransfer()` is called **once per file** at the point the bytes were verified, with the real elapsed time, so
+`effectiveSpeedMBps` is measured rather than a constant. Each entry carries:
+
+```
+{ id, label, op, direction, transportUsed, localPath, virtualPath, source,
+  promotedHotspot, bytes, durationMs, effectiveSpeedMBps, status, timestampMs }
+```
+
+`source` is the part that makes an entry honest about *who* moved the bytes — the user asked specifically for
+"plus some other unique features like" that:
+
+| `source` | Meaning | Recorded by |
+| :--- | :--- | :--- |
+| `ui` | Started in the native Windows File Manager | `uiOpCopyMove` / the pane's upload + save paths |
+| `api` | Started by a client call (`POST /api/vfs/transfer`, WebDAV) | the transfer route |
+| `phone-upload` | The phone pushed the file — possibly with its screen off | `POST /api/vfs/pc/upload` |
+| `phone-download` | The phone saved a file from the PC | `GET …/raw?download=1` |
+
+An image **preview** (`/raw` without `download=1`) is deliberately not recorded: opening a thumbnail is not sharing a
+file, and a history full of previews would bury the real transfers.
+
+Persistence is plain JSON with a schema number (`{"schema":2,"transfers":[…]}`), loaded at startup before the first
+snapshot, bounded at 60 entries, and written on every append. The uninstaller already removes `%APPDATA%\ChainIt`,
+so a clean uninstall leaves no history behind.
+
+Endpoints: `GET /api/history?limit=25` (returns `items[]` + the `historyFile` path, because "where is this stored"
+should be answerable), `POST /api/history/clear`, and `POST /api/pc/reveal {"path"}` which runs
+`explorer /select,<local>` after checking the file exists (404 otherwise).
+
+### 10.5 Refusals carry the runtime's own sentence
+
+A listing of a volume that cannot be served answers **200** with `items: []` and an `error` string, never a 400 and
+never an empty list with no explanation — the phone shows that sentence verbatim, and the native pane paints it in
+the row area:
+
+- `Drive Q: is not present.` (volume letter absent)
+- `Access to drives other than C: is switched off on the PC (Link tab).` (reach off)
+
+Every listing also carries `drives[]`, `allowOtherDrives` and `pcRoot` **inline**. Over Bluetooth a second round trip
+is the expensive part of the interaction, so a client must be able to offer the drive picker and report the reach
+state from the reply it already has.
+
+### 10.6 Battery telemetry: real values, or an explicit "not live"
+
+The phone reads `BatteryManager` plus the sticky `ACTION_BATTERY_CHANGED` broadcast in `net/BatteryTelemetry.kt` and
+publishes `batteryPct`, `charging`, `chargeSource` (`ac|usb|wireless|none`) and `temperatureC` in **both** the
+`/chainit/ping` reply and the UDP sibling beacon. The engine stores `phoneSeenMs` when a real phone answers, and the
+snapshot derives:
+
+- `phoneTelemetryAgeMs = now - phoneSeenMs`
+- `phoneTelemetryLive = age < 180 s`
+
+`phoneSeenMs == 0` means no phone has ever answered, and the UI says so — `awaiting the phone's first report` —
+instead of drawing a gauge at a simulated 88%. A stale report still shows the last known number, but greyed and
+labelled `last reported 12 min ago`. That distinction is the whole point: a plausible number with no phone attached
+is worse than no number.
+
+### 10.7 The node preview mirrors the contract, honestly
+
+`app/` is a preview runtime, not the product, but it is what the contract test exercises — so it implements the same
+wire shapes with the same semantics and its own limits stated rather than faked:
+
+- `vfsService.listVolumes()` uses `fs.statfsSync` (guarded; reports `0` rather than guessing) and serves exactly
+  **one** volume, the seeded `.runtime/pc-drive`, marked `isPcRoot: true`. It never invents `D:`/`E:`.
+- A request for an unserved letter is refused with `Drive Q: is not present on this PC (the node preview serves C:
+  only).` — the preview's own sentence about the preview.
+- `POST /api/pc/reveal` returns **501** `{ok:false}` with `path` and `localPath` and says the node preview cannot open
+  Explorer, instead of pretending.
+- History and settings persist to `.runtime/transfer-history.json` and `.runtime/settings.json` (label surfaced as
+  `historyFile`), and `engineState` recomputes `phoneSeenMs` / `phoneTelemetryLive` per snapshot on the same 3-minute
+  window.
+
+### 10.8 Contract test
+
+`app/server/selftest.ts` §7 pins all of it: a listing carries `drives[]` with exactly one `isPcRoot` whose
+`virtualPath` is `/`; `/api/drives` names the root letter; an absent volume answers with `items: []`, a non-empty
+`error` **and** the volume list; flipping the reach switch off changes the refusal sentence and back on restores it;
+an upload then appears in `/api/history` with `source: "phone-upload"`, `direction: "phone_to_pc"` and a `virtualPath`
+that ends with the filename; an explicit `raw?download=1` adds a `phone-download` entry; `/api/pc/reveal` resolves a
+real path and 404s on a missing one; `history/clear` reports how many entries went and leaves the list empty; and the
+snapshot carries the five battery fields, `pcVolumes[]` and `allowOtherDrives`.

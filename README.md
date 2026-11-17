@@ -10,15 +10,74 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.37 MB | **v1.6.0** — Portable `.exe`. **Fully native: the File Manager is a Win32 window this process draws itself**, so ChainIt never launches Edge (or any browser) and the taskbar button is ChainIt’s own chain-link icon — not a globe. v1.6.0 fixes the **Modified** column: it used to stamp every row with the current time (`nowMs()`), so sorting by date was meaningless — it now reads each entry’s real last-write time. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + About tabs. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.6.0.exe`](./releases/ChainIt-Setup-1.6.0.exe) | ~1.68 MB | **v1.6.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk. It now **closes a running ChainIt properly before overwriting the exe** (Windows locks a running image, so the old build used to survive the install). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller, `/S` silent. Built by **Qmer**. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~924 KB | **v1.6.0 (`versionCode 7`)** — **the phone now browses your PC’s folders natively.** “Browse PC files” used to fire an `ACTION_VIEW` intent at `http://<pc>:4173/mobile`, i.e. it sent you to Edge/Chrome; it now opens `PcBrowserActivity`, a screen ChainIt draws itself (list, sort, open, save, new folder, rename, delete, send-to-folder) that reaches the PC over **Wi-Fi or Bluetooth RFCOMM — no browser, no WebView**. V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades the installed `com.chainit.android` in place. The VFS server speaks **HTTP/1.1 keep-alive**, so one Bluetooth RFCOMM link serves a whole `Z:\` session; the listener falls back from the secure to the insecure channel and re-arms itself forever. Runs as a **`connectedDevice`** foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart, so **a phone locked all night keeps serving**. Built by **Qmer**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.51 MB | **v1.7.0** — Portable `.exe`, still **fully native** (a Win32 window this process draws itself — no Edge, no WebView, ChainIt’s own taskbar icon). New in 1.7.0: the **phone’s battery** is drawn natively (gauge + charge/plug/temperature on the **Link** tab and in the status bar), a **Recent** tab lists every file that actually moved with who moved it and where it landed (kept in `%APPDATA%\ChainIt\transfer-history.json`, so it survives a restart), and the PC side is **no longer only `C:`** — press **Up** from the profile folder (or **Drives**) for Explorer’s *This PC* level, and any volume is addressable as `/D:`, `/E:`, including card readers, USB sticks and mapped shares. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + Recent + About tabs. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.7.0.exe`](./releases/ChainIt-Setup-1.7.0.exe) | ~1.82 MB | **v1.7.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk, and it closes a running ChainIt before overwriting the exe (Windows locks a running image). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller that also removes the new settings/history files, `/S` silent. Built by **Qmer**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~940 KB | **v1.7.0 (`versionCode 8`)** — the native PC browser gained **Drives** and **Recent shared**: *Drives* lists every volume the PC reports with its real free/total space (so `D:`, `E:`, a card reader or a mapped share are one tap away, not just the profile folder), and *Recent shared* reads the PC’s own persisted history — including files the phone pushed **while its screen was off** — and can save one to the phone again or ask the PC to open its folder in Explorer. The phone now also reports **charging state, plug and battery temperature**, and shows its own charge in a **BATTERY** tile. Still zero browsers/WebViews: V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades `com.chainit.android` in place; HTTP/1.1 keep-alive over Wi-Fi **or** Bluetooth RFCOMM; `connectedDevice` foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.6.0.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.7.0.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.7.0
+
+> **Both platforms.** Windows `1.7.0` (build 9) and Android `1.7.0` (`versionCode 8`).
+> Three things to get back or get properly: **the phone's battery**, **the files you just shared**, and **the rest of
+> the PC's drives**.
+
+**1. The phone's battery is drawn natively again — with the detail that actually matters.**
+The engine always parsed `batteryPct` out of the phone's `/chainit/ping`, and the web preview showed it, but the
+**native** Windows window — the one that runs on a real PC — never drew it. It does now: a battery **gauge** in the Link
+tab's headline card, a `Phone battery` row with the percentage, the plug (`mains (AC)` / `USB` / `wireless pad`) and the
+pack temperature, a `Phone screen` row (`locked (transfers still run)`), and `phone 86% · charging` in the status bar of
+every tab. From v1.7.0 the phone reports `charging`, `chargeSource` and `temperatureC` from `BatteryManager` and the
+sticky `ACTION_BATTERY_CHANGED` broadcast (`net/BatteryTelemetry.kt`), and Android grew a **BATTERY** tile next to
+LINK / STORAGE / SCREEN. Nothing is invented: the engine stores when a real phone last answered (`phoneSeenMs`), so a
+report older than three minutes reads `last reported 12 min ago`, and a PC that has never heard from a phone reads
+`awaiting the phone's first report` instead of a plausible-looking 88%.
+
+**2. Recent shared files — a history, not a session log.**
+Every file that actually moves is recorded per file (not one aggregate row per batch) with its direction, the transport
+that carried it, a **measured** rate instead of the old hard-coded `88.5 MB/s` and `durationMs: 8`, the PC-side path it
+landed on, its VFS path, and **who started it**: `ui` (File Manager), `api` (a client call), `phone-upload` or
+`phone-download` (the phone itself — which is how a share made with the screen off shows up later). The list is capped at
+60 entries, written to `%APPDATA%\ChainIt\transfer-history.json` and loaded at startup, so it survives a restart and an
+in-place update; the uninstaller already removes that directory.
+
+- **Windows:** a fourth tab, **Recent** (keyboard `3`), newest first, two lines per row — the file, then
+  `Received · Phone → PC · Bluetooth · pushed by the phone · at 2026-11-17 16:04`. Double-click opens the file
+  (Shift+double-click its folder), right-click offers *Open*, *Open containing folder*, *Copy PC path* and
+  *Clear history…*, and a row whose file has since moved or been deleted says so instead of failing silently.
+- **Android:** **Recent shared** in the PC browser reads the same history over Wi-Fi or Bluetooth; an entry can be
+  **saved to the phone again** (fetched by its VFS path — the phone never interprets a Windows path) or **shown on the
+  PC**, which selects it in Explorer through `POST /api/pc/reveal`.
+- **API:** `GET /api/history?limit=25`, `POST /api/history/clear`, `POST /api/pc/reveal`; the snapshot's `transfers[]`
+  now carries `localPath`, `virtualPath` and `source`.
+
+**3. The PC is not only `C:` — and widening that is the user's decision, not a default nobody asked for.**
+Until now the VFS router mapped `/` onto `%USERPROFILE%` and `resolveLocalSafe()` confined every path inside it, so
+neither the File Manager nor the phone could reach a second partition, a card reader, a USB stick or a mapped share.
+`/` still means the profile folder — every existing client keeps working — but a virtual path may now **name a volume**:
+`/D:`, `/E:/Games`. `resolveLocalSafe()` confines such a path to *that* volume (a `..` escape lands on the volume root,
+and a path naming an absent drive falls back instead of throwing). Volumes are enumerated with `GetLogicalDrives` +
+`GetDriveTypeW` + `GetVolumeInformationW` + `GetDiskFreeSpaceExW`; a **mapped network drive is listed but never probed**,
+because that call can block for seconds on a share whose server is gone, and a drive with no media reports
+`ready: false` with zero sizes rather than a fabricated capacity.
+
+- **Windows:** press **Up** from the profile folder (or click the new **Drives** toolbar button) for Explorer's
+  *This PC* level — one row per volume with its label and `412 GB free of 931 GB`; double-click enters it and the
+  breadcrumb reads `This PC › D: › Games`. File operations are dimmed at that level: they apply to files, not drives.
+  The **Link** tab's last button reports and flips the reach switch (`Other drives: reachable (4)` /
+  `Other drives: blocked (C: only)`), persisted in `%APPDATA%\ChainIt\settings.json`.
+- **Android:** the **Drives** sheet lists the same volumes with the same real capacities, marks the one you are in,
+  greys out a drive the PC has blocked, and can flip the PC's switch remotely (`POST /api/drives/scope`) — the decision
+  is still the PC's, persisted there and shown there.
+- **API:** every listing now carries `drives[]`, `allowOtherDrives` and `pcRoot` inline, so a client can offer the
+  choice without a second round trip (over Bluetooth that round trip is the expensive part), plus `GET /api/drives` and
+  `POST /api/drives/scope`. A refused volume answers `200` with `items: []` and the PC's own sentence in `error` —
+  “Drive Q: is not present.” or “Access to drives other than C: is switched off on the PC (Link tab).” — because an
+  empty list with no explanation reads as a bug.
 
 ### What is new in v1.6.0
 
@@ -59,10 +118,12 @@ needed Wi-Fi even when Bluetooth was paired and working, and nothing about the e
    `ChainItFileProvider` are present in the final `classes.dex` (183 first-party classes, still
    invokedynamic-free).
 
-**How to tell which build you are actually running:** on Windows open the **About** tab — v1.6.0 reads
-`Version 1.6.0 (build 8) · native Win32 · no browser, no runtime`. On the phone, **Browse PC files** must open a
-dark ChainIt screen whose header says **PC FILES**; if a browser opens instead, you are still on `versionCode 6` —
-install the new APK (it upgrades in place) and quit the old app from recents first.
+**How to tell which build you are actually running:** on Windows open the **About** tab — v1.7.0 reads
+`Version 1.7.0 (build 9) · native Win32 · no browser, no runtime`, has **four** tabs (`Files`, `Link`, `Recent`, `About`)
+and a **Drives** button in the Files toolbar; v1.6.0 reads `1.6.0 (build 8)` and has three tabs. On the phone,
+**Browse PC files** must open a dark ChainIt screen whose header says **PC FILES** with **Drives** and **Recent shared**
+under the path bar, and the main screen shows a **BATTERY** tile; if a browser opens instead you are on `versionCode 6`
+or older — install the new APK (it upgrades in place) and quit the old app from recents first.
 
 ### What is new in v1.5.1
 
@@ -323,7 +384,7 @@ one. v1.6.0 supersedes this build.
    - Tap **`3. Tap to Allow Bluetooth Connectivity`** *(Android 12+)* and allow **Nearby devices / Bluetooth**. The line turns green — `✓ 3. Bluetooth Sibling Socket Ready (RFCOMM Active)` — when the native Bluetooth server is live. *(Only needed if you want Bluetooth mode.)*
    - **For Bluetooth-only use:** pair the phone with your PC **once** (Android *Settings → Bluetooth* ↔ Windows *Settings → Bluetooth & devices*). ChainIt reuses that pairing to open RFCOMM sockets automatically in the background — no re-pairing and no confirmation prompts.
 3. Leave the **Sibling Mode** switch **ON** *(default Sibling Key is `CHAINIT-SIBLING`)*. You can now lock your phone screen and put it away!
-4. **Browse your PC's folders from the phone (v1.6.0):** tap **`Browse PC files`** in the *PC files* card. ChainIt draws the listing itself — **no browser opens** — over Wi-Fi, hotspot or USB tethering, and over **Bluetooth RFCOMM with Wi-Fi completely off** once the phone and PC are paired. You can sort by name/size/type/date, open text and images inside ChainIt, save anything to `Downloads/ChainIt`, create folders, rename, delete, and send a phone file straight into the folder you are looking at. The PC shares your Windows **profile** folder as the root (`Desktop`, `Documents`, `Downloads`, `Pictures`, …), which is why the path bar reads `/` at the top rather than `C:\`.
+4. **Browse your PC's folders from the phone (v1.6.0):** tap **`Browse PC files`** in the *PC files* card. ChainIt draws the listing itself — **no browser opens** — over Wi-Fi, hotspot or USB tethering, and over **Bluetooth RFCOMM with Wi-Fi completely off** once the phone and PC are paired. You can sort by name/size/type/date, open text and images inside ChainIt, save anything to `Downloads/ChainIt`, create folders, rename, delete, and send a phone file straight into the folder you are looking at. The PC shares your Windows **profile** folder as the root (`Desktop`, `Documents`, `Downloads`, `Pictures`, …), which is why the path bar reads `/` at the top rather than `C:\`. **New in v1.7.0:** the **`Drives`** button under the path bar lists every volume the PC reports (`D:`, `E:`, card readers, mapped shares) with real free space — tapping one browses it, and the same sheet can switch the PC between *profile folder only* and *all volumes*; **`Recent shared`** lists the files that actually moved, including ones this phone pushed while its screen was off, and can save one back to the phone or ask the PC to open its folder in Explorer. The main screen also shows a **BATTERY** tile with your own charge, plug and level (`not reported` when Android says so).
 
 ### Part B — On Your Windows 10 / 11 Laptop
 1. Download **`ChainIt-Windows.exe`** (e.g., onto your Desktop) and double-click it.
@@ -351,12 +412,12 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.6.0.exe` (installer) & `ChainIt-Android.apk` (v1.6.0 / `versionCode 7`), plus `version.txt` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.7.0.exe` (installer) & `ChainIt-Android.apk` (v1.7.0 / `versionCode 8`), plus `version.txt` |
 | [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
 | [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |
-| [`windows/src/chainit_win_main.cpp`](./windows/src/chainit_win_main.cpp) | Native Win32 C++17 single-binary source (**native hub window + AppUserModelID taskbar identity**, System Tray, UDP discovery, **`AF_BTH` RFCOMM client + published SDP receiver + `WSALookupService` paired-device discovery**, multipath WebDAV `Z:\` mounter with phone-name labelling, **parallel 2 MiB chunked transfers with per-chunk SHA-256**, verified desktop-shortcut writer with an MS-SHLLINK fallback, `/uninstall` mode, embedded UI server) |
-| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, **`PhoneHttpAndWebDavServer` with mandatory Pairing Key, brute-force lockout and SHA-256 range/upload verification**, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`, **`ui/PcBrowserActivity` + `net/PcVfsClient` + `net/ChainItFileProvider` — the native PC file browser that replaced the old jump into a web browser**) |
+| [`windows/src/chainit_win_main.cpp`](./windows/src/chainit_win_main.cpp) | Native Win32 C++17 single-binary source (**native hub window + AppUserModelID taskbar identity**, System Tray, UDP discovery, **`AF_BTH` RFCOMM client + published SDP receiver + `WSALookupService` paired-device discovery**, multipath WebDAV `Z:\` mounter with phone-name labelling, **parallel 2 MiB chunked transfers with per-chunk SHA-256**, verified desktop-shortcut writer with an MS-SHLLINK fallback, `/uninstall` mode, embedded UI server, **v1.7.0: multi-volume VFS (`GetLogicalDrives`/`GetDriveTypeW`/`GetVolumeInformationW`/`GetDiskFreeSpaceExW`), `%APPDATA%\ChainIt` settings + shared-file history, `/api/drives`, `/api/history`, `/api/pc/reveal`, 4-tab native UI with the Recent tab and the battery gauge**) |
+| [`android/`](./android) | Native Kotlin Android source (`SiblingDaemonService`, **`PhoneHttpAndWebDavServer` with mandatory Pairing Key, brute-force lockout and SHA-256 range/upload verification**, **`BluetoothRfcommTransport`**, `UdpSiblingDiscovery`, `AndroidStorageVfsProvider`, `MainActivity`, **`ui/PcBrowserActivity` + `net/PcVfsClient` + `net/ChainItFileProvider` — the native PC file browser that replaced the old jump into a web browser**, **`net/BatteryTelemetry`** — real charge/plug/temperature readings published in the ping and the UDP beacon, and the drive + recent-history sheets added in v1.7.0) |
 | [`crates/`](./crates) | Shared Rust core (`chainit-core`) & Windows library (`chainit-windows`) |
 | [`app/`](./app) | ChainIt File Manager React/TypeScript UI + Node live preview server |
 | [`scripts/`](./scripts) | PowerShell `Z:\` drive helpers (`mount-z-drive.ps1`, `unmount-z-drive.ps1`), asset embedder (`gen_embedded_assets.py`) & release manifest publisher |

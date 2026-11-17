@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { DriveStats, DriveTarget, VfsItem } from '../shared/types.js';
+import { DriveStats, DriveTarget, PcVolume, VfsItem } from '../shared/types.js';
 import { PC_DRIVE_ROOT, PHONE_DRIVE_ROOT } from './seedStorage.js';
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -35,12 +35,100 @@ export function normalizeVirtualPath(virtualPath: string | undefined): string {
   return normalized === '' ? '/' : normalized;
 }
 
+/**
+ * A virtual path may name a volume outright ("/D:/Games"), which is how the PC side reaches a second
+ * partition, a card reader or a mapped share instead of only the profile folder on C: (v1.7.0).
+ * Returns the letter and the remainder, or null when the path is an ordinary root-relative one.
+ */
+export function parseDrivePrefix(virtualPath: string | undefined): { letter: string; rest: string } | null {
+  if (!virtualPath) return null;
+  const m = /^\/([A-Za-z]):(?:\/.*)?$/.exec(virtualPath.replace(/\\/g, '/'));
+  if (!m) return null;
+  const unified = virtualPath.replace(/\\/g, '/');
+  return { letter: m[1].toUpperCase(), rest: unified.slice(m[1].length + 2) };
+}
+
+/**
+ * The volumes this runtime can serve.
+ *
+ * The Windows engine enumerates real volumes with GetLogicalDrives/GetDriveTypeW. This node preview
+ * has exactly one seeded volume, and it says so instead of inventing D: and E: - an unavailable drive
+ * must produce the same honest "not present" answer a client gets from the engine.
+ */
+export function listVolumes(allowOtherDrives = true): PcVolume[] {
+  const rootPath = path.resolve(PC_DRIVE_ROOT);
+  fs.mkdirSync(rootPath, { recursive: true });
+
+  const onWindows = process.platform === 'win32';
+  const letter = onWindows ? (path.parse(rootPath).root.replace(/\\$/, '').toUpperCase() || 'C') : 'C';
+  const kind = onWindows ? (process.env.SystemRoot ? 'fixed' : 'fixed') : 'fixed';
+
+  let totalBytes = 0;
+  let freeBytes = 0;
+  try {
+    // statfsSync exists on Node 18.15+/20+; when the platform refuses it, the sizes stay 0 rather
+    // than being guessed.
+    const st = (fs as unknown as { statfsSync?: (p: string) => { bsize: number; blocks: number; bfree: number } })
+      .statfsSync;
+    if (typeof st === 'function') {
+      const info = st(rootPath);
+      totalBytes = info.bsize * info.blocks;
+      freeBytes = info.bsize * info.bfree;
+    }
+  } catch {
+    totalBytes = 0;
+    freeBytes = 0;
+  }
+
+  const volumes: PcVolume[] = [
+    {
+      letter,
+      virtualPath: '/',
+      label: onWindows
+        ? `Windows profile folder (${path.basename(rootPath)})`
+        : `Preview volume (${path.basename(rootPath)})`,
+      rootPath: rootPath.split(path.sep).join('/'),
+      kind: kind as PcVolume['kind'],
+      isPcRoot: true,
+      ready: true,
+      totalBytes,
+      freeBytes,
+    },
+  ];
+  void allowOtherDrives;
+  return volumes;
+}
+
+/** The single letter this runtime can actually serve; anything else is honestly "not present". */
+export function servedLetters(): string[] {
+  return listVolumes().map((v) => v.letter);
+}
+
 export function resolveSafePath(target: DriveTarget, virtualPath: string | undefined): {
   fullPath: string;
   virtualPath: string;
   rootPath: string;
 } {
   const rootPath = path.resolve(getRootForTarget(target));
+
+  const drive = target === 'pc' ? parseDrivePrefix(virtualPath) : null;
+  if (drive) {
+    const served = servedLetters();
+    if (!served.includes(drive.letter)) {
+      throw new Error(
+        `Drive ${drive.letter}: is not present on this PC (the node preview serves ${served.join(', ')}: only).`
+      );
+    }
+    // Same volume as the root: "/C:/Documents" is exactly "/Documents".
+    const cleanVirtual = normalizeVirtualPath(drive.rest || '/');
+    const rel = cleanVirtual.replace(/^\/+/, '');
+    const fullPath = path.resolve(rootPath, rel);
+    if (fullPath !== rootPath && !fullPath.startsWith(rootPath + path.sep)) {
+      throw new Error(`Blocked path traversal attempt: ${virtualPath}`);
+    }
+    return { fullPath, virtualPath: `/${drive.letter}:${cleanVirtual === '/' ? '' : cleanVirtual}`, rootPath };
+  }
+
   const cleanVirtual = normalizeVirtualPath(virtualPath);
   const rel = cleanVirtual.replace(/^\/+/, '');
   const fullPath = path.resolve(rootPath, rel);
@@ -95,10 +183,37 @@ export function toVfsItem(rootPath: string, fullPath: string): VfsItem {
   };
 }
 
-export function listDirectory(target: DriveTarget, dirVirtualPath: string): {
+export function listDirectory(
+  target: DriveTarget,
+  dirVirtualPath: string,
+  allowOtherDrives = true
+): {
   currentPath: string;
   items: VfsItem[];
+  drives?: PcVolume[];
+  allowOtherDrives?: boolean;
+  pcRoot?: string;
+  error?: string;
 } {
+  const drives = target === 'pc' ? listVolumes(allowOtherDrives) : undefined;
+
+  // A named volume that is not there gets the runtime's own sentence instead of a 400: the client
+  // cannot tell "empty drive" from "wrong drive" without it, and over Bluetooth a retry is expensive.
+  const drive = target === 'pc' ? parseDrivePrefix(dirVirtualPath) : null;
+  if (drive && !servedLetters().includes(drive.letter)) {
+    const why = allowOtherDrives
+      ? `Drive ${drive.letter}: is not present on this PC.`
+      : `Access to drives other than ${servedLetters().join(', ')}: is switched off on the PC.`;
+    return {
+      currentPath: `/${drive.letter}:`,
+      items: [],
+      drives,
+      allowOtherDrives,
+      pcRoot: '/',
+      error: why,
+    };
+  }
+
   const { fullPath, virtualPath, rootPath } = resolveSafePath(target, dirVirtualPath);
   if (!fs.existsSync(fullPath)) {
     throw new Error(`Directory does not exist: ${virtualPath}`);
@@ -117,7 +232,13 @@ export function listDirectory(target: DriveTarget, dirVirtualPath: string): {
       return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
     });
 
-  return { currentPath: virtualPath, items };
+  return {
+    currentPath: virtualPath,
+    items: items.slice(0, 400),
+    drives,
+    allowOtherDrives: target === 'pc' ? allowOtherDrives : undefined,
+    pcRoot: target === 'pc' ? '/' : undefined,
+  };
 }
 
 export function computeSubtreeBytes(fullPath: string): {
@@ -148,12 +269,17 @@ export function getDriveStats(target: DriveTarget): DriveStats {
   fs.mkdirSync(root, { recursive: true });
   const summary = computeSubtreeBytes(root);
   if (target === 'pc') {
+    const vol = listVolumes()[0];
+    // Real capacity when the platform reports it; the old fixed 512 GB figure stays only as the
+    // fallback for a runtime without statfs, and is then labelled as such by `ready`.
+    const total = vol.totalBytes > 0 ? vol.totalBytes : 512 * 1024 * 1024 * 1024;
+    const used = vol.totalBytes > 0 ? vol.totalBytes - vol.freeBytes : 184 * 1024 * 1024 * 1024 + summary.bytes;
     return {
       target: 'pc',
-      driveLetter: 'C:',
-      label: 'Windows 11 Local SSD',
-      totalCapacityBytes: 512 * 1024 * 1024 * 1024,
-      usedBytes: 184 * 1024 * 1024 * 1024 + summary.bytes,
+      driveLetter: `${vol.letter}:`,
+      label: vol.label,
+      totalCapacityBytes: total,
+      usedBytes: used,
       fileCount: summary.files,
       folderCount: Math.max(0, summary.folders - 1),
     };

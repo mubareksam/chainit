@@ -2,7 +2,6 @@ package com.chainit.android.net
 
 import android.app.KeyguardManager
 import android.content.Context
-import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import org.json.JSONArray
@@ -104,10 +103,9 @@ class UdpSiblingDiscovery(
     fun buildBeaconPayload(): ByteArray {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-
         val screenLocked = !pm.isInteractive || km.isKeyguardLocked
-        val battery = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).coerceIn(1, 100)
+        val batt = BatteryTelemetry.read(context)
+        val battery = batt.pct
         val epoch = System.currentTimeMillis() / 900_000L
         val key = getSiblingKey()
 
@@ -128,6 +126,9 @@ class UdpSiblingDiscovery(
         json.put("androidVersion", "Android ${Build.VERSION.RELEASE}")
         json.put("vfsPort", vfsPort)
         json.put("batteryPct", battery)
+        json.put("charging", batt.charging)
+        json.put("chargeSource", batt.source)
+        json.put("temperatureC", batt.tempC)
         json.put("screenLocked", screenLocked)
         json.put("siblingEnabled", isSiblingEnabled())
         json.put("authTag", computeAuthToken(key, epoch))

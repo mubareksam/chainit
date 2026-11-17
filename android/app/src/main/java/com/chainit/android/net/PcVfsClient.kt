@@ -59,7 +59,7 @@ object PcVfsClient {
     /** Largest response held in memory (list / text / JSON answers are all far smaller). */
     private const val MAX_MEMORY_BODY = 24L * 1024 * 1024
 
-    private const val USER_AGENT = "ChainIt-Android/1.6"
+    private const val USER_AGENT = "ChainIt-Android/1.7"
 
     enum class Transport(val label: String) {
         LAN("Wi-Fi"),
@@ -105,16 +105,106 @@ object PcVfsClient {
             }
     }
 
+    /**
+     * One volume on the PC (v1.7.0).
+     *
+     * The PC's "/" is its profile folder, which is not the whole machine: a second partition, a card
+     * reader or a mapped share is addressed as "/D:", "/E:" ... exactly like the Windows File Manager
+     * addresses it. `ready == false` means the volume is listed but has no media (or is a remote share
+     * the PC deliberately did not probe), so the sizes are zero rather than invented.
+     */
+    class Drive(
+        val letter: String,
+        val virtualPath: String,
+        val label: String,
+        val rootPath: String,
+        val kind: String,
+        val isPcRoot: Boolean,
+        val ready: Boolean,
+        val totalBytes: Long,
+        val freeBytes: Long
+    ) {
+        /** "D:  Data" plus an honest capacity or media note. */
+        val caption: String
+            get() {
+                val head = if (label.isBlank()) "$letter:" else "$letter:  $label"
+                if (isPcRoot) return "$head  (profile folder)"
+                if (!ready) return if (kind == "network") "$head  (remote, not probed)" else "$head  (no media)"
+                if (totalBytes <= 0L) return head
+                return "$head  ${humanSize(freeBytes)} free of ${humanSize(totalBytes)}"
+            }
+
+        val kindLabel: String
+            get() = when (kind) {
+                "fixed" -> "Local disk"
+                "removable" -> "Removable"
+                "cdrom" -> "DVD drive"
+                "network" -> "Network share"
+                "ramdisk" -> "RAM disk"
+                "profile" -> "Profile folder"
+                else -> "Drive"
+            }
+    }
+
     class Listing(
         val currentPath: String,
         val items: List<Item>,
         val transport: Transport,
         val rttMs: Long,
-        val problem: String?
+        val problem: String?,
+        val drives: List<Drive> = emptyList(),
+        val allowOtherDrives: Boolean = true
     ) {
         val ok: Boolean get() = problem == null
         val message: String get() = problem ?: describe(200, transport)
     }
+
+    /** One entry of the PC's shared-file history: what moved, which way, and where it landed. */
+    class HistoryEntry(
+        val label: String,
+        val op: String,
+        val direction: String,
+        val transportUsed: String,
+        val localPath: String,
+        val virtualPath: String,
+        val source: String,
+        val bytes: Long,
+        val timestampMs: Long
+    ) {
+        val toPhone: Boolean get() = direction == "pc_to_phone"
+
+        val verb: String
+            get() = when (op) {
+                "move" -> "Moved"
+                "copy" -> "Copied"
+                "upload" -> "Received"
+                "download" -> "Sent"
+                else -> "Transferred"
+            }
+
+        val who: String
+            get() = when (source) {
+                "ui" -> "started in the PC File Manager"
+                "api" -> "started by a client call"
+                "phone-upload" -> "pushed by this phone"
+                "phone-download" -> "pulled by this phone"
+                else -> ""
+            }
+
+        /**
+         * A file this phone can ask for again. Only `virtualPath` is usable from here: it is the
+         * address the PC's own file API understands ("/Downloads/x.pdf", "/D:/Games/x.zip"), while
+         * `localPath` is a Windows path this phone has no business interpreting.
+         */
+        val fetchable: Boolean get() = virtualPath.isNotBlank()
+    }
+
+    class HistoryResult(
+        val ok: Boolean,
+        val entries: List<HistoryEntry>,
+        val transport: Transport,
+        val message: String
+    )
 
     class DownloadResult(val ok: Boolean, val bytes: Long, val transport: Transport, val message: String)
 
@@ -181,6 +271,14 @@ object PcVfsClient {
         return try {
             val json = JSONObject(reply.text)
             val current = json.optString("currentPath", dir)
+            val drives = parseDrives(json.optJSONArray("drives"))
+            val allow = json.optBoolean("allowOtherDrives", true)
+            // A volume with no media, an offline share or a switched-off reach all come back as an
+            // empty list plus the PC's own sentence - showing that beats showing "0 files".
+            val refused = json.optString("error", "")
+            if (refused.isNotBlank()) {
+                return Listing(current, emptyList(), reply.transport, reply.rttMs, refused, drives, allow)
+            }
             val arr = json.optJSONArray("items") ?: JSONArray()
             val out = ArrayList<Item>(arr.length())
             for (i in 0 until arr.length()) {
@@ -197,10 +295,98 @@ object PcVfsClient {
                     )
                 )
             }
-            Listing(current, out, reply.transport, reply.rttMs, null)
+            Listing(current, out, reply.transport, reply.rttMs, null, drives, allow)
         } catch (t: Throwable) {
-            Listing(dir, emptyList(), reply.transport, reply.rttMs, "The PC answered but its listing could not be read (${t.javaClass.simpleName}).")
+            Listing(dir, emptyList(), reply.transport, reply.rttMs,
+                "The PC answered but its listing could not be read (${t.javaClass.simpleName}).",
+                emptyList(), true)
         }
+    }
+
+    private fun parseDrives(arr: JSONArray?): List<Drive> {
+        if (arr == null) return emptyList()
+        val out = ArrayList<Drive>(arr.length())
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val letter = o.optString("letter", "")
+            if (letter.isBlank()) continue
+            out.add(
+                Drive(
+                    letter = letter,
+                    virtualPath = o.optString("virtualPath", "/"),
+                    label = o.optString("label", ""),
+                    rootPath = o.optString("rootPath", ""),
+                    kind = o.optString("kind", "fixed"),
+                    isPcRoot = o.optBoolean("isPcRoot", false),
+                    ready = o.optBoolean("ready", true),
+                    totalBytes = o.optLong("totalBytes", 0L),
+                    freeBytes = o.optLong("freeBytes", 0L)
+                )
+            )
+        }
+        return out
+    }
+
+    /**
+     * The PC's volume list and its reach switch, on demand.
+     * Every listing already carries the same array, so this is for the drive sheet's refresh button
+     * and for a PC that has just had a card inserted.
+     */
+    fun drives(context: Context, target: Target): Pair<List<Drive>, Boolean> {
+        val reply = request(context, target, "GET", "/api/drives", null, null, LAN_READ_MS, BT_READ_MS, null, null, null)
+        if (!reply.ok) return Pair(emptyList(), true)
+        return try {
+            val json = JSONObject(reply.text)
+            Pair(parseDrives(json.optJSONArray("drives")), json.optBoolean("allowOtherDrives", true))
+        } catch (_: Throwable) {
+            Pair(emptyList(), true)
+        }
+    }
+
+    /**
+     * Asks the PC to widen (or narrow) what "/" may name. This is the phone's handle on the same
+     * switch the Windows Link tab shows - the decision is the PC user's, and it is persisted there.
+     */
+    fun setDriveScope(context: Context, target: Target, allow: Boolean): Reply {
+        val body = JSONObject().put("allowOtherDrives", allow).toString().toByteArray(Charsets.UTF_8)
+        return request(context, target, "POST", "/api/drives/scope", body, null, LAN_READ_MS, BT_READ_MS, null, null, null)
+    }
+
+    /** The PC's recent shared files, newest first. */
+    fun history(context: Context, target: Target, limit: Int): HistoryResult {
+        val reply = request(context, target, "GET", "/api/history?limit=$limit", null, null, LAN_READ_MS, BT_READ_MS, null, null, null)
+        if (!reply.ok) return HistoryResult(false, emptyList(), reply.transport, reply.message)
+        return try {
+            val json = JSONObject(reply.text)
+            val arr = json.optJSONArray("items") ?: JSONArray()
+            val out = ArrayList<HistoryEntry>(arr.length())
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                out.add(
+                    HistoryEntry(
+                        label = o.optString("label", ""),
+                        op = o.optString("op", "transfer"),
+                        direction = o.optString("direction", ""),
+                        transportUsed = o.optString("transportUsed", ""),
+                        localPath = o.optString("localPath", ""),
+                        virtualPath = o.optString("virtualPath", ""),
+                        source = o.optString("source", ""),
+                        bytes = o.optLong("bytes", 0L),
+                        timestampMs = o.optLong("timestampMs", 0L)
+                    )
+                )
+            }
+            HistoryResult(true, out, reply.transport, describe(200, reply.transport))
+        } catch (t: Throwable) {
+            HistoryResult(false, emptyList(), reply.transport,
+                "The PC answered but its history could not be read (${t.javaClass.simpleName}).")
+        }
+    }
+
+    /** Asks the PC to select a path in Explorer - "show me where that landed on the PC". */
+    fun reveal(context: Context, target: Target, path: String): Reply {
+        val body = JSONObject().put("path", path).toString().toByteArray(Charsets.UTF_8)
+        return request(context, target, "POST", "/api/pc/reveal", body, null, LAN_READ_MS, BT_READ_MS, null, null, null)
     }
 
     /** Inline text preview — the PC serves editable text up to 2 MB and says so when it will not. */

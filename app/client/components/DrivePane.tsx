@@ -31,7 +31,8 @@ import {
 } from 'lucide-react';
 import { DriveStats, DriveTarget, SystemSnapshot, VfsItem } from '../../shared/types';
 import { api } from '../api/client';
-import { formatBytes, isImageMime, toWindowsDisplayPath } from '../utils/format';
+import { formatBytes, isImageMime, toWindowsDisplayPath, volumeCaption } from '../utils/format';
+import type { PcVolume } from '../../shared/types';
 import { SORT_LABELS, SortState, sortItems } from '../utils/sort';
 import { SortMenu } from './SortMenu';
 
@@ -113,6 +114,12 @@ export const DrivePane: React.FC<Props> = ({
   const [items, setItems] = useState<VfsItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [unavailableError, setUnavailableError] = useState<string | null>(null);
+  /**
+   * Volumes the PC reported with this listing (v1.7.0). "/" is the PC's profile folder, not the whole
+   * machine - a second partition, a card reader or a mapped share is addressed as "/D:", "/E:".
+   */
+  const [drives, setDrives] = useState<PcVolume[]>([]);
+  const [allowOtherDrives, setAllowOtherDrives] = useState(true);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
   const [search, setSearch] = useState('');
@@ -137,7 +144,11 @@ export const DrivePane: React.FC<Props> = ({
     try {
       const res = await api.listDir(target, currentDir);
       setItems(res.items);
-      setUnavailableError(null);
+      if (res.drives) setDrives(res.drives);
+      if (typeof res.allowOtherDrives === 'boolean') setAllowOtherDrives(res.allowOtherDrives);
+      // A volume with no media, an offline share or a switched-off reach answers with an empty list
+      // plus the PC's own sentence - showing that beats showing a folder that looks merely empty.
+      setUnavailableError(res.error ?? null);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unable to read directory';
       if (
@@ -537,6 +548,41 @@ export const DrivePane: React.FC<Props> = ({
         </div>
 
       </div>
+
+      {/* Volume chips - the PC is not only C: (v1.7.0) */}
+      {!isPhone && drives.length > 0 && (
+        <div className="ci-scroll flex items-center gap-1.5 px-3 py-1.5 bg-slate-950/60 border-b border-slate-800/60 overflow-x-auto">
+          <span className="text-[10px] uppercase tracking-wide text-slate-500 shrink-0">Drives</span>
+          {drives.map((vol) => {
+            const active = currentDir === vol.virtualPath || currentDir.startsWith(`${vol.virtualPath}/`);
+            const blocked = !allowOtherDrives && !vol.isPcRoot;
+            return (
+              <button
+                key={vol.virtualPath}
+                onClick={() => onNavigate(vol.virtualPath)}
+                title={`${vol.rootPath} · ${vol.kind}${vol.ready ? '' : ' · not readable'}${
+                  blocked ? ' · blocked on the PC' : ''
+                }`}
+                className={`px-2 py-0.5 rounded-md text-[11px] font-mono shrink-0 transition ${
+                  active
+                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                    : blocked || !vol.ready
+                      ? 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/70'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                }`}
+              >
+                {volumeCaption(vol)}
+                {blocked ? ' · blocked' : ''}
+              </button>
+            );
+          })}
+          <span className="text-[10px] text-slate-600 shrink-0 ml-1">
+            {allowOtherDrives
+              ? 'other drives reachable'
+              : 'profile folder only — widen it on the PC (Link tab)'}
+          </span>
+        </div>
+      )}
 
       {/* Quick Folder Chips */}
       <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-950/40 border-b border-slate-800/60 overflow-x-auto">

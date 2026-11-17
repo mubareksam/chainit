@@ -86,6 +86,17 @@ class PcBrowserActivity : Activity() {
     private var lastProblem: String? = null
     private var lastProgressPostMs = 0L
 
+    /**
+     * Volumes the PC reported with its last listing (v1.7.0).
+     *
+     * "/" is the PC's profile folder, not the whole machine - a second partition, a card reader or a
+     * mapped share is addressed as "/D:", "/E:" and so on. Every listing carries this array, so the
+     * drive sheet costs no extra round trip (over Bluetooth that round trip is the slow part).
+     */
+    private var pcDrives: List<PcVfsClient.Drive> = emptyList()
+    private var allowOtherDrives = true
+    private var recentEntries: List<PcVfsClient.HistoryEntry> = emptyList()
+
     // --- views -----------------------------------------------------------------------------------
     private lateinit var headerSubtitle: TextView
     private lateinit var transportPill: TextView
@@ -95,6 +106,8 @@ class PcBrowserActivity : Activity() {
     private lateinit var newFolderButton: TextView
     private lateinit var sendHereButton: TextView
     private lateinit var sortButton: TextView
+    private lateinit var drivesButton: TextView
+    private lateinit var recentButton: TextView
     private lateinit var headerName: TextView
     private lateinit var headerSize: TextView
     private lateinit var headerDate: TextView
@@ -241,7 +254,23 @@ class PcBrowserActivity : Activity() {
         sortButton.layoutParams = Ds.lp(this, weight = 1f, startDp = 8f)
         row.addView(sortButton)
         newFolderButton.layoutParams = Ds.lp(this, weight = 1f)
-        return row
+
+        // Second row: which drive on the PC, and what has already been shared. Both are answers to
+        // "the PC is not only C:" - the first reaches the other volumes, the second shows the trail.
+        val row2 = Ds.row(this).apply {
+            setPadding(Ds.dp(context, 14f), Ds.dp(context, 0f), Ds.dp(context, 14f), Ds.dp(context, 8f))
+        }
+        drivesButton = actionButton("Drives") { showDrivesSheet() }
+        drivesButton.layoutParams = Ds.lp(this, weight = 1f)
+        row2.addView(drivesButton)
+        recentButton = actionButton("Recent shared") { showRecentSheet() }
+        recentButton.layoutParams = Ds.lp(this, weight = 1f, startDp = 8f)
+        row2.addView(recentButton)
+
+        val col = Ds.col(this)
+        col.addView(row)
+        col.addView(row2)
+        return col
     }
 
     private fun buildColumnHeader(): View {
@@ -637,6 +666,8 @@ class PcBrowserActivity : Activity() {
                 lastTransport = listing.transport
                 lastRttMs = listing.rttMs
                 lastProblem = listing.problem
+                if (listing.drives.isNotEmpty()) pcDrives = listing.drives
+                allowOtherDrives = listing.allowOtherDrives
                 if (listing.ok) {
                     cwd = listing.currentPath.ifBlank { dir }
                     items = listing.items
@@ -825,6 +856,191 @@ class PcBrowserActivity : Activity() {
             renderList()
         })
         showSheet(cwd, "The PC shares your Windows profile folder as /", actions)
+    }
+
+    /**
+     * The PC's volumes, with real capacity, and the switch that decides whether "/" may name one.
+     *
+     * The switch belongs to the PC (it is persisted there and shown on its Link tab); changing it from
+     * the phone is offered because the phone is usually the reason somebody walks over to a PC.
+     */
+    private fun showDrivesSheet() {
+        val actions = ArrayList<SheetAction>()
+        val here = if (cwd.startsWith("/") && cwd.length > 2 && cwd[2] == ':') cwd.substring(0, 3) else "/"
+        for (d in pcDrives) {
+            val current = (d.virtualPath == here) || (d.virtualPath != "/" && cwd.startsWith(d.virtualPath))
+            val blocked = !allowOtherDrives && !d.isPcRoot
+            actions.add(
+                SheetAction(
+                    (if (current) "\u2713 " else "") + d.caption + (if (blocked) "  \u2014 blocked on the PC" else ""),
+                    if (current) Ds.accentSoft else if (blocked) Ds.textMuted else Ds.textPrimary
+                ) {
+                    if (blocked) {
+                        toast("The PC only shares its profile folder right now. Allow other drives below, then try again.")
+                    } else if (!d.ready) {
+                        toast("${d.letter}: has no media, or the PC could not read it")
+                    } else {
+                        navigate(d.virtualPath)
+                    }
+                }
+            )
+        }
+        if (pcDrives.isEmpty()) {
+            actions.add(SheetAction("Ask the PC which drives it has", Ds.accentSoft) { refreshDrives() })
+        }
+        actions.add(
+            SheetAction(
+                if (allowOtherDrives) "Block other drives on the PC" else "Allow other drives on the PC",
+                Ds.textSecondary
+            ) { toggleDriveScope() }
+        )
+        actions.add(SheetAction("Refresh the drive list", Ds.textSecondary) { refreshDrives() })
+        val sub = if (pcDrives.isEmpty()) "No volume list from the PC yet"
+        else "${pcDrives.size} volume(s)  \u2022  / is the PC's profile folder on ${pcDrives.firstOrNull { it.isPcRoot }?.letter ?: "?"}:"
+        showSheet("Drives on the PC", sub, actions)
+    }
+
+    private fun refreshDrives() {
+        if (busy) return
+        busy = true
+        showBusy("Asking the PC which drives it has\u2026")
+        Thread {
+            val pair = PcVfsClient.drives(this, target)
+            ui.post {
+                busy = false
+                hideBusy()
+                if (pair.first.isEmpty()) {
+                    toast("The PC did not report any volumes over this link")
+                } else {
+                    pcDrives = pair.first
+                    allowOtherDrives = pair.second
+                    toast("${pair.first.size} volume(s) reported by the PC")
+                    showDrivesSheet()
+                }
+            }
+        }.start()
+    }
+
+    private fun toggleDriveScope() {
+        if (busy) return
+        val want = !allowOtherDrives
+        busy = true
+        showBusy(if (want) "Asking the PC to allow other drives\u2026" else "Asking the PC to block other drives\u2026")
+        Thread {
+            val reply = PcVfsClient.setDriveScope(this, target, want)
+            ui.post {
+                busy = false
+                hideBusy()
+                if (reply.ok) {
+                    allowOtherDrives = want
+                    toast(
+                        if (want) "The PC now accepts /D:, /E: and removable drives"
+                        else "The PC only shares its profile folder again"
+                    )
+                    navigate(cwd)
+                } else {
+                    toast(reply.message)
+                }
+            }
+        }.start()
+    }
+
+    /**
+     * What has already moved between this phone and the PC, newest first, read from the PC's own
+     * persisted history - so shares made while this phone's screen was off, or from the PC's File
+     * Manager, are here too.
+     */
+    private fun showRecentSheet() {
+        if (busy) return
+        busy = true
+        showBusy("Reading the PC's shared-file history\u2026")
+        Thread {
+            val result = PcVfsClient.history(this, target, 24)
+            ui.post {
+                busy = false
+                hideBusy()
+                if (!result.ok) {
+                    toast(result.message)
+                    return@post
+                }
+                recentEntries = result.entries
+                if (recentEntries.isEmpty()) {
+                    showSheet(
+                        "Recent shared files",
+                        "Nothing has moved between this phone and the PC yet",
+                        listOf(SheetAction("Go to the PC root", Ds.accentSoft) { navigate("/") })
+                    )
+                    return@post
+                }
+                val actions = ArrayList<SheetAction>()
+                for (e in recentEntries) {
+                    val arrow = if (e.toPhone) "\u2191 to this phone" else "\u2193 to the PC"
+                    val when_ = PcVfsClient.humanTime(e.timestampMs)
+                    actions.add(
+                        SheetAction("${e.label}  \u2022  ${PcVfsClient.humanSize(e.bytes)}  \u2022  $arrow  \u2022  $when_", Ds.textPrimary) {
+                            showRecentEntrySheet(e)
+                        }
+                    )
+                }
+                showSheet(
+                    "Recent shared files",
+                    "${recentEntries.size} newest of the PC's history  \u2022  kept on the PC across restarts",
+                    actions
+                )
+            }
+        }.start()
+    }
+
+    private fun showRecentEntrySheet(e: PcVfsClient.HistoryEntry) {
+        val actions = ArrayList<SheetAction>()
+        val who = e.who
+        val sub = buildString {
+            append(e.verb).append(' ').append(if (e.toPhone) "to this phone" else "to the PC")
+            if (e.transportUsed.isNotBlank()) append("  \u2022  ").append(e.transportUsed)
+            if (who.isNotBlank()) append("  \u2022  ").append(who)
+            append("  \u2022  ").append(PcVfsClient.humanTime(e.timestampMs))
+        }
+        if (e.fetchable) {
+            actions.add(SheetAction("Save to phone again (Downloads)", Ds.accentSoft) { refetch(e) })
+            actions.add(SheetAction("Show it on the PC (Explorer)", Ds.textPrimary) { revealOnPc(e) })
+            actions.add(SheetAction("Open its PC folder here", Ds.textPrimary) {
+                navigate(PcVfsClient.parentOf(e.virtualPath))
+            })
+        } else {
+            actions.add(SheetAction("Details", Ds.textPrimary) { showText(e.label, sub) })
+        }
+        showSheet(e.label, sub, actions)
+    }
+
+    /** Pulls a file from the PC's history again - the entry's own virtual path, not a Windows one. */
+    private fun refetch(e: PcVfsClient.HistoryEntry) {
+        val item = PcVfsClient.Item(
+            name = e.label,
+            path = e.virtualPath,
+            isDirectory = false,
+            sizeBytes = e.bytes,
+            modifiedMs = e.timestampMs,
+            mimeType = "",
+            ext = if (e.label.contains('.')) e.label.substringAfterLast('.', "") else ""
+        )
+        saveToPhone(item)
+    }
+
+    private fun revealOnPc(e: PcVfsClient.HistoryEntry) {
+        if (busy) return
+        busy = true
+        showBusy("Asking the PC to open that folder\u2026")
+        Thread {
+            val reply = PcVfsClient.reveal(this, target, e.virtualPath)
+            ui.post {
+                busy = false
+                hideBusy()
+                toast(
+                    if (reply.ok) "The PC opened Explorer at ${e.virtualPath}"
+                    else reply.message
+                )
+            }
+        }.start()
     }
 
     private fun showSortSheet() {

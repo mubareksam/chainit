@@ -4,7 +4,6 @@ import android.app.KeyguardManager
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.net.Uri
-import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import com.chainit.android.vfs.AndroidStorageVfsProvider
@@ -399,15 +398,20 @@ class PhoneHttpAndWebDavServer(
             pathPart == "/chainit/ping" && method == "GET" -> {
                 val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
                 val km = context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-                val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
                 val (totalB, usedB) = vfs.getStorageCapacity()
+                // v1.7.0: the PC shows the charge, the plug and the temperature next to the
+                // percentage, because "86%" alone does not say whether the link survives the night.
+                val batt = BatteryTelemetry.read(context)
 
                 val obj = JSONObject()
                 obj.put("ok", true)
                 obj.put("deviceName", "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}")
                 obj.put("model", Build.MODEL)
                 obj.put("androidVersion", "Android ${Build.VERSION.RELEASE}")
-                obj.put("batteryPct", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).coerceIn(1, 100))
+                obj.put("batteryPct", batt.pct)
+                obj.put("charging", batt.charging)
+                obj.put("chargeSource", batt.source)
+                obj.put("temperatureC", batt.tempC)
                 obj.put("screenLocked", !pm.isInteractive || km.isKeyguardLocked)
                 obj.put("totalBytes", totalB)
                 obj.put("usedBytes", usedB)
