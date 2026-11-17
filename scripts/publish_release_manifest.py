@@ -8,6 +8,13 @@ So the hashes here MUST match the committed binaries — run this script after e
 release build (android/build-apk.sh and the Windows zig c++ command) and commit the
 result together with the binaries.
 
+It also refuses to publish a manifest for a binary whose compiled VERSIONINFO disagrees with
+--version. windows/res/*.rc carry the version twice - numeric FILEVERSION/PRODUCTVERSION fields and
+the FileVersion/ProductVersion strings - and a hand bump can easily update one and not the other.
+Explorer's Details tab shows the string, so the mistake is invisible in the UI while
+GetFileVersionInfo (and anything comparing versions numerically) still reports the old release.
+v1.7.0 shipped that way once; this check makes it a build failure instead.
+
 Usage:  python3 scripts/publish_release_manifest.py [--version 1.3.0] [--code 4]
 """
 
@@ -17,6 +24,8 @@ import argparse
 import datetime as _dt
 import hashlib
 import pathlib
+import re
+import struct
 import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -39,6 +48,66 @@ def sha256(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+# VS_FIXEDFILEINFO starts with this signature; the next four dwords are the numeric
+# file and product versions. The packed installer contains two of them (its own stub
+# resource plus the appended payload's), so every occurrence has to agree.
+_VS_FIXEDFILEINFO_SIG = b"\xbd\x04\xef\xfe"
+
+
+def _dword_version(ms: int, ls: int) -> str:
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
+def pe_versions(path: pathlib.Path) -> list[str]:
+    """Every numeric file:product version compiled into a PE's VERSIONINFO resource."""
+    data = path.read_bytes()
+    found: list[str] = []
+    idx = data.find(_VS_FIXEDFILEINFO_SIG)
+    while idx != -1 and idx + 24 <= len(data):
+        file_ms, file_ls, prod_ms, prod_ls = struct.unpack_from("<IIII", data, idx + 8)
+        found.append(f"{_dword_version(file_ms, file_ls)}:{_dword_version(prod_ms, prod_ls)}")
+        idx = data.find(_VS_FIXEDFILEINFO_SIG, idx + 1)
+    return found
+
+
+def check_pe_version(path: pathlib.Path, version: str) -> list[str]:
+    """Fail the release if a binary's compiled version is not `version`.
+
+    Returns the human-readable lines to print. Raises SystemExit on any disagreement,
+    naming both the field and the value found, because "the manifest is wrong" is a
+    much worse thing to discover on a user's machine than here.
+    """
+    label = path.name
+    if not path.exists():
+        return []
+    want = f"{version}.0"
+    found = pe_versions(path)
+    if not found:
+        print(f"ERROR: {label} has no VERSIONINFO resource at all", file=sys.stderr)
+        raise SystemExit(1)
+    bad = [f for f in found if f != f"{want}:{want}"]
+    if bad:
+        print(
+            f"ERROR: {label} was compiled with the wrong version resource:\n"
+            f"         expected FILEVERSION/PRODUCTVERSION {want} ({version}), found {', '.join(sorted(set(bad)))}\n"
+            f"         bump the numeric FILEVERSION and PRODUCTVERSION fields in windows/res/*.rc -\n"
+            f"         updating only the FileVersion/ProductVersion strings is not enough.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    # The string half of the resource lives in StringFileInfo as UTF-16; a numeric-only
+    # bump would leave Explorer's Details tab showing the previous release.
+    data = path.read_bytes()
+    if version.encode("utf-16-le") not in data:
+        print(
+            f"ERROR: {label} carries numeric version {want} but no \"{version}\" version string -\n"
+            f"         the FileVersion/ProductVersion strings in windows/res/*.rc are stale.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    return [f"  {label:<28} VERSIONINFO {want} ({len(found)} resource{'s' if len(found) > 1 else ''})"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", default="1.3.0", help="human version label (versionName)")
@@ -53,6 +122,10 @@ def main() -> int:
 
     exe_hash, apk_hash = sha256(EXE), sha256(APK)
     today = _dt.date.today().isoformat()
+
+    # Refuse to publish a manifest whose binaries disagree with the version being published.
+    pe_lines = check_pe_version(EXE, args.version)
+    pe_lines += check_pe_version(setup_exe(args.version), args.version)
 
     # The setup package is optional but published when present: it carries the very
     # same ChainIt-Windows.exe payload, so its hash is recorded for completeness.
@@ -103,6 +176,8 @@ def main() -> int:
     print(f"  version   {args.version} (code {args.code})")
     print(f"  exe       {EXE.stat().st_size} bytes  {exe_hash}")
     print(f"  apk       {APK.stat().st_size} bytes  {apk_hash}")
+    for line in pe_lines:
+        print(line)
     if setup_lines:
         print(f"  setup     {setup.stat().st_size} bytes  {setup_lines[1].split('=', 1)[1]}")
     return 0
