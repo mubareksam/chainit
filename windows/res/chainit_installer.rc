@@ -14,12 +14,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Qmer"
             VALUE "FileDescription",  "ChainIt for Windows Setup"
-            VALUE "FileVersion",      "1.6.0.0"
+            VALUE "FileVersion",      "1.7.0.0"
             VALUE "InternalName",     "ChainIt-Setup"
             VALUE "OriginalFilename", "ChainIt-Setup.exe"
             VALUE "LegalCopyright",   "Built by Qmer"
             VALUE "ProductName",      "ChainIt Sibling"
-            VALUE "ProductVersion",   "1.6.0.0"
+            VALUE "ProductVersion",   "1.7.0.0"
         END
     END
     BLOCK "VarFileInfo"

@@ -98,7 +98,7 @@ export const AboutView: React.FC<Props> = ({ snapshot }) => {
           <div className="text-right">
             <div className="ci-section-label">Version</div>
             <div className="ci-mono text-sm text-slate-200">
-              {APP_VERSION} <span className="text-[var(--ci-text-4)]">· code 5</span>
+              {APP_VERSION} <span className="text-[var(--ci-text-4)]">· code 8</span>
             </div>
           </div>
         </div>

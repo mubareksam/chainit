@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import type { WebSocket } from 'ws';
 import {
   DriveTarget,
@@ -12,8 +14,18 @@ import {
   TransferRecord,
   TransportId,
   TransportTelemetry,
+  PcVolume,
 } from '../shared/types.js';
-import { executeCopyOrMove, getDriveStats } from './vfsService.js';
+import { executeCopyOrMove, getDriveStats, listVolumes } from './vfsService.js';
+import { RUNTIME_ROOT } from './seedStorage.js';
+
+/**
+ * The preview keeps its shared-file history and its drive-reach switch on disk, exactly as the Windows
+ * engine keeps them in %APPDATA%\ChainIt: a history that empties when the process exits is a session
+ * log, not a history, and a reach switch that resets on restart is not a decision.
+ */
+const HISTORY_FILE = path.join(RUNTIME_ROOT, 'transfer-history.json');
+const SETTINGS_FILE = path.join(RUNTIME_ROOT, 'settings.json');
 
 const BEACON_EPOCH_SEC = 900;
 const SIBLING_BEACON_SECRET = Buffer.alloc(32, 0x42);
@@ -31,7 +43,21 @@ class ChainItEngine {
     onlineP2pEnabled: false,
     phoneScreenLocked: true, // Starts locked in pocket to prove Sibling screen-off VFS!
     phoneBatteryPct: 86,
+    // This runtime simulates the phone, so the battery detail is simulated with it - the same fields a
+    // real phone reports from BatteryManager (percent, plug, temperature, when it was last seen).
+    phoneCharging: true,
+    phoneChargeSource: 'ac',
+    phoneTemperatureC: 31.4,
+    phoneSeenMs: Date.now(),
+    phoneTelemetryLive: true,
   };
+
+  /**
+   * Whether "/" may name another volume ("/D:", "/E:", removable, mapped). On Windows this is a real
+   * switch over the filesystem's reach, persisted and shown on the Link tab; the preview mirrors the
+   * contract so the UI and the API tests exercise the same shapes.
+   */
+  allowOtherDrives = true;
 
   sibling: SiblingConfig = {
     enabled: true,
@@ -61,6 +87,7 @@ class ChainItEngine {
   private wsClients = new Set<WebSocket>();
 
   constructor() {
+    this.loadPersisted();
     this.recomputeState();
     this.addLog(
       'SIBLING',
@@ -463,10 +490,15 @@ class ChainItEngine {
       effectiveSpeedMBps: linkSpeed,
       status: 'completed',
       timestampMs: Date.now(),
+      // Provenance: an entry is only actionable if a client knows who moved it and where it landed.
+      source: 'api',
+      virtualPath:
+        params.toTarget === 'pc'
+          ? `${params.toDir === '/' ? '' : params.toDir}/${result.itemNames[0] ?? label}`.replace(/\/+/g, '/')
+          : undefined,
     };
 
-    this.transfers.unshift(record);
-    if (this.transfers.length > 40) this.transfers.length = 40;
+    this.pushTransfer(record);
 
     this.addLog(
       'VFS',
@@ -516,6 +548,119 @@ class ChainItEngine {
     return out;
   }
 
+  /** Appends one shared-file entry, keeps the list bounded, and writes it out. */
+  pushTransfer(record: TransferRecord): void {
+    this.transfers.unshift(record);
+    if (this.transfers.length > 60) this.transfers.length = 60;
+    this.persistHistory();
+  }
+
+  /**
+   * Records a file the phone itself moved (a push to the PC, or an explicit save from it). Previews
+   * are deliberately not recorded: the phone fetches /raw to show an image, and counting every look
+   * would bury the files somebody actually took.
+   */
+  recordSharedFile(params: {
+    op: TransferRecord['op'];
+    direction: TransferRecord['direction'];
+    label: string;
+    bytes: number;
+    startedMs: number;
+    source: NonNullable<TransferRecord['source']>;
+    virtualPath?: string;
+    localPath?: string;
+  }): TransferRecord {
+    const elapsedMs = Math.max(1, Date.now() - params.startedMs);
+    const mbps = params.bytes / (1024 * 1024) / (elapsedMs / 1000);
+    const record: TransferRecord = {
+      id: crypto.randomUUID().slice(0, 8),
+      label: params.label,
+      op: params.op,
+      direction: params.direction,
+      transportUsed: this.activeTransportId ?? 'wifi_lan',
+      promotedHotspot: false,
+      bytes: params.bytes,
+      durationMs: elapsedMs,
+      effectiveSpeedMBps: Number.isFinite(mbps) ? Number(mbps.toFixed(2)) : 0,
+      status: 'completed',
+      timestampMs: Date.now(),
+      source: params.source,
+      virtualPath: params.virtualPath,
+      localPath: params.localPath,
+    };
+    this.pushTransfer(record);
+    return record;
+  }
+
+  /** Empties the history on disk as well as in memory. */
+  clearHistory(): number {
+    const removed = this.transfers.length;
+    this.transfers = [];
+    this.persistHistory();
+    this.addLog('VFS', 'Shared-file history cleared', `${removed} entry/entries removed.`);
+    this.broadcast('vfs_changed', { targets: ['pc', 'phone'] });
+    return removed;
+  }
+
+  setAllowOtherDrives(allow: boolean): void {
+    if (this.allowOtherDrives === allow) return;
+    this.allowOtherDrives = allow;
+    this.persistSettings();
+    this.addLog(
+      'VFS',
+      allow ? 'Other drives reachable' : 'Other drives blocked',
+      allow
+        ? 'Virtual paths may now name any volume (/D:, /E:, removable and mapped drives).'
+        : 'Only the profile folder is reachable again; /D: style paths are refused with a reason.'
+    );
+    this.broadcast('vfs_changed', { targets: ['pc'] });
+  }
+
+  pcVolumes(): PcVolume[] {
+    return listVolumes(this.allowOtherDrives);
+  }
+
+  private persistHistory(): void {
+    try {
+      fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+      fs.writeFileSync(HISTORY_FILE, JSON.stringify({ schema: 2, transfers: this.transfers }, null, 2));
+    } catch {
+      // A preview that cannot write its runtime directory still serves the in-memory history.
+    }
+  }
+
+  private persistSettings(): void {
+    try {
+      fs.mkdirSync(RUNTIME_ROOT, { recursive: true });
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ schema: 2, allowOtherDrives: this.allowOtherDrives }, null, 2));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private loadPersisted(): void {
+    try {
+      if (fs.existsSync(SETTINGS_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) as { allowOtherDrives?: boolean };
+        if (typeof parsed.allowOtherDrives === 'boolean') this.allowOtherDrives = parsed.allowOtherDrives;
+      }
+    } catch {
+      /* a hand-edited settings file must not stop the preview */
+    }
+    try {
+      if (fs.existsSync(HISTORY_FILE)) {
+        const parsed = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) as { transfers?: TransferRecord[] };
+        if (Array.isArray(parsed.transfers)) {
+          this.transfers = parsed.transfers
+            .filter((t) => t && typeof t.label === 'string' && typeof t.timestampMs === 'number')
+            .slice(0, 60);
+        }
+      }
+    } catch {
+      /* a truncated history file is ignored rather than fatal */
+    }
+  }
+
   getSnapshot(): SystemSnapshot {
     this.recomputeState();
     const transports = this.buildTransportTelemetry().map((t) => ({
@@ -530,7 +675,13 @@ class ChainItEngine {
       manualTransportId: this.manualTransportId,
       activeTransportId: this.activeTransportId,
       transports,
-      environment: { ...this.environment },
+      environment: {
+        ...this.environment,
+        // Recomputed per snapshot: "live" means the phone reported within the last three minutes.
+        phoneSeenMs: this.environment.phoneSeenMs ?? 0,
+        phoneTelemetryLive:
+          (this.environment.phoneSeenMs ?? 0) > 0 && Date.now() - (this.environment.phoneSeenMs ?? 0) < 180000,
+      },
       sibling: { ...this.sibling },
       drives: {
         pc: getDriveStats('pc'),
@@ -541,6 +692,8 @@ class ChainItEngine {
       logs: [...this.logs],
       lanAddresses: this.getLanAddresses(),
       serverPort: this.serverPort,
+      pcVolumes: this.pcVolumes(),
+      allowOtherDrives: this.allowOtherDrives,
       security: {
         keyAuth: 'required',
         lockoutAfter: 5,

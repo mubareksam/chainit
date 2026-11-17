@@ -58,6 +58,7 @@ class MainActivity : Activity() {
     private lateinit var metricLink: TextView
     private lateinit var metricStorage: TextView
     private lateinit var metricScreen: TextView
+    private lateinit var metricBattery: TextView
     private lateinit var siblingSwitch: Switch
 
     // Cards
@@ -236,6 +237,9 @@ class MainActivity : Activity() {
         metricLink = addMetricTile(tiles, "LINK", "—", 0)
         metricStorage = addMetricTile(tiles, "STORAGE", "—", Ds.dp(this, 8f))
         metricScreen = addMetricTile(tiles, "SCREEN", "—", Ds.dp(this, 8f))
+        // The same reading the PC shows on its Link tab: this phone's own charge and plug, so a
+        // session that dies at 3% is never a mystery on either screen.
+        metricBattery = addMetricTile(tiles, "BATTERY", "—", Ds.dp(this, 8f))
         card.addView(tiles)
 
         return card
@@ -649,6 +653,20 @@ class MainActivity : Activity() {
         metricStorage.setTextColor(if (storageOk) Ds.textPrimary else Ds.amber)
         val keyguard = getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
         metricScreen.text = if (!pm.isInteractive || keyguard.isKeyguardLocked) "Locked • served" else "On"
+
+        val batt = com.chainit.android.net.BatteryTelemetry.read(this)
+        metricBattery.text = when {
+            batt.pct <= 0 -> "not reported"
+            batt.charging -> "${batt.pct}% • ${batt.source.uppercase(java.util.Locale.US)}"
+            else -> "${batt.pct}% • battery"
+        }
+        metricBattery.setTextColor(
+            when {
+                batt.charging || batt.pct >= 40 -> Ds.textPrimary
+                batt.pct >= 15 -> Ds.amber
+                else -> Ds.danger
+            }
+        )
 
         // Bluetooth is a full Z:\ transport, not a one-shot file push - show that it is really serving.
         btStatusText?.let { tv ->

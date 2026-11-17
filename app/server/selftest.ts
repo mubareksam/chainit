@@ -167,6 +167,116 @@ async function run() {
   assert.notEqual(afterDelete.currentPath, probeDir, 'a deleted folder is no longer served');
   console.log('✓ Native PC file browser API contract (list, mkdir, upload, raw, text, rename, delete, honest 404)');
 
+  // ---------------------------------------------------------------------------
+  // 7. Volumes beyond C:, the reach switch, and the shared-file history (v1.7.0)
+  // ---------------------------------------------------------------------------
+  {
+    const listRes = await (await fetch(`${BASE}/api/vfs/pc/list?path=/`)).json();
+    assert.ok(Array.isArray(listRes.drives) && listRes.drives.length >= 1, 'a listing carries the volume list');
+    const root = listRes.drives.find((d: { isPcRoot?: boolean }) => d.isPcRoot);
+    assert.ok(root, 'exactly one volume is the profile root');
+    assert.equal(root.virtualPath, '/', 'the profile root is still addressed as "/" so old clients work');
+    assert.equal(typeof listRes.allowOtherDrives, 'boolean', 'the reach switch travels with every listing');
+
+    const drivesRes = await fetch(`${BASE}/api/drives`);
+    assert.equal(drivesRes.status, 200);
+    const drives = await drivesRes.json();
+    assert.ok(Array.isArray(drives.drives), '/api/drives lists volumes');
+    assert.ok(drives.pcRootLetter, '/api/drives names the root volume letter');
+
+    // A volume that is not there must be refused with the runtime's own sentence, never a bare 400
+    // and never a silent jump back to the profile folder.
+    const absent = await (await fetch(`${BASE}/api/vfs/pc/list?path=${encodeURIComponent('/Q:/nope')}`)).json();
+    assert.deepEqual(absent.items, [], 'an absent volume lists nothing');
+    assert.ok(typeof absent.error === 'string' && absent.error.length > 0, 'and says why');
+    assert.ok(Array.isArray(absent.drives), 'the refusal still carries the volume list');
+
+    // Narrowing the reach is a decision, so it is explicit, persisted and reported.
+    const offRes = await fetch(`${BASE}/api/drives/scope`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowOtherDrives: false }),
+    });
+    assert.equal(offRes.status, 200);
+    const off = await offRes.json();
+    assert.equal(off.allowOtherDrives, false, 'the switch reports its new state');
+    const blocked = await (await fetch(`${BASE}/api/vfs/pc/list?path=${encodeURIComponent('/Q:/nope')}`)).json();
+    assert.ok(blocked.error && /switched off|not present/i.test(blocked.error), 'a blocked volume explains itself');
+    await fetch(`${BASE}/api/drives/scope`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allowOtherDrives: true }),
+    });
+
+    // The history records who moved a file and where it landed, so an entry is actionable.
+    const upRes = await fetch(
+      `${BASE}/api/vfs/pc/upload?dir=${encodeURIComponent('/Documents')}&filename=history-probe.txt`,
+      { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'shared from the phone' }
+    );
+    assert.equal(upRes.status, 200);
+    const histRes = await fetch(`${BASE}/api/history?limit=5`);
+    assert.equal(histRes.status, 200);
+    const hist = await histRes.json();
+    assert.ok(Array.isArray(hist.items) && hist.items.length >= 1, '/api/history answers with entries');
+    const entry = hist.items.find((t: { label?: string }) => t.label === 'history-probe.txt');
+    assert.ok(entry, 'the upload the phone just pushed is in the history');
+    assert.equal(entry.source, 'phone-upload', 'and it says the phone pushed it');
+    assert.equal(entry.direction, 'phone_to_pc', 'with the direction it travelled');
+    assert.ok(entry.virtualPath && entry.virtualPath.endsWith('/history-probe.txt'), 'and where it landed');
+    assert.ok(hist.historyFile, 'the history file path is reported, not hidden');
+
+    // An explicit save is a share; a preview is not.
+    const saveRes = await fetch(
+      `${BASE}/api/vfs/pc/raw?path=${encodeURIComponent('/Documents/history-probe.txt')}&download=1`
+    );
+    assert.equal(saveRes.status, 200);
+    await new Promise((r) => setTimeout(r, 60));
+    const afterSave = await (await fetch(`${BASE}/api/history?limit=5`)).json();
+    const pulled = afterSave.items.find(
+      (t: { label?: string; source?: string }) => t.label === 'history-probe.txt' && t.source === 'phone-download'
+    );
+    assert.ok(pulled, 'an explicit save (download=1) is recorded as the phone pulling the file');
+
+    const revealRes = await fetch(`${BASE}/api/pc/reveal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/Documents/history-probe.txt' }),
+    });
+    const reveal = await revealRes.json();
+    assert.ok(reveal.localPath && reveal.localPath.length > 0, 'reveal resolves the virtual path to a real one');
+    const revealGone = await fetch(`${BASE}/api/pc/reveal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '/Documents/never-existed.bin' }),
+    });
+    assert.equal(revealGone.status, 404, 'reveal refuses a path that is not there');
+
+    const clearRes = await fetch(`${BASE}/api/history/clear`, { method: 'POST' });
+    assert.equal(clearRes.status, 200);
+    const cleared = await clearRes.json();
+    assert.ok(cleared.removed >= 1, 'clearing reports how many entries went');
+    const afterClear = await (await fetch(`${BASE}/api/history`)).json();
+    assert.deepEqual(afterClear.items, [], 'and the history is then empty');
+
+    // Battery detail travels with the percentage, and says whether it is live.
+    const state = await (await fetch(`${BASE}/api/state`)).json();
+    assert.equal(typeof state.environment.phoneBatteryPct, 'number', 'battery percentage is present');
+    assert.equal(typeof state.environment.phoneCharging, 'boolean', 'charging state is present');
+    assert.ok(state.environment.phoneChargeSource, 'the plug is named');
+    assert.equal(typeof state.environment.phoneTemperatureC, 'number', 'temperature is present');
+    assert.equal(typeof state.environment.phoneTelemetryLive, 'boolean', 'and whether the report is live');
+    assert.ok(Array.isArray(state.pcVolumes), 'the snapshot carries the volume list');
+    assert.equal(typeof state.allowOtherDrives, 'boolean', 'and the reach switch');
+
+    // Leave the probe file out of the preview's seeded storage.
+    await fetch(`${BASE}/api/vfs/pc/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: ['/Documents/history-probe.txt'] }),
+    });
+  }
+  console.log('✓ Volumes beyond C:, drive-reach switch, shared-file history and battery telemetry verified');
+
   // Clean up test copy & restore clean default preview state
   await fetch(`${BASE}/api/vfs/phone/delete`, {
     method: 'POST',

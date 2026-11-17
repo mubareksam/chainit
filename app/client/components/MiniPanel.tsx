@@ -15,7 +15,7 @@ import {
 import { SystemSnapshot, TransportId } from '../../shared/types';
 import { api } from '../api/client';
 import { LogoBadge } from './Brand';
-import { formatBytes } from '../utils/format';
+import { batteryTint, batteryTooltip, chargeLabel, formatBytes } from '../utils/format';
 
 /**
  * Tray mini-panel: a tiny always-handy dashboard opened from the tray icon
@@ -113,9 +113,16 @@ export const MiniPanel: React.FC = () => {
               <span className="ci-body flex-1 truncate">
                 {connected ? snapshot?.sibling.peerDeviceName || 'Phone connected' : 'Sibling Mode'}
               </span>
-              <span className="ci-chip" title="Phone battery">
-                <BatteryCharging className="w-3 h-3" />
+              <span
+                className="ci-chip"
+                title={snapshot ? batteryTooltip(snapshot.environment) : 'Phone battery'}
+              >
+                <BatteryCharging
+                  className={`w-3 h-3 ${snapshot ? batteryTint(snapshot.environment) : ''}`}
+                />
                 {battery}%
+                {snapshot?.environment.phoneCharging ? ` · ${chargeLabel(snapshot.environment)}` : ''}
+                {snapshot?.environment.phoneTelemetryLive === false ? ' · stale' : ''}
               </span>
               {locked && <Lock className="w-3.5 h-3.5 text-[var(--ci-amber)]" />}
             </div>
