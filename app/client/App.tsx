@@ -35,6 +35,8 @@ import { MobileCompanionPage } from './components/MobileCompanionPage';
 import { MiniPanel } from './components/MiniPanel';
 import { SiblingAndMountView } from './components/SiblingAndMountView';
 import {
+  batteryKnown,
+  batteryLabel,
   batteryTint,
   batteryTooltip,
   chargeLabel,
@@ -46,7 +48,7 @@ import {
 } from './utils/format';
 
 /** Kept in sync with android/app/src/main/AndroidManifest.xml and the Windows exe. */
-export const APP_VERSION = '1.8.0';
+export const APP_VERSION = '1.9.0';
 
 type MainTab = 'explorer' | 'connectivity' | 'sibling' | 'about';
 type ExplorerLayout = 'dual' | 'single_z';
@@ -330,8 +332,8 @@ export const App: React.FC = () => {
                 <BatteryCharging
                   className={`w-3.5 h-3.5 ${batteryTint(snapshot.environment)}`}
                 />
-                {snapshot.environment.phoneBatteryPct}%
-                {snapshot.environment.phoneCharging ? (
+                {batteryLabel(snapshot.environment)}
+                {batteryKnown(snapshot.environment) && snapshot.environment.phoneCharging ? (
                   <span className="text-emerald-400/90">· {chargeLabel(snapshot.environment)}</span>
                 ) : null}
                 {snapshot.environment.phoneTelemetryLive === false ? (

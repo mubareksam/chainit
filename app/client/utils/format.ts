@@ -43,6 +43,8 @@ export function chargeLabel(env: EnvironmentSimulation): string {
 
 /** Emerald when healthy or on charge, amber below 40%, red below 15% - the same rule the engine uses. */
 export function batteryTint(env: EnvironmentSimulation): string {
+  // An unmeasured battery gets no colour: a tint is a claim about the charge.
+  if (!batteryKnown(env)) return 'opacity-60';
   const pct = env.phoneBatteryPct ?? 0;
   if (env.phoneCharging || pct >= 40) return 'text-emerald-400';
   if (pct >= 15) return 'text-amber-400';
@@ -50,21 +52,67 @@ export function batteryTint(env: EnvironmentSimulation): string {
 }
 
 /**
+ * Whether a percentage has actually been reported (v1.9.0).
+ *
+ * The engine used to default the phone's battery to a literal 88, so a handset that answered without
+ * the field was drawn as a healthy 88 % gauge. `phoneBatteryPct === 0` is a real reading — a dead
+ * battery — and must not be confused with "nobody measured one", which is what this distinguishes.
+ */
+export function batteryKnown(env: EnvironmentSimulation): boolean {
+  // An engine that predates the flag is treated as reporting one: it only ever set a percentage when
+  // a phone answered, and refusing to draw it would hide a real reading.
+  return env.phoneBatteryKnown !== false && (env.phoneSeenMs ?? 0) > 0;
+}
+
+/**
+ * Which link carried the last reading, as a phrase.
+ *
+ * Over Bluetooth this is the point of the whole card: it is the difference between "the offline link
+ * carries real telemetry" and "this is a Wi-Fi report from four minutes ago".
+ */
+export function telemetryCarrierLabel(env: EnvironmentSimulation): string {
+  switch (env.phoneTelemetryTransport) {
+    case 'bluetooth':
+      return 'over Bluetooth RFCOMM';
+    case 'wifi_lan':
+      return 'over Wi-Fi / LAN';
+    case 'local_hotspot':
+      return 'over the hotspot';
+    case 'usb_rndis':
+      return 'over USB tethering';
+    case 'online_p2p':
+      return 'over the online relay';
+    default:
+      return '';
+  }
+}
+
+/** The percentage, or an honest placeholder when no phone has reported one. */
+export function batteryLabel(env: EnvironmentSimulation): string {
+  return batteryKnown(env) ? `${env.phoneBatteryPct ?? 0}%` : '—';
+}
+
+/**
  * The full sentence behind the percentage.
  * Nothing is invented: when no phone has reported (phoneSeenMs is 0 or missing) the tooltip says so,
- * and when the report is older than three minutes it says how old instead of implying "now".
+ * when a phone answered but named no battery it says that instead, and when the report is older than
+ * three minutes it says how old rather than implying "now".
  */
 export function batteryTooltip(env: EnvironmentSimulation): string {
   const seen = env.phoneSeenMs ?? 0;
   if (!seen) return 'No phone has reported its battery yet — open ChainIt on the phone.';
+  if (!batteryKnown(env)) {
+    return 'The phone answered, but its ChainIt build reports no battery detail — update the APK.';
+  }
   const ageMin = Math.max(0, Math.round((Date.now() - seen) / 60000));
   const age = ageMin < 1 ? 'just now' : ageMin < 60 ? `${ageMin} min ago` : `${Math.round(ageMin / 60)} h ago`;
   const temp = typeof env.phoneTemperatureC === 'number' && env.phoneTemperatureC > 0
     ? ` · ${env.phoneTemperatureC.toFixed(1)}°C`
     : '';
+  const carrier = telemetryCarrierLabel(env);
   return `Phone battery ${env.phoneBatteryPct}% · ${chargeLabel(env)}${temp} · reported ${age}${
     env.phoneTelemetryLive === false ? ' (stale)' : ''
-  }`;
+  }${carrier ? ` · ${carrier}` : ''}`;
 }
 
 /**

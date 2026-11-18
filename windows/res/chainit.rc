@@ -3,8 +3,8 @@
 1 ICON "chainit.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,8,0,0
-PRODUCTVERSION  1,8,0,0
+FILEVERSION     1,9,0,0
+PRODUCTVERSION  1,9,0,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -14,12 +14,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Qmer"
             VALUE "FileDescription",  "ChainIt Sibling"
-            VALUE "FileVersion",      "1.8.0.0"
+            VALUE "FileVersion",      "1.9.0.0"
             VALUE "InternalName",     "ChainIt-Windows"
             VALUE "OriginalFilename", "ChainIt-Windows.exe"
             VALUE "LegalCopyright",   "Built by Qmer"
             VALUE "ProductName",      "ChainIt Sibling"
-            VALUE "ProductVersion",   "1.8.0.0"
+            VALUE "ProductVersion",   "1.9.0.0"
         END
     END
     BLOCK "VarFileInfo"

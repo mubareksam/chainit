@@ -68,6 +68,19 @@ export interface EnvironmentSimulation {
   /** False when the last report is older than three minutes - the number is then history, not live. */
   phoneTelemetryLive?: boolean;
   /**
+   * True only once a percentage has actually arrived from a phone (v1.9.0). The Windows engine used
+   * to default `phoneBatteryPct` to a literal 88, so a handset that answered *without* the field was
+   * drawn as a healthy 88 % gauge with a healthy colour. A client must gate the number on this flag
+   * rather than on the value, because 0 % is a real reading and "absent" is not a number at all.
+   */
+  phoneBatteryKnown?: boolean;
+  /**
+   * Which link carried the last telemetry reading - `wifi_lan`, `bluetooth`, `local_hotspot`, ...
+   * (v1.9.0). Over Bluetooth this is the whole point of the card: it is the difference between "the
+   * offline link carries real telemetry" and "this is a Wi-Fi report from four minutes ago".
+   */
+  phoneTelemetryTransport?: string;
+  /**
    * Bluetooth radio simulation (v1.8.0). The preview has no radio, so these three knobs describe
    * the handset the dial policy should behave as though is paired. They exist so the *policy* can
    * be exercised and asserted - a listener that is open but published no SDP record is the failure

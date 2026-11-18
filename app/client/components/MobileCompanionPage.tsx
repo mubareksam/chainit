@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { SystemSnapshot, VfsItem } from '../../shared/types';
 import { api } from '../api/client';
-import { batteryTint, batteryTooltip, chargeLabel, formatBytes } from '../utils/format';
+import { batteryKnown, batteryLabel, batteryTint, batteryTooltip, chargeLabel, formatBytes, telemetryCarrierLabel } from '../utils/format';
 
 interface Props {
   snapshot: SystemSnapshot;
@@ -107,12 +107,13 @@ export const MobileCompanionPage: React.FC<Props> = ({
                   <span className="text-xs font-semibold">Phone battery</span>
                 </div>
                 <span className={`text-sm font-mono ${batteryTint(snapshot.environment)}`}>
-                  {snapshot.environment.phoneBatteryPct}%
+                  {batteryLabel(snapshot.environment)}
                 </span>
               </div>
               <div className="text-[10px] opacity-80 mt-1">
-                {chargeLabel(snapshot.environment)}
-                {typeof snapshot.environment.phoneTemperatureC === 'number' &&
+                {batteryKnown(snapshot.environment) ? chargeLabel(snapshot.environment) : 'no battery report'}
+                {batteryKnown(snapshot.environment) &&
+                typeof snapshot.environment.phoneTemperatureC === 'number' &&
                 snapshot.environment.phoneTemperatureC > 0
                   ? ` · ${snapshot.environment.phoneTemperatureC.toFixed(1)} °C`
                   : ''}
@@ -121,6 +122,9 @@ export const MobileCompanionPage: React.FC<Props> = ({
                     ? ' · stale report'
                     : ' · live'
                   : ' · awaiting the phone\u2019s first report'}
+                {telemetryCarrierLabel(snapshot.environment)
+                  ? ` · ${telemetryCarrierLabel(snapshot.environment)}`
+                  : ''}
               </div>
             </div>
 

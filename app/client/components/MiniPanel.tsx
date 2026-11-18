@@ -15,7 +15,7 @@ import {
 import { SystemSnapshot, TransportId } from '../../shared/types';
 import { api } from '../api/client';
 import { LogoBadge } from './Brand';
-import { batteryTint, batteryTooltip, chargeLabel, formatBytes } from '../utils/format';
+import { batteryKnown, batteryLabel, batteryTint, batteryTooltip, chargeLabel, formatBytes } from '../utils/format';
 
 /**
  * Tray mini-panel: a tiny always-handy dashboard opened from the tray icon
@@ -61,7 +61,7 @@ export const MiniPanel: React.FC = () => {
   const connected = snapshot?.sibling.connected ?? false;
   const zMounted = snapshot?.sibling.zDriveMounted ?? false;
   const active: TransportId | null = snapshot?.activeTransportId ?? null;
-  const battery = snapshot?.environment.phoneBatteryPct ?? 0;
+  const battery = snapshot ? batteryLabel(snapshot.environment) : '—';
   const locked = snapshot?.environment.phoneScreenLocked ?? false;
   const last = snapshot?.transfers[0];
 
@@ -120,8 +120,10 @@ export const MiniPanel: React.FC = () => {
                 <BatteryCharging
                   className={`w-3 h-3 ${snapshot ? batteryTint(snapshot.environment) : ''}`}
                 />
-                {battery}%
-                {snapshot?.environment.phoneCharging ? ` · ${chargeLabel(snapshot.environment)}` : ''}
+                {battery}
+                {snapshot && batteryKnown(snapshot.environment) && snapshot.environment.phoneCharging
+                  ? ` · ${chargeLabel(snapshot.environment)}`
+                  : ''}
                 {snapshot?.environment.phoneTelemetryLive === false ? ' · stale' : ''}
               </span>
               {locked && <Lock className="w-3.5 h-3.5 text-[var(--ci-amber)]" />}

@@ -10,15 +10,83 @@ All three artifacts are compiled, signed and committed — pick the portable exe
 
 | Platform | File | Size | Details |
 | :--- | :--- | :--- | :--- |
-| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.55 MB | **v1.8.0** — Portable `.exe`, still **fully native** (a Win32 window this process draws itself — no Edge, no WebView, ChainIt’s own taskbar icon). New in 1.8.0: **Bluetooth actually connects, and says why when it does not** — the RFCOMM channel is remembered per handset so a warm dial skips the SDP lookup entirely, a phone whose service record is not visible is rescued by a *verified* channel sweep, every candidate is probed in parallel with per-device backoff instead of six serial 12-second dials, and a failed dial names its cause (`the phone published no SDP record for ChainIt`, `the phone refused the connection, so its ChainIt listener is not open`) in the Link tab and the log instead of leaving you guessing. From 1.7.0: the **phone’s battery** is drawn natively (gauge + charge/plug/temperature on the **Link** tab and in the status bar), a **Recent** tab lists every file that actually moved with who moved it and where it landed (kept in `%APPDATA%\ChainIt\transfer-history.json`, so it survives a restart), and the PC side is **no longer only `C:`** — press **Up** from the profile folder (or **Drives**) for Explorer’s *This PC* level, and any volume is addressable as `/D:`, `/E:`, including card readers, USB sticks and mapped shares. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + Recent + About tabs. Built by **Qmer**. |
-| **Windows installer** | [`releases/ChainIt-Setup-1.8.0.exe`](./releases/ChainIt-Setup-1.8.0.exe) | ~1.85 MB | **v1.8.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk, and it closes a running ChainIt before overwriting the exe (Windows locks a running image). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller that also removes the new settings/history files, `/S` silent. Built by **Qmer**. |
-| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~944 KB | **v1.8.0 (`versionCode 9`)** — Bluetooth stopped being the transport that silently failed: the app now asks for **`BLUETOOTH_ADVERTISE`** at first run (without it the RFCOMM listener opens, looks healthy, and publishes no SDP record for the PC to find), names the missing permission verbatim instead of “could not open an RFCOMM channel”, dials the PC through **secure → insecure → explicit-channel** fallbacks, remembers which PC answered so the next push is one connect instead of a walk over every paired device, learns the PC's Bluetooth address from the `X-ChainIt-Pc-Bt` header on any reply, reports its own address and channel in the ping and the UDP beacon, and serves RFCOMM sessions through 64 KiB buffers instead of 8 KiB. From 1.7.0: the native PC browser gained **Drives** and **Recent shared**: *Drives* lists every volume the PC reports with its real free/total space (so `D:`, `E:`, a card reader or a mapped share are one tap away, not just the profile folder), and *Recent shared* reads the PC’s own persisted history — including files the phone pushed **while its screen was off** — and can save one to the phone again or ask the PC to open its folder in Explorer. The phone now also reports **charging state, plug and battery temperature**, and shows its own charge in a **BATTERY** tile. Still zero browsers/WebViews: V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades `com.chainit.android` in place; HTTP/1.1 keep-alive over Wi-Fi **or** Bluetooth RFCOMM; `connectedDevice` foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart. Built by **Qmer**. |
+| **Windows 10 / 11 (64-bit)** | [`releases/ChainIt-Windows.exe`](./releases/ChainIt-Windows.exe) | ~1.58 MB | **v1.9.0** — Portable `.exe`, still **fully native** (a Win32 window this process draws itself — no Edge, no WebView, ChainIt’s own taskbar icon). New in 1.9.0: **Bluetooth is equivalent, not merely connected** — the phone’s battery, plug and temperature now reach the PC over the offline link and name it as their carrier (`· over Bluetooth RFCOMM`), an automatic dial gets the same 12-second budget as the manual Connect button when the channel is not yet known, a file that did not land is reported as not landed instead of as a completed transfer at a measured speed, a failed move no longer deletes the source, no percentage or byte count is invented, and the Phone pane can never be a folder on this PC wearing the phone’s name. New in 1.8.0: **Bluetooth actually connects, and says why when it does not** — the RFCOMM channel is remembered per handset so a warm dial skips the SDP lookup entirely, a phone whose service record is not visible is rescued by a *verified* channel sweep, every candidate is probed in parallel with per-device backoff instead of six serial 12-second dials, and a failed dial names its cause (`the phone published no SDP record for ChainIt`, `the phone refused the connection, so its ChainIt listener is not open`) in the Link tab and the log instead of leaving you guessing. From 1.7.0: the **phone’s battery** is drawn natively (gauge + charge/plug/temperature on the **Link** tab and in the status bar), a **Recent** tab lists every file that actually moved with who moved it and where it landed (kept in `%APPDATA%\ChainIt\transfer-history.json`, so it survives a restart), and the PC side is **no longer only `C:`** — press **Up** from the profile folder (or **Drives**) for Explorer’s *This PC* level, and any volume is addressable as `/D:`, `/E:`, including card readers, USB sticks and mapped shares. Dual-pane PC + `Z:\` browser, sortable columns, shell file-type icons, right-click menu, type-ahead filter, cut/copy/paste between devices, Link + Recent + About tabs. Built by **Qmer**. |
+| **Windows installer** | [`releases/ChainIt-Setup-1.9.0.exe`](./releases/ChainIt-Setup-1.9.0.exe) | ~1.89 MB | **v1.9.0** — Setup program with **no third-party packaging tool**: the stub carries the very same `ChainIt-Windows.exe` as an appended payload plus a SHA-256 trailer it verifies before touching disk, and it closes a running ChainIt before overwriting the exe (Windows locks a running image). Per-user install into `%LOCALAPPDATA%\Programs\ChainIt` (no UAC prompt), Desktop + Start Menu shortcuts, Apps & features entry with a working uninstaller that also removes the new settings/history files, `/S` silent. Built by **Qmer**. |
+| **Android 8.0 – 15.0+** | [`releases/ChainIt-Android.apk`](./releases/ChainIt-Android.apk) | ~944 KB | **v1.9.0 (`versionCode 10`)** — Bluetooth stopped paying for Wi-Fi that is not there: every request used to try the remembered LAN address first and burn up to 3.5 s on a socket that cannot exist before Bluetooth was attempted, once per listing, per download and per upload. The link that answered last is now tried first, the LAN attempt is skipped entirely when the phone has no IP network, the walk over paired devices is bounded at 16 s in total rather than 12 s per device, and a failure says which link was never tried and why. In 1.8.0 Bluetooth stopped being the transport that silently failed: the app now asks for **`BLUETOOTH_ADVERTISE`** at first run (without it the RFCOMM listener opens, looks healthy, and publishes no SDP record for the PC to find), names the missing permission verbatim instead of “could not open an RFCOMM channel”, dials the PC through **secure → insecure → explicit-channel** fallbacks, remembers which PC answered so the next push is one connect instead of a walk over every paired device, learns the PC's Bluetooth address from the `X-ChainIt-Pc-Bt` header on any reply, reports its own address and channel in the ping and the UDP beacon, and serves RFCOMM sessions through 64 KiB buffers instead of 8 KiB. From 1.7.0: the native PC browser gained **Drives** and **Recent shared**: *Drives* lists every volume the PC reports with its real free/total space (so `D:`, `E:`, a card reader or a mapped share are one tap away, not just the profile folder), and *Recent shared* reads the PC’s own persisted history — including files the phone pushed **while its screen was off** — and can save one to the phone again or ask the PC to open its folder in Explorer. The phone now also reports **charging state, plug and battery temperature**, and shows its own charge in a **BATTERY** tile. Still zero browsers/WebViews: V2+V3 signed Kotlin APK on the same certificate as every previous build, so it upgrades `com.chainit.android` in place; HTTP/1.1 keep-alive over Wi-Fi **or** Bluetooth RFCOMM; `connectedDevice` foreground service with a 9-minute Doze heartbeat, self-renewing wake lock and recents-swipe restart. Built by **Qmer**. |
 
 **Direct downloads (always the latest build on this branch):**
 - Windows (portable): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Windows.exe>
-- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.8.0.exe>
+- Windows (installer): <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Setup-1.9.0.exe>
 - Android: <https://github.com/mubareksam/chainit/raw/main/releases/ChainIt-Android.apk>
 - Release manifest (version + SHA-256 of all three artifacts): [`releases/version.txt`](./releases/version.txt)
+
+### What is new in v1.9.0
+
+> **Both platforms.** Windows `1.9.0` (build 11) and Android `1.9.0` (`versionCode 10`).
+> One thing to get back: **Bluetooth has to be equivalent, not merely connected** — the same battery, both drives in
+> both directions, the same speed, and the same honesty when something fails. It is the transport that has to work
+> when there is no internet at all. The defect-by-defect write-up, with the line each fix removes, is
+> [`ARCHITECTURE.md`](./ARCHITECTURE.md) §7.13.
+
+**1. The phone’s battery now reaches the PC over Bluetooth — and says that it did.**
+Battery telemetry had exactly one writer: the ping over an IP transport. The UDP beacon carried the same fields and
+Windows discarded all of them except the Bluetooth address, so with no Wi-Fi at all the card sat on *"awaiting the
+phone’s first report"* while the handset was paired, listening and answering. Both arrivals now fold into one
+function, and the reading records which link carried it: the Link tab row is now labelled `Battery via Bluetooth` and
+reads `86% · mains (AC) · 31.5 °C · just now`, and the preview client tags the same reading `over Bluetooth RFCOMM`.
+(The old row appended *"charging from mains (AC)"* to a 304 px column, so the temperature and the age were ellipsised
+away — the carrier name is in the label because the value was already full.)
+
+**2. No number is invented, anywhere.**
+The percentage used to default to a literal **88**, so a phone that answered *without* reporting its battery was
+drawn as a healthy 88 % gauge in a healthy colour. The temperature was read with an integer parser, which turned a
+real `36.5 °C` into `36`. A phone-to-phone transfer defaulted to `1024` bytes and a local copy to `4096`, and a speed
+was then derived from those. An unreported value is now absent, and the UI says *"not reported"* instead of drawing a
+number nobody measured.
+
+**3. The automatic dial gets the same budget as the manual one.**
+Discovery handed every candidate 3 seconds while the Connect button got 12 — and a cold dial is an SDP lookup, an ACL
+page and a connect, all drawn from one shared deadline. So the path that runs on its own, which is the *only* path you
+get when there is no internet and you are waiting for it to link up, was the strictest one in the program; its
+failures fed a backoff out to 30 s, and the channel cache only fills on success, so a cold radio could fail forever
+and never earn the fast path. The budget now comes from whether the channel is known — 3 s warm, 12 s cold — and the
+probes run in parallel, so one cold cycle costs 12 s exactly once.
+
+**4. A transfer that moved nothing no longer reports `completed`.**
+`/api/vfs/transfer` answered `{"status":"completed"}` whatever happened, logged *"Completed over bluetooth at
+N MB/s"*, and wrote a history row for a file that never left the PC — because a failed upload returned *the length of
+the buffer it had tried to send* rather than what the phone confirmed. Both directions now report only what the far
+end confirmed, the answer is `completed` / `partial` / `failed` with the real causes listed, a total failure is a
+**502**, and files that did not land are not recorded in history at all.
+
+**5. A failed move keeps your file.**
+A "move" to the phone deleted the PC’s original as soon as the upload call returned — including when it returned
+nothing, which over Bluetooth destroyed the only copy. The phone→PC move deleted every phone-side source regardless
+of what arrived. Sources are now removed only after a confirmed transfer, the phone-side delete lists only paths that
+actually landed, and a delete that then fails is reported as a duplication rather than swallowed.
+
+**6. The Phone pane can never be a folder on your PC wearing the phone’s name.**
+With no phone reachable, phone browsing used to fall back to `<profile>\.chainit\sibling-staging` — a folder **on this
+PC**, pre-populated with `DCIM\Camera`, `Download` and `Documents` — and serve it as the handset. Browsing it still
+works as offline scratch space, but every response is labelled `simulated: true` with a notice naming the folder, and
+anything that would change or hand over a file is refused with a **503** and the actual cause, including the last
+Bluetooth dial error.
+
+**7. On the phone, Bluetooth stops paying for Wi-Fi that is not there.**
+Every operation tried the LAN first, and the LAN address is *remembered* in preferences, so it stayed non-blank long
+after Wi-Fi was gone: each listing, download and upload burned up to 3.5 s on a socket that cannot exist before
+Bluetooth was attempted. The link that answered last is now tried first, the LAN attempt is skipped entirely when the
+phone has no IP network (`ACCESS_NETWORK_STATE` was already granted), the walk over paired devices is bounded at 16 s
+in total instead of 12 s per device, and a failure names the link that was never tried and why.
+
+**8. Proven, not asserted.**
+`selftest.ts` §9 pins the parity property: with every IP transport switched off, a `bt://` link must come up, must
+carry live battery naming Bluetooth as its carrier, must report the percentage the phone actually gave, and must
+refuse a phone-targeted transfer **without recording it**. Two negative tests were run to prove the assertions bite —
+removing the carrier fails with `actual: 'wifi_lan', expected: 'bluetooth'`, and removing the refusal fails with
+`actual: 200`. **There is no Bluetooth radio in this build environment**, so the native changes are verified by
+compilation, by review against the line each one names, and by that contract test — never by a real RFCOMM session
+with a handset.
 
 ### What is new in v1.8.0
 
@@ -184,11 +252,12 @@ needed Wi-Fi even when Bluetooth was paired and working, and nothing about the e
    `ChainItFileProvider` are present in the final `classes.dex` (211 first-party classes, still
    invokedynamic-free).
 
-**How to tell which build you are actually running:** on Windows open the **About** tab — v1.8.0 reads
-`Version 1.8.0 (build 10) · native Win32 · no browser, no runtime`, has **four** tabs (`Files`, `Link`, `Recent`, `About`),
-a **Drives** button in the Files toolbar, and a **Bluetooth RFCOMM link** card on the Link tab whose last row is either
-`Phone reports itself as bt://…` or `Last dial failed — <the actual cause>`; v1.7.0 reads `1.7.0 (build 9)` and has no
-such row. On the phone, the Bluetooth line reads `Bluetooth RFCOMM: LIVE (secure channel 7)` plus `PC dials: bt://…:7`
+**How to tell which build you are actually running:** on Windows open the **About** tab — v1.9.0 reads
+`Version 1.9.0 (build 11) · native Win32 · no browser, no runtime`, has **four** tabs (`Files`, `Link`, `Recent`, `About`),
+a **Drives** button in the Files toolbar, a **Bluetooth RFCOMM link** card on the Link tab whose last row is either
+`Phone reports itself as bt://…` or `Last dial failed — <the actual cause>`, and a battery row whose label names the
+link that carried the reading — `Battery via Bluetooth` when the offline link did; v1.8.0 reads `1.8.0 (build 10)`,
+says only `Phone battery`, and has no carrier clause, and v1.7.0 reads `1.7.0 (build 9)` and has no such row at all. On the phone, the Bluetooth line reads `Bluetooth RFCOMM: LIVE (secure channel 7)` plus `PC dials: bt://…:7`
 when the listener is published, and names the missing permission when it is not; v1.7.0 and older could only say
 `re-arming — Could not open an RFCOMM channel`. On the phone,
 **Browse PC files** must open a dark ChainIt screen whose header says **PC FILES** with **Drives** and **Recent shared**
@@ -482,7 +551,7 @@ ChainIt automatically detects and scores whichever connection is fastest—no "C
 
 | Path | Description |
 | :--- | :--- |
-| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.8.0.exe` (installer) & `ChainIt-Android.apk` (v1.8.0 / `versionCode 9`), plus `version.txt` |
+| [`releases/`](./releases) | Compiled final deliverables: `ChainIt-Windows.exe`, `ChainIt-Setup-1.9.0.exe` (installer) & `ChainIt-Android.apk` (v1.9.0 / `versionCode 10`), plus `version.txt` |
 | [`installer/`](./installer) | The Windows setup program: `build-installer.sh` compiles `windows/src/chainit_installer.cpp`, `pack_installer.py` appends the payload + 52-byte SHA-256 trailer |
 | [`windows/src/chainit_installer.cpp`](./windows/src/chainit_installer.cpp) | Self-contained setup stub: reads its own trailer, verifies SHA-256, installs per-user, writes shortcuts + Apps & features uninstaller, `/S` silent mode |
 | [`ARCHITECTURE.md`](./ARCHITECTURE.md) | Complete protocol (`CHNP/1.0`), transport scoring formula, Sibling crypto, and VFS design |

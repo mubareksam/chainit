@@ -51,6 +51,11 @@ class ChainItEngine {
     phoneTemperatureC: 31.4,
     phoneSeenMs: Date.now(),
     phoneTelemetryLive: true,
+    // The preview starts with a simulated phone that has already answered a ping on the LAN, so it
+    // has a known percentage and a named carrier. Both are updated by markPhoneTelemetry whenever a
+    // link actually reaches the handset - including the Bluetooth one (v1.9.0).
+    phoneBatteryKnown: true,
+    phoneTelemetryTransport: 'wifi_lan',
   };
 
   /**
@@ -101,6 +106,19 @@ class ChainItEngine {
    * from the environment simulation. Called before every dial and before every snapshot, so the
    * model and the reported state can never disagree about what the radio is doing.
    */
+  /**
+   * Records that telemetry arrived, and which link carried it.
+   *
+   * Mirrors the native engine's single telemetry fold (v1.9.0). Keeping one writer means a reading
+   * can never be refreshed by a path that never spoke to the phone, and `phoneBatteryKnown` is only
+   * ever set by an actual arrival - so a client cannot draw a percentage nobody measured.
+   */
+  markPhoneTelemetry(transport: string) {
+    this.environment.phoneSeenMs = Date.now();
+    this.environment.phoneTelemetryTransport = transport;
+    this.environment.phoneBatteryKnown = true;
+  }
+
   private syncBtHandset() {
     const parsed = parseBtEndpoint(this.manualPhoneEndpoint);
     if (this.manualPhoneEndpoint.startsWith('bt://') && this.environment.bluetoothEnabled && parsed) {
@@ -154,6 +172,11 @@ class ChainItEngine {
     this.btLinkUp = result.ok;
     this.btActiveEndpoint = result.ok ? result.endpoint : '';
     this.btDialedEndpoint = endpoint;
+    // A dial that reached the handset is also a telemetry arrival: on the native engine the same
+    // RFCOMM exchange carries /chainit/ping's battery payload, so a Bluetooth-only link has live
+    // battery detail with the plug and the temperature. That parity - not just file bytes - is what
+    // the offline transport has to deliver, and it is what the contract test asserts.
+    if (result.ok) this.markPhoneTelemetry('bluetooth');
     // Record the radio conditions this dial was made under, so a later refresh knows whether
     // anything actually changed. Without this a re-dial would happen on every refresh.
     this.btDialedSignature = `${endpoint}|${this.environment.btListenerOpen !== false}|${
