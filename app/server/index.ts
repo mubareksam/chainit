@@ -119,7 +119,7 @@ const normalizeBtLink = (raw: string): string | null => {
   return channel ? `bt://${mac}:${channel}` : `bt://${mac}`;
 };
 
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 
 app.get('/api/app/version', (_req, res) => {
   res.json({ version: APP_VERSION, runtime: 'node-preview', channel: 'stable' });
@@ -221,6 +221,8 @@ app.post('/api/transport/connect-ip', (req, res) => {
   engine.environment.sharedWifiAvailable = true;
   engine.manualPhoneEndpoint = phoneIp.trim();
   engine.recomputeState();
+  // The LAN link reached the phone, so its telemetry is live and this is the link that carried it.
+  engine.markPhoneTelemetry('wifi_lan');
   engine.addLog(
     'TRANSPORT',
     `Linked to Android Phone IP ${phoneIp.trim()}:49180`,

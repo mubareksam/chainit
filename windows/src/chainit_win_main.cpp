@@ -197,6 +197,31 @@ static ULONG btCachedChannel(BTH_ADDR addr) {
     return (it == gBtChannelCache.end()) ? 0 : it->second;
 }
 
+/**
+ * How long an *automatic* probe of a Bluetooth endpoint may take (W1).
+ *
+ * A cold dial is an SDP lookup, then an ACL page, then a connect - and btRfcommConnectResolved draws
+ * every one of those steps from a single shared deadline, bailing out once less than 250 ms is left.
+ * A budget that is too small therefore does not make the dial quicker, it makes it fail.
+ *
+ * The discovery loop used to hand every candidate 3000 ms while the manual Connect button got
+ * 12000 ms, which made the path that runs on its own - the only path a user with no internet ever
+ * gets - the strictest one in the program. Its failures then fed an exponential backoff out to 30 s,
+ * so "wait for it to link up" was strictly worse than "click Connect". The channel cache only fills
+ * on a *successful* dial, so a cold radio could fail forever and never earn the fast path.
+ *
+ * Warm means no SDP is needed: either the endpoint spells its own RFCOMM channel, or an earlier dial
+ * resolved and cached one. Warm dials are a single connect, so the short budget is both correct and
+ * what keeps a discovery cycle quick.
+ */
+static int btProbeBudgetMs(const std::string& endpoint) {
+    BTH_ADDR addr = 0;
+    ULONG port = 0;
+    if (!isBtEndpoint(endpoint) || !parseBtEndpoint(endpoint, &addr, &port)) return 12000;
+    const bool warm = (port != 0) || (btCachedChannel(addr) != 0);
+    return warm ? 3000 : 12000;
+}
+
 /// Forgets one handset's channel: its listener moved, so the number is stale.
 static void btForgetChannel(BTH_ADDR addr) {
     std::lock_guard<std::mutex> lk(gBtChannelCacheMtx);
@@ -557,6 +582,22 @@ static std::string jsonEscape(const std::string& s) {
     return out;
 }
 
+/**
+ * Appends extra fields to a JSON object string, handling the empty-object case.
+ *
+ * Used to label a listing that is not what it appears to be (W6), so the disclosure travels with the
+ * payload instead of depending on a client already knowing to ask.
+ */
+static std::string jsonWithExtraFields(const std::string& js, const std::string& fields) {
+    if (js.empty() || js.back() != '}') return js;
+    std::string body = js.substr(0, js.size() - 1);
+    while (!body.empty() && (body.back() == ' ' || body.back() == '\n' || body.back() == '\r' || body.back() == '\t')) {
+        body.pop_back();
+    }
+    const bool emptyObject = body.empty() || body.back() == '{';
+    return body + (emptyObject ? "" : ",") + fields + "}";
+}
+
 static std::string jsonExtractString(const std::string& json, const std::string& key, const std::string& defVal = "") {
     std::string pat = "\"" + key + "\"";
     size_t pos = json.find(pat);
@@ -619,6 +660,29 @@ static int64_t jsonExtractInt(const std::string& json, const std::string& key, i
     long long v = std::strtoll(json.c_str() + pos, &endPtr, 10);
     if (endPtr == json.c_str() + pos) return defVal;
     return static_cast<int64_t>(v);
+}
+
+/**
+ * Reads a number that may carry a fraction.
+ *
+ * jsonExtractInt uses strtoll, which stops at the decimal point - so the phone's battery
+ * temperature, which Android reports in tenths of a degree and BatteryTelemetry divides by ten
+ * (`36.5`), arrived on the PC as a flat `36`. On the one number a user reads to judge whether the
+ * handset is getting too hot during a long Bluetooth transfer, losing the fraction is losing the
+ * point. Returns defVal when the key is absent or the value is not a number.
+ */
+static double jsonExtractDouble(const std::string& json, const std::string& key, double defVal) {
+    std::string pat = "\"" + key + "\"";
+    size_t pos = json.find(pat);
+    if (pos == std::string::npos) return defVal;
+    pos = json.find(':', pos + pat.size());
+    if (pos == std::string::npos) return defVal;
+    pos++;
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) pos++;
+    char* endPtr = nullptr;
+    double v = std::strtod(json.c_str() + pos, &endPtr);
+    if (endPtr == json.c_str() + pos) return defVal;
+    return v;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -846,7 +910,15 @@ struct GlobalState {
     bool envBluetooth = true;
     bool envOnline = false;
     bool phoneScreenLocked = true;
-    int phoneBatteryPct = 88;
+
+    // W3: the percentage used to default to a literal 88, and jsonExtractInt handed that 88 back
+    // whenever a reply omitted "batteryPct" - so a handset that answered without the field was drawn
+    // as a healthy 88 % gauge with a healthy colour. The comment below this block already said that
+    // inventing telemetry "would be a lie about hardware we cannot see"; the percentage was the one
+    // field still doing exactly that. Zero plus `known == false` means "not reported", and the UI
+    // says so instead of drawing a number nobody measured.
+    int phoneBatteryPct = 0;
+    bool phoneBatteryKnown = false;
 
     // v1.7.0: a percentage alone is not enough to judge whether the link will survive the night, so
     // the phone also reports how it is being powered and how warm it is. All of it comes from the
@@ -856,6 +928,10 @@ struct GlobalState {
     std::string phoneChargeSource = "none";   // ac | usb | wireless | none
     double phoneTempC = 0.0;
     int64_t phoneSeenMs = 0;
+    // W2: which link carried the last telemetry. The battery row can then say "over Bluetooth
+    // RFCOMM" instead of leaving the user to guess whether the reading came from the offline link
+    // they actually depend on, or from a Wi-Fi report that is minutes old.
+    std::string phoneTelemetryTransport;      // wifi_lan | bluetooth | usb_rndis | ... | "" = never
 
     // Sibling configuration
     bool siblingEnabled = true;
@@ -2337,9 +2413,14 @@ static std::string buildStateSnapshotJson() {
         << "\"phoneScreenLocked\":" << (gState.phoneScreenLocked ? "true" : "false") << ","
         << "\"phoneBatteryPct\":" << gState.phoneBatteryPct << ","
         // Battery detail is reported by the phone itself (BatteryManager / sticky
-        // ACTION_BATTERY_CHANGED) from v1.7.0 on. phoneSeenMs == 0 means no real phone has ever
-        // answered a ping, so the UI shows "awaiting telemetry" rather than a plausible-looking
-        // number nobody measured.
+        // ACTION_BATTERY_CHANGED) from v1.7.0 on. `phoneBatteryKnown` is the honest gate: it is only
+        // true once a percentage has actually arrived, so a client can tell "0 % and critical" from
+        // "no reading" instead of drawing whichever number the default happened to be (W3 - the
+        // default used to be a literal 88). `phoneTelemetryTransport` names the link that carried the
+        // last reading, which over Bluetooth is the difference between "the offline link works" and
+        // "this is a Wi-Fi report from four minutes ago" (W2).
+        << "\"phoneBatteryKnown\":" << (gState.phoneBatteryKnown ? "true" : "false") << ","
+        << "\"phoneTelemetryTransport\":\"" << jsonEscape(gState.phoneTelemetryTransport) << "\","
         << "\"phoneCharging\":" << (gState.phoneCharging ? "true" : "false") << ","
         << "\"phoneChargeSource\":\"" << jsonEscape(gState.phoneChargeSource) << "\","
         << "\"phoneTemperatureC\":" << gState.phoneTempC << ","
@@ -2453,11 +2534,95 @@ static std::string buildStateSnapshotJson() {
     return oss.str();
 }
 
+/**
+ * Which transport an endpoint belongs to.
+ *
+ * Shared by the ping path and the beacon path so the two cannot classify the same handset
+ * differently - a telemetry reading that says "over Wi-Fi" while the link card says "Bluetooth"
+ * would be its own kind of lie.
+ */
+static std::string classifyEndpointTransport(const std::string& ip) {
+    if (isBtEndpoint(ip)) return "bluetooth";
+    if (ip == "127.0.0.1" || ip.rfind("192.168.42.", 0) == 0) return "usb_rndis";
+    if (ip.rfind("192.168.43.", 0) == 0 || ip.rfind("192.168.49.", 0) == 0 ||
+        ip.rfind("192.168.137.", 0) == 0) {
+        return "local_hotspot";
+    }
+    if (ip.rfind("192.168.44.", 0) == 0) return "bluetooth";
+    if (ip.rfind("100.", 0) == 0) return "online_p2p";
+    return "wifi_lan";
+}
+
+/**
+ * Folds one telemetry payload into the state (W2, W3). Takes gState.mtx itself.
+ *
+ * Two things carry the phone's battery: the /chainit/ping reply and the UDP sibling beacon. The
+ * beacon's copy used to be thrown away - its handler read the Bluetooth address out of the payload
+ * and ignored the rest - which left telemetry freshness hostage to a single probe path. Over
+ * Bluetooth that is precisely the path with the tightest budget and the most reasons to fail, so the
+ * battery card sat on "awaiting the phone's first report" while the handset was paired, listening
+ * and answering. Now either arrival keeps the reading live.
+ *
+ * Every field is taken only when the payload actually carries it, and a percentage that never
+ * arrived stays unknown instead of becoming a plausible-looking number. Returns true when the
+ * payload carried at least one telemetry field.
+ */
+static bool applyPhoneTelemetry(const std::string& payload, const std::string& transport) {
+    if (payload.empty()) return false;
+
+    const bool hasPct = jsonHasKey(payload, "batteryPct");
+    const bool hasSource = jsonHasKey(payload, "chargeSource");
+    const bool hasTemp = jsonHasKey(payload, "temperatureC");
+    const bool hasCharging = jsonHasKey(payload, "charging");
+    const bool hasLocked = jsonHasKey(payload, "screenLocked");
+    const bool hasTotal = jsonHasKey(payload, "totalBytes");
+    const bool hasUsed = jsonHasKey(payload, "usedBytes");
+    if (!hasPct && !hasSource && !hasTemp && !hasCharging && !hasLocked && !hasTotal && !hasUsed) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(gState.mtx);
+    if (hasPct) {
+        const int64_t pct = jsonExtractInt(payload, "batteryPct", -1);
+        if (pct >= 0 && pct <= 100) {
+            gState.phoneBatteryPct = static_cast<int>(pct);
+            gState.phoneBatteryKnown = true;
+        }
+    }
+    if (hasSource) {
+        const std::string src = jsonExtractString(payload, "chargeSource", "");
+        if (!src.empty()) {
+            gState.phoneChargeSource = src;
+            gState.phoneCharging = (src == "ac" || src == "usb" || src == "wireless");
+        }
+    }
+    // A payload can carry "charging" without naming the plug (an older APK), so it is read on its
+    // own rather than being inferred from chargeSource alone.
+    if (hasCharging && !hasSource) gState.phoneCharging = jsonExtractBool(payload, "charging", gState.phoneCharging);
+    if (hasTemp) {
+        const double t = jsonExtractDouble(payload, "temperatureC", -1000.0);
+        if (t > -273.0) gState.phoneTempC = t;
+    }
+    if (hasLocked) gState.phoneScreenLocked = jsonExtractBool(payload, "screenLocked", gState.phoneScreenLocked);
+    if (hasTotal) {
+        gState.phoneTotalBytes =
+            static_cast<uint64_t>(jsonExtractInt(payload, "totalBytes", static_cast<int64_t>(gState.phoneTotalBytes)));
+    }
+    if (hasUsed) {
+        gState.phoneUsedBytes =
+            static_cast<uint64_t>(jsonExtractInt(payload, "usedBytes", static_cast<int64_t>(gState.phoneUsedBytes)));
+    }
+    gState.phoneSeenMs = nowMs();
+    if (!transport.empty()) gState.phoneTelemetryTransport = transport;
+    return true;
+}
+
 // --- Probe & Register Real Android Phone Endpoint ---
 
 static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int timeoutMs = 0) {
-    // Native Bluetooth RFCOMM needs a longer budget (SDP lookup + ACL page + pairing check).
-    if (timeoutMs <= 0) timeoutMs = isBtEndpoint(ip) ? 9000 : 1500;
+    // Native Bluetooth RFCOMM needs a longer budget (SDP lookup + ACL page + pairing check), and
+    // how much longer depends on whether the channel is already known (W1).
+    if (timeoutMs <= 0) timeoutMs = isBtEndpoint(ip) ? btProbeBudgetMs(ip) : 1500;
     HttpReply rep = httpRequestToPhone(ip, PHONE_VFS_PORT, "GET", "/chainit/ping", "", {}, timeoutMs);
     if (rep.status != 200 || rep.body.find("\"ok\":true") == std::string::npos) {
         return false;
@@ -2470,14 +2635,7 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int
     btLearnFromPayload(rep.body);
 
     std::string kind = kindHint;
-    if (kind.empty()) {
-        if (isBtEndpoint(ip)) kind = "bluetooth";
-        else if (ip == "127.0.0.1" || ip.rfind("192.168.42.", 0) == 0) kind = "usb_rndis";
-        else if (ip.rfind("192.168.43.", 0) == 0 || ip.rfind("192.168.49.", 0) == 0 || ip.rfind("192.168.137.", 0) == 0) kind = "local_hotspot";
-        else if (ip.rfind("192.168.44.", 0) == 0) kind = "bluetooth";
-        else if (ip.rfind("100.", 0) == 0) kind = "online_p2p";
-        else kind = "wifi_lan";
-    }
+    if (kind.empty()) kind = classifyEndpointTransport(ip);
 
     bool newlyConnected = false;
     {
@@ -2487,25 +2645,6 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int
         gState.peerDeviceName = jsonExtractString(rep.body, "deviceName", "Android Sibling");
         gState.peerModel = jsonExtractString(rep.body, "model", "Android");
         gState.peerAndroidVersion = jsonExtractString(rep.body, "androidVersion", "Android");
-        gState.phoneBatteryPct = static_cast<int>(jsonExtractInt(rep.body, "batteryPct", 88));
-        gState.phoneScreenLocked = jsonExtractBool(rep.body, "screenLocked", false);
-        // v1.7.0: charging state, plug and temperature. Each field is taken only when this reply
-        // actually carries it - an APK from before 1.7.0 reports the percentage alone, and inventing
-        // the rest would be a lie about hardware we cannot see.
-        {
-            const std::string src = jsonExtractString(rep.body, "chargeSource", "");
-            if (!src.empty()) {
-                gState.phoneChargeSource = src;
-                gState.phoneCharging = (src == "ac" || src == "usb" || src == "wireless");
-            }
-            if (rep.body.find("\"temperatureC\"") != std::string::npos) {
-                gState.phoneTempC = static_cast<double>(jsonExtractInt(rep.body, "temperatureC",
-                                                                       static_cast<int64_t>(gState.phoneTempC)));
-            }
-            gState.phoneSeenMs = nowMs();
-        }
-        gState.phoneTotalBytes = static_cast<uint64_t>(jsonExtractInt(rep.body, "totalBytes", static_cast<int64_t>(gState.phoneTotalBytes)));
-        gState.phoneUsedBytes = static_cast<uint64_t>(jsonExtractInt(rep.body, "usedBytes", static_cast<int64_t>(gState.phoneUsedBytes)));
 
         if (newlyConnected) {
             std::string link = isBtEndpoint(ip)
@@ -2517,6 +2656,12 @@ static bool probePhoneIp(const std::string& ip, const std::string& kindHint, int
                              : "Verified ChainIt-Android.apk on port 49180; Z:\\ live storage ready.");
         }
     }
+
+    // W2/W3: battery, charge source, temperature, lock state and capacity all come from one fold,
+    // shared with the UDP beacon path so a beacon keeps the reading live even when no ping does.
+    // It takes gState.mtx itself, so it runs outside the block above - and it records which link
+    // carried the numbers, because "86 %" means something different over Bluetooth than over Wi-Fi.
+    applyPhoneTelemetry(rep.body, kind);
 
     if (newlyConnected) {
         mountZDriveAsync();
@@ -2582,7 +2727,14 @@ static void discoveryLoop() {
                 if (msg.find("CHAINIT_SIBLING_ANNOUNCE_V1") != std::string::npos) {
                     char senderIp[64] = {};
                     inet_ntop(AF_INET, &sender.sin_addr, senderIp, sizeof(senderIp));
-                    probePhoneIp(senderIp, "");
+                    const bool pinged = probePhoneIp(senderIp, "");
+                    // W2: the beacon carries the same battery payload as a ping reply, and this
+                    // handler used to read only the Bluetooth address out of it and discard the
+                    // rest. When the ping itself fails - phone busy, firewall, radio napping - the
+                    // beacon is still first-hand evidence that the handset is alive and what its
+                    // battery is doing, so the reading stays live instead of ageing out and greying
+                    // the card. Applying it only on a failed ping keeps the richer reply authoritative.
+                    if (!pinged) applyPhoneTelemetry(msg, classifyEndpointTransport(senderIp));
                     // The beacon also names the phone's Bluetooth address and channel. Arm the
                     // native link from it right away, so Bluetooth is already up (or already
                     // known-bad with a reason) before Wi-Fi is switched off - rather than being
@@ -2607,7 +2759,7 @@ static void discoveryLoop() {
                         }
                         if (!btLive) {
                             lastBtArmTry = ::GetTickCount64();
-                            probePhoneIp(btEp, "bluetooth", 3000);
+                            probePhoneIp(btEp, "bluetooth", btProbeBudgetMs(btEp));
                         }
                     }
                 }
@@ -2781,7 +2933,12 @@ static void bluetoothDiscoveryLoop() {
             if (!gRunning.load()) break;
             probers.emplace_back([cand, &answered]() {
                 if (answered.load()) return;
-                if (probePhoneIp(cand, "bluetooth", 3000)) answered.store(true);
+                // Budget from cache state, not a constant (W1): a handset that has never answered
+                // needs SDP + page + connect inside the deadline, and 3 s is routinely not enough
+                // for that, which is why the automatic link-up used to fail while Connect worked.
+                // The probers run concurrently, so one cold 12 s dial costs the cycle 12 s *once*;
+                // it caches the channel on success and every later cycle is the warm 3 s.
+                if (probePhoneIp(cand, "bluetooth", btProbeBudgetMs(cand))) answered.store(true);
             });
         }
         for (auto& t : probers) {
@@ -2975,22 +3132,79 @@ static void bluetoothServerLoop() {
 
 // --- Recursive Cross-Device Copy / Move Helper ---
 
-static uint64_t uploadLocalPathToPhone(const fs::path& localPath, const std::string& phoneIp, const std::string& phoneDestDir) {
+/**
+ * What one cross-device copy actually achieved (W4, W5).
+ *
+ * Both helpers used to return a bare byte count, which cannot distinguish "the phone confirmed it
+ * wrote 220 000 bytes" from "the dial failed and nothing moved". The caller then added that number
+ * to a total, derived a speed from it and recorded a history row - so a Bluetooth upload that never
+ * reached the handset was reported as a completed transfer at a measured MB/s, and the file was
+ * simply not on the phone. `bytes` here is only ever what the far end confirmed, and `problem` says
+ * in one sentence why it was not more.
+ */
+struct PhoneXfer {
+    uint64_t bytes = 0;      ///< bytes the far end confirmed, never the length we hoped to send
+    bool ok = false;         ///< every file in this operation landed
+    bool verified = false;   ///< a SHA-256 actually compared equal - not merely "no hash was offered"
+    std::string problem;     ///< why not, as a sentence a user can act on
+};
+
+/** Turns a reply status into the sentence a user can act on ("" means success). */
+static std::string describePhoneReply(int status, const std::string& endpoint) {
+    if (status >= 200 && status < 300) return "";
+    if (status == 401) return "the phone rejected the Pairing Key (401)";
+    if (status == 403) return "Sibling Mode is switched off on the phone (403)";
+    if (status == 404) return "the phone has no such file (404)";
+    if (status == 409) return "the phone rejected the content because its SHA-256 did not match (409)";
+    if (status == 413) return "the file is too large for the phone to accept (413)";
+    if (status == 429) return "the phone is rate-limiting this PC after repeated failures (429)";
+    if (status == 507) return "the phone is out of storage space (507)";
+    if (status >= 500) return "the phone's ChainIt service failed internally (" + std::to_string(status) + ")";
+    if (status > 0) return "the phone answered " + std::to_string(status);
+    // Status 0 means nothing came back at all. Over Bluetooth the dial path recorded a specific
+    // reason, and that reason is worth far more to the user than the word "failed".
+    if (isBtEndpoint(endpoint)) {
+        const std::string why = btLastDialError();
+        return why.empty() ? std::string("no answer from the phone over Bluetooth RFCOMM")
+                           : ("Bluetooth: " + why);
+    }
+    return "no answer from the phone at " + endpoint + " (is ChainIt open on it?)";
+}
+
+static PhoneXfer uploadLocalPathToPhone(const fs::path& localPath, const std::string& phoneIp,
+                                       const std::string& phoneDestDir) {
+    PhoneXfer out;
     std::error_code ec;
     if (fs::is_directory(localPath, ec)) {
         std::string folderName = localPath.filename().u8string();
         std::string mkBody = "{\"parentDir\":\"" + jsonEscape(phoneDestDir) + "\",\"name\":\"" + jsonEscape(folderName) + "\"}";
-        httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/mkdir", mkBody, {{"Content-Type", "application/json"}}, 5000);
-        std::string subDest = (phoneDestDir == "/" ? "" : phoneDestDir) + "/" + folderName;
-        uint64_t sum = 0;
-        for (const auto& child : fs::directory_iterator(localPath, ec)) {
-            sum += uploadLocalPathToPhone(child.path(), phoneIp, subDest);
+        HttpReply mkRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/mkdir", mkBody,
+                                            {{"Content-Type", "application/json"}}, 5000);
+        // A folder that already exists is not a failure. Anything else means its children have
+        // nowhere to land, so say so rather than reporting the bytes of files that went nowhere.
+        if (mkRep.status != 200 && mkRep.status != 201 && mkRep.status != 409) {
+            out.problem = "could not create the folder " + folderName + " on the phone: " +
+                          describePhoneReply(mkRep.status, phoneIp);
+            return out;
         }
-        return sum;
+        std::string subDest = (phoneDestDir == "/" ? "" : phoneDestDir) + "/" + folderName;
+        out.ok = true;
+        for (const auto& child : fs::directory_iterator(localPath, ec)) {
+            const PhoneXfer sub = uploadLocalPathToPhone(child.path(), phoneIp, subDest);
+            out.bytes += sub.bytes;
+            if (!sub.ok) {
+                out.ok = false;
+                if (out.problem.empty()) out.problem = sub.problem;
+            }
+        }
+        return out;
     }
 
     std::ifstream ifs(localPath, std::ios::binary);
-    if (!ifs) return 0;
+    if (!ifs) {
+        out.problem = "cannot open " + localPath.filename().u8string() + " on this PC";
+        return out;
+    }
     std::ostringstream ss;
     ss << ifs.rdbuf();
     std::string data = ss.str();
@@ -3001,14 +3215,29 @@ static uint64_t uploadLocalPathToPhone(const fs::path& localPath, const std::str
     std::map<std::string, std::string> hdrs = {{"Content-Type", "application/octet-stream"}};
     if (!fileHash.empty()) hdrs["X-ChainIt-File-Sha256"] = fileHash;
     HttpReply upRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", url, data, hdrs, 60000);
-    if (upRep.status == 409) {
-        addLogLocked("SECURITY", "Upload rejected by phone (SHA-256 mismatch)", fname);
-        return 0;
+
+    const std::string why = describePhoneReply(upRep.status, phoneIp);
+    if (!why.empty()) {
+        if (upRep.status == 409) {
+            addLogLocked("SECURITY", "Upload rejected by phone (SHA-256 mismatch)", fname);
+        }
+        out.problem = fname + ": " + why;
+        return out;
     }
-    return data.size();
+
+    // The phone confirmed it. Prefer the count *it* reports over the length we sent, so a truncated
+    // write on the handset is recorded here as truncated instead of as a full transfer.
+    out.bytes = data.size();
+    if (jsonHasKey(upRep.body, "bytes")) {
+        const int64_t wrote = jsonExtractInt(upRep.body, "bytes", -1);
+        if (wrote >= 0) out.bytes = static_cast<uint64_t>(wrote);
+    }
+    out.ok = true;
+    return out;
 }
 
-static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::string& phoneSrcPath, const fs::path& localDestDir) {
+static PhoneXfer downloadPhonePathToLocal(const std::string& phoneIp, const std::string& phoneSrcPath, const fs::path& localDestDir) {
+    PhoneXfer out;
     std::error_code ec;
     fs::create_directories(localDestDir, ec);
     std::string baseName = fs::u8path(phoneSrcPath).filename().u8string();
@@ -3020,7 +3249,7 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
         fs::path subLocal = localDestDir / fs::u8path(baseName);
         fs::create_directories(subLocal, ec);
         // Extract child paths from items array
-        uint64_t sum = 0;
+        out.ok = true;
         size_t pos = listRep.body.find("\"items\":[");
         while ((pos = listRep.body.find("\"path\":\"", pos)) != std::string::npos) {
             pos += 8;
@@ -3029,10 +3258,15 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
             std::string childPath = listRep.body.substr(pos, endQ - pos);
             pos = endQ + 1;
             if (!childPath.empty() && childPath != phoneSrcPath) {
-                sum += downloadPhonePathToLocal(phoneIp, childPath, subLocal);
+                const PhoneXfer sub = downloadPhonePathToLocal(phoneIp, childPath, subLocal);
+                out.bytes += sub.bytes;
+                if (!sub.ok) {
+                    out.ok = false;
+                    if (out.problem.empty()) out.problem = sub.problem;
+                }
             }
         }
-        return sum;
+        return out;
     }
 
     const std::string rawUrl = "/chainit/raw?path=" + urlEncode(phoneSrcPath);
@@ -3132,7 +3366,10 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
             addLogLocked("VFS", "Parallel chunked transfer completed",
                          baseName + " (" + std::to_string(total) + " B in " + std::to_string(workers) +
                              " simultaneous 2 MiB streams, every chunk SHA-256 verified)");
-            return total;
+            out.bytes = total;
+            out.ok = true;
+            out.verified = true;   // every 2 MiB chunk was SHA-256 checked before the rename
+            return out;
         }
         // fall through to the single-stream path on any parallel failure
     }
@@ -3144,15 +3381,33 @@ static uint64_t downloadPhonePathToLocal(const std::string& phoneIp, const std::
             if (got != fileSha) {
                 gIntegrityFailures.fetch_add(1);
                 addLogLocked("SECURITY", "Transfer aborted: whole-file SHA-256 mismatch", phoneSrcPath);
-                return 0;
+                out.problem = baseName + ": what arrived did not match the phone's SHA-256, so nothing was kept";
+                return out;
             }
             gIntegrityChunksOk.fetch_add(1);
+            out.verified = true;
         }
         std::ofstream ofs(dst, std::ios::binary);
         ofs.write(rawRep.body.data(), static_cast<std::streamsize>(rawRep.body.size()));
-        return rawRep.body.size();
+        ofs.close();
+        // Asking for the write is not the same as having written it: a full disk or a locked
+        // destination leaves the stream bad, and reporting the byte count anyway is how a transfer
+        // that never happened ends up in the history with a speed attached to it.
+        std::error_code wec;
+        const uint64_t landed =
+            fs::is_regular_file(dst, wec) ? static_cast<uint64_t>(fs::file_size(dst, wec)) : 0;
+        if (ofs.fail() || landed != rawRep.body.size()) {
+            out.problem = baseName + ": this PC could not write the file to " + dst.u8string() + " (" +
+                          std::to_string(landed) + " of " + std::to_string(rawRep.body.size()) +
+                          " bytes made it to disk)";
+            return out;
+        }
+        out.bytes = landed;
+        out.ok = true;
+        return out;
     }
-    return 0;
+    out.problem = baseName + ": " + describePhoneReply(rawRep.status, phoneIp);
+    return out;
 }
 
 // --- HTTP Response Helpers ---
@@ -3417,12 +3672,12 @@ static ShortcutResult createDesktopShortcut() {
 // Tray icon handle (declared early so the updater can drop the icon before it exits).
 static NOTIFYICONDATAW gNid{};
 
-static const char* const kChainItAppVersion = "1.8.0";
+static const char* const kChainItAppVersion = "1.9.0";
 /** Increases with every release (mirrors the APK versionCode). Published on the
  *  File Manager window as the "ChainItBuild" property so that a newly launched
  *  build can tell a *current* resident instance from an *older* one - and take
  *  over from the older one instead of politely handing the user back to it. */
-static const int kChainItBuildNumber = 10;
+static const int kChainItBuildNumber = 11;
 
 static std::vector<std::wstring> updateUrlCandidates() {
     std::vector<std::wstring> urls;
@@ -3808,8 +4063,36 @@ static void sendHttpResponse(
     }
 }
 
+/**
+ * The reason phrase that belongs with a status code.
+ *
+ * sendJsonStr used to answer every non-200 as "Bad Request", so the honest refusals added for the
+ * phone-unreachable case went out as `HTTP/1.1 503 Bad Request` - a code and a phrase that contradict
+ * each other in the very response whose job is to explain what went wrong.
+ */
+static const char* httpReasonPhrase(int status) {
+    switch (status) {
+        case 200: return "OK";
+        case 201: return "Created";
+        case 206: return "Partial Content";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 413: return "Payload Too Large";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 507: return "Insufficient Storage";
+        default: return (status >= 500) ? "Server Error" : "Error";
+    }
+}
+
 static void sendJsonStr(SOCKET client, int status, const std::string& json) {
-    sendHttpResponse(client, status, status == 200 ? "OK" : "Bad Request", "application/json; charset=utf-8", json.data(), json.size());
+    sendHttpResponse(client, status, httpReasonPhrase(status), "application/json; charset=utf-8", json.data(), json.size());
 }
 
 // --- WebSocket Handshake (RFC 6455) so Browser Live Connection Works Smoothly ---
@@ -4328,64 +4611,152 @@ static void handleHttpClient(SOCKET client) {
         // with the PC-side path it refers to, and the speed is measured over this call instead of the
         // constant the old code stored.
         const int64_t startedMs = nowMs();
-        struct Shared { std::string label; std::string localPath; int64_t bytes; };
+        // `ok` is what keeps a file that never landed out of the shared-file history: without it a
+        // failed download still had a destination path, so it was recorded as a 0-byte transfer.
+        struct Shared { std::string label; std::string localPath; int64_t bytes; bool ok = true; };
         std::vector<Shared> shared;
+        // W5: why individual files did not land. This endpoint used to answer {"status":"completed"}
+        // whatever happened, so a Bluetooth transfer that moved nothing at all was indistinguishable
+        // from one that moved everything - the user saw a success line with a measured MB/s and a
+        // history row, and the file was simply not on the phone.
+        std::vector<std::string> failures;
+        // W6: set when the operation named the phone but no phone is reachable. The response then
+        // refuses instead of quietly doing something local and calling it a transfer.
+        std::string phoneUnreachable;
 
         if (!phoneIp.empty() && (fromTarget == "phone" || toTarget == "phone")) {
             if (fromTarget == "pc" && toTarget == "phone") {
                 for (const auto& p : fromPaths) {
                     fs::path src = resolveLocalSafe(gState.pcRoot, p);
-                    const uint64_t n = uploadLocalPathToPhone(src, phoneIp, toDir);
-                    totalBytes += n;
-                    shared.push_back({src.filename().u8string(), src.generic_u8string(), static_cast<int64_t>(n)});
+                    const PhoneXfer up = uploadLocalPathToPhone(src, phoneIp, toDir);
+                    totalBytes += up.bytes;
+                    shared.push_back({src.filename().u8string(), src.generic_u8string(), static_cast<int64_t>(up.bytes), up.ok});
+                    if (!up.ok) {
+                        failures.push_back(up.problem.empty()
+                                               ? (src.filename().u8string() + " did not reach the phone")
+                                               : up.problem);
+                        // W8: a move whose upload was not confirmed must not delete the source. The
+                        // old code removed it unconditionally, so a failed Bluetooth move destroyed
+                        // the only copy of the file - on this PC, where the user could still see it
+                        // a moment earlier.
+                        continue;
+                    }
                     if (op == "move") fs::remove_all(src, ec);
                 }
             } else if (fromTarget == "phone" && toTarget == "pc") {
                 fs::path dstDir = resolveLocalSafe(gState.pcRoot, toDir);
+                // W8: only a path that actually landed on this PC may be deleted from the phone.
+                std::vector<std::string> landedOnPc;
                 for (const auto& p : fromPaths) {
-                    const uint64_t n = downloadPhonePathToLocal(phoneIp, p, dstDir);
-                    totalBytes += n;
+                    const PhoneXfer dn = downloadPhonePathToLocal(phoneIp, p, dstDir);
+                    totalBytes += dn.bytes;
                     const fs::path landed = dstDir / fs::u8path(p).filename();
-                    shared.push_back({fs::u8path(p).filename().u8string(), landed.generic_u8string(), static_cast<int64_t>(n)});
+                    shared.push_back({fs::u8path(p).filename().u8string(), landed.generic_u8string(), static_cast<int64_t>(dn.bytes), dn.ok});
+                    if (!dn.ok) {
+                        failures.push_back(dn.problem.empty() ? (p + " did not arrive from the phone") : dn.problem);
+                        continue;
+                    }
+                    landedOnPc.push_back(p);
                 }
-                if (op == "move") {
+                if (op == "move" && !landedOnPc.empty()) {
                     std::ostringstream delJson;
                     delJson << "{\"paths\":[";
-                    for (size_t i = 0; i < fromPaths.size(); ++i) {
+                    for (size_t i = 0; i < landedOnPc.size(); ++i) {
                         if (i > 0) delJson << ",";
-                        delJson << "\"" << jsonEscape(fromPaths[i]) << "\"";
+                        delJson << "\"" << jsonEscape(landedOnPc[i]) << "\"";
                     }
                     delJson << "]}";
-                    httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/delete", delJson.str(), {{"Content-Type", "application/json"}}, 10000);
+                    HttpReply delRep = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/delete",
+                                                         delJson.str(), {{"Content-Type", "application/json"}}, 10000);
+                    // The bytes are on this PC, so this is not a lost file - but a move that could not
+                    // remove the source left a duplicate, and saying nothing about it is how a user
+                    // ends up with two copies and no idea why.
+                    const std::string delWhy = describePhoneReply(delRep.status, phoneIp);
+                    if (!delWhy.empty()) {
+                        failures.push_back("the files landed on this PC but the phone's copies could not be "
+                                           "deleted, so they are duplicated: " + delWhy);
+                    }
+                } else if (op == "move" && landedOnPc.empty()) {
+                    failures.push_back("nothing arrived, so nothing was deleted from the phone");
                 }
             } else if (fromTarget == "phone" && toTarget == "phone") {
                 HttpReply r = httpRequestToPhone(phoneIp, PHONE_VFS_PORT, "POST", "/chainit/transfer", body, {{"Content-Type", "application/json"}}, 30000);
-                totalBytes = static_cast<uint64_t>(jsonExtractInt(r.body, "totalBytes", 1024));
-                // Nothing landed on this PC, so there is no local path to offer for this entry.
-                shared.push_back({fromPaths.empty() ? std::string("phone-to-phone items")
-                                                    : fs::u8path(fromPaths[0]).filename().u8string(),
-                                  "", static_cast<int64_t>(totalBytes)});
+                const std::string why = describePhoneReply(r.status, phoneIp);
+                if (!why.empty()) {
+                    failures.push_back(why);
+                } else {
+                    // W7: the size used to default to a literal 1024 when the phone did not report
+                    // one, and a speed was then derived from that invented number. An unreported
+                    // size is absent, not 1 KiB.
+                    totalBytes = jsonHasKey(r.body, "totalBytes")
+                                     ? static_cast<uint64_t>(jsonExtractInt(r.body, "totalBytes", 0))
+                                     : 0;
+                    // Nothing landed on this PC, so there is no local path to offer for this entry.
+                    shared.push_back({fromPaths.empty() ? std::string("phone-to-phone items")
+                                                        : fs::u8path(fromPaths[0]).filename().u8string(),
+                                      "", static_cast<int64_t>(totalBytes)});
+                }
             }
+        } else if (fromTarget == "phone" || toTarget == "phone") {
+            // W6: the operation named the phone, and no phone is reachable. This branch used to copy
+            // into <profile>\.chainit\sibling-staging - a folder on *this PC*, pre-populated with
+            // DCIM\Camera, Download and Documents - and then report the result as a completed
+            // cross-device transfer with a measured MB/s. So dragging a file onto the Phone pane with
+            // the radio off appeared to work while the file never left the machine. The staging
+            // folder stays for browsing as labelled offline scratch space; it is not the handset and
+            // is no longer reported as one.
+            std::string cause = "no phone is reachable on any transport right now";
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                if (!gState.phoneLinkProblem.empty()) cause = gState.phoneLinkProblem;
+            }
+            const std::string btWhy = btLastDialError();
+            if (!btWhy.empty() && btLastErrorAgeMs() < 120000) {
+                cause += "  \u00B7  last Bluetooth dial: " + btWhy;
+            }
+            phoneUnreachable = cause;
         } else {
-            // Local PC -> PC (or local demo phone folder before real phone pairs)
-            fs::path srcRoot = (fromTarget == "pc") ? gState.pcRoot : gState.fallbackPhoneRoot;
-            fs::path dstRoot = (toTarget == "pc") ? gState.pcRoot : gState.fallbackPhoneRoot;
-            fs::path dstDir = resolveLocalSafe(dstRoot, toDir);
+            // A genuine PC -> PC copy inside the profile root: no phone involved, nothing to fake.
+            fs::path dstDir = resolveLocalSafe(gState.pcRoot, toDir);
             fs::create_directories(dstDir, ec);
             for (const auto& p : fromPaths) {
-                fs::path src = resolveLocalSafe(srcRoot, p);
-                if (!fs::exists(src, ec)) continue;
+                fs::path src = resolveLocalSafe(gState.pcRoot, p);
+                if (!fs::exists(src, ec)) {
+                    failures.push_back(p + " is not present on this PC");
+                    continue;
+                }
                 fs::path dst = dstDir / src.filename();
+                ec.clear();
                 if (op == "move") {
                     fs::rename(src, dst, ec);
                     if (ec) {
+                        ec.clear();
                         fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                        if (ec) {
+                            failures.push_back(p + ": " + ec.message());
+                            continue;
+                        }
                         fs::remove_all(src, ec);
                     }
                 } else {
                     fs::copy(src, dst, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+                    if (ec) {
+                        failures.push_back(p + ": " + ec.message());
+                        continue;
+                    }
                 }
-                const uint64_t n = fs::is_regular_file(dst, ec) ? fs::file_size(dst, ec) : 4096;
+                // W7: measured, not assumed. This used to fall back to a literal 4096 bytes for
+                // anything that was not a regular file - so copying a folder recorded 4 KiB and a
+                // speed derived from it. A folder is the sum of its files; anything else is zero.
+                uint64_t n = 0;
+                if (fs::is_regular_file(dst, ec)) {
+                    n = static_cast<uint64_t>(fs::file_size(dst, ec));
+                } else if (fs::is_directory(dst, ec)) {
+                    for (auto it = fs::recursive_directory_iterator(dst, ec);
+                         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                        if (fs::is_regular_file(it->path(), ec)) n += static_cast<uint64_t>(fs::file_size(it->path(), ec));
+                    }
+                }
                 totalBytes += n;
                 shared.push_back({src.filename().u8string(), dst.generic_u8string(), static_cast<int64_t>(n)});
             }
@@ -4394,29 +4765,81 @@ static void handleHttpClient(SOCKET client) {
         const std::string label = fromPaths.empty() ? "Items" : fs::u8path(fromPaths[0]).filename().u8string();
         const std::string dir = (fromTarget == "pc" && toTarget == "phone") ? "pc_to_phone" :
                                 (fromTarget == "phone" && toTarget == "pc") ? "phone_to_pc" : "internal_pc";
+
+        // W6: the operation named the phone and no phone is reachable. Refuse, with the reason the
+        // link layer already knows, instead of doing something local and calling it a transfer.
+        if (!phoneUnreachable.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(gState.mtx);
+                addLogLocked("VFS", std::string(op == "move" ? "Move refused: " : "Copy refused: ") + label,
+                             phoneUnreachable);
+            }
+            std::string resp = "{\"status\":\"failed\",\"error\":\"" + jsonEscape(phoneUnreachable) +
+                               "\",\"problems\":[\"" + jsonEscape(phoneUnreachable) +
+                               "\"],\"movedBytes\":0,\"snapshot\":" + buildStateSnapshotJson() + "}";
+            sendJsonStr(client, 503, resp);
+            closesocket(client);
+            return;
+        }
+
+        bool anyOk = false;
+        for (const Shared& sh : shared) {
+            if (sh.ok) { anyOk = true; break; }
+        }
+        size_t recorded = 0;
         {
             const int64_t elapsed = (std::max)(static_cast<int64_t>(1), nowMs() - startedMs);
             const double mbps = (static_cast<double>(totalBytes) / (1048576.0)) / (static_cast<double>(elapsed) / 1000.0);
             // A batch records its files, not one aggregate row - but bounded, so copying a whole
-            // folder cannot push the useful end of the history out in a single operation.
+            // folder cannot push the useful end of the history out in a single operation. A file that
+            // did not land is not recorded at all: it still had a destination path, so the old test
+            // let it into the Recent tab as a 0-byte transfer that looked like a real one.
             size_t kept = 0;
             for (const Shared& sh : shared) {
                 if (kept >= 24u) break;
+                if (!sh.ok) continue;
                 if (sh.bytes <= 0 && sh.localPath.empty()) continue;
                 recordTransfer(op, dir, sh.label, sh.bytes, mbps, activeTr, "api", sh.localPath);
                 ++kept;
             }
-            if (kept == 0) recordTransfer(op, dir, label, static_cast<int64_t>(totalBytes), mbps, activeTr, "api", "");
+            recorded = kept;
+            if (kept == 0 && failures.empty()) {
+                recordTransfer(op, dir, label, static_cast<int64_t>(totalBytes), mbps, activeTr, "api", "");
+                recorded = 1;
+            }
 
             char spd[32];
             std::snprintf(spd, sizeof(spd), "%.1f MB/s", mbps);
             std::lock_guard<std::mutex> lk(gState.mtx);
-            addLogLocked("VFS", (op == "move" ? "Moved " : "Copied ") + label,
-                         "Completed over " + activeTr + " at " + spd);
+            if (failures.empty()) {
+                addLogLocked("VFS", (op == "move" ? "Moved " : "Copied ") + label,
+                             "Completed over " + activeTr + " at " + spd);
+            } else {
+                // The log is where a user goes to find out what happened, so it carries the first
+                // real cause rather than a summary that says everything is fine.
+                addLogLocked("VFS", (op == "move" ? "Move incomplete: " : "Copy incomplete: ") + label,
+                             std::to_string(recorded) + " of " + std::to_string(fromPaths.size()) +
+                                 " item(s) landed over " + activeTr + "  \u00B7  " + failures.front());
+            }
         }
 
-        std::string resp = "{\"status\":\"completed\",\"snapshot\":" + buildStateSnapshotJson() + "}";
-        sendJsonStr(client, 200, resp);
+        // W5: the answer says what happened. "completed" only when nothing failed, "partial" when
+        // some files landed and some did not, "failed" when none did - and a total failure is a 502,
+        // because the phone is the upstream that did not deliver.
+        const char* verdict = failures.empty() ? "completed" : (anyOk ? "partial" : "failed");
+        std::string resp = std::string("{\"status\":\"") + verdict + "\"";
+        if (!failures.empty()) {
+            resp += ",\"error\":\"" + jsonEscape(failures.front()) + "\",\"problems\":[";
+            for (size_t i = 0; i < failures.size() && i < 8u; ++i) {
+                if (i > 0) resp += ",";
+                resp += "\"" + jsonEscape(failures[i]) + "\"";
+            }
+            resp += "]";
+        }
+        resp += ",\"movedBytes\":" + std::to_string(totalBytes);
+        resp += ",\"itemsLanded\":" + std::to_string(recorded);
+        resp += ",\"snapshot\":" + buildStateSnapshotJson() + "}";
+        sendJsonStr(client, (failures.empty() || anyOk) ? 200 : 502, resp);
         closesocket(client);
         return;
     }
@@ -4434,6 +4857,7 @@ static void handleHttpClient(SOCKET client) {
         }
 
         // Proxy to real Android Sibling if connected!
+        std::string phoneProxyFailure;
         if (isPhone && !phoneIp.empty()) {
             std::string remoteUrl = "/chainit/" + action + (queryStr.empty() ? "" : ("?" + queryStr));
             std::map<std::string, std::string> hdrs;
@@ -4445,14 +4869,46 @@ static void handleHttpClient(SOCKET client) {
                 std::string ct = rep.headers.count("content-type") ? rep.headers["content-type"] : "application/json";
                 std::map<std::string, std::string> extra;
                 if (rep.headers.count("content-disposition")) extra["Content-Disposition"] = rep.headers["content-disposition"];
-                sendHttpResponse(client, rep.status, rep.status == 200 ? "OK" : "Error", ct, rep.body.data(), rep.body.size(), extra);
+                sendHttpResponse(client, rep.status, httpReasonPhrase(rep.status), ct, rep.body.data(), rep.body.size(), extra);
                 closesocket(client);
                 return;
             }
+            phoneProxyFailure = describePhoneReply(rep.status, phoneIp);
         }
 
-        // Local execution (for C:\ User Profile OR Demo Phone Folder before Android app pairs)
-        fs::path root = isPhone ? gState.fallbackPhoneRoot : gState.pcRoot;
+        // W6: the phone was named and no phone is behind it. This used to fall straight through to
+        // <profile>\.chainit\sibling-staging - a folder on *this PC*, pre-populated with DCIM\Camera,
+        // Download and Documents - and serve it as though it were the handset. Listing it is still
+        // useful as offline scratch space, so it stays, but every byte of the response now says it is
+        // simulated. Anything that would change or hand over a file is refused instead: "delete this
+        // photo" aimed at a phone that is not there must not quietly delete something inside the PC's
+        // own profile and report success.
+        if (isPhone) {
+            std::string cause = phoneIp.empty() ? std::string() : phoneProxyFailure;
+            if (cause.empty()) {
+                cause = "no phone is reachable on any transport right now";
+                const std::string btWhy = btLastDialError();
+                if (!btWhy.empty() && btLastErrorAgeMs() < 120000) cause += "  \u00B7  last Bluetooth dial: " + btWhy;
+            }
+            if (action != "list" || method != "GET") {
+                sendJsonStr(client, 503, "{\"error\":\"" + jsonEscape(cause) +
+                                         "\",\"phoneReachable\":false,\"simulated\":false}");
+                closesocket(client);
+                return;
+            }
+            const std::string p = getQueryParam(queryStr, "path", "/");
+            const std::string notice = "Offline scratch folder on this PC (" +
+                                       gState.fallbackPhoneRoot.u8string() + "), not your phone. " + cause;
+            sendJsonStr(client, 200,
+                        jsonWithExtraFields(listLocalDirJson(gState.fallbackPhoneRoot, p),
+                                            "\"simulated\":true,\"phoneReachable\":false,\"notice\":\"" +
+                                                jsonEscape(notice) + "\""));
+            closesocket(client);
+            return;
+        }
+
+        // Local execution against the PC's own profile root.
+        fs::path root = gState.pcRoot;
         std::error_code ec;
 
         if (action == "list" && method == "GET") {
@@ -5395,9 +5851,18 @@ static void uiLoadPaneAsync(int pane, const std::wstring& dir) {
                     } else if (rep.status > 0) {
                         pay->error = L"The phone answered HTTP " + std::to_wstring(rep.status) + L".";
                     } else {
-                        pay->error = isBtEndpoint(ip)
-                            ? L"The Bluetooth RFCOMM link did not answer. Keep the phone in range; ChainIt re-dials on its own."
-                            : L"The phone did not answer on " + uiUtf8ToWide(ip) + L". Every transport is being re-scanned now.";
+                        // The dial path records why it failed (WSAECONNREFUSED means the handset's
+                        // ChainIt listener is not open; a page timeout means it is out of range or
+                        // asleep). A generic "did not answer" threw that away, and the difference is
+                        // exactly what tells a user whether to move closer or open the app.
+                        const std::string why = isBtEndpoint(ip) ? btLastDialError() : std::string();
+                        if (isBtEndpoint(ip) && !why.empty() && btLastErrorAgeMs() < 120000) {
+                            pay->error = L"The Bluetooth RFCOMM link did not answer: " + uiUtf8ToWide(why);
+                        } else {
+                            pay->error = isBtEndpoint(ip)
+                                ? L"The Bluetooth RFCOMM link did not answer. Keep the phone in range and ChainIt open; ChainIt re-dials on its own."
+                                : L"The phone did not answer on " + uiUtf8ToWide(ip) + L". Every transport is being re-scanned now.";
+                        }
                         {
                             std::lock_guard<std::mutex> lk(gState.mtx);
                             gState.phoneLinkProblem = uiWideToUtf8(pay->error);
@@ -5762,11 +6227,16 @@ static void uiOpTransfer(int fromPane, bool move) {
                 const std::string ip = uiCurrentPhoneIp();
                 if (ip.empty()) { fail = L"No phone linked yet."; break; }
                 const fs::path real = uiRealPcPath(t.path);
-                const uint64_t n = uploadLocalPathToPhone(real, ip, uiWideToUtf8(toDir));
-                if (n == 0 && !t.isDir) { fail = L"Upload refused for " + t.name; }
-                done += n;
-                if (n > 0) shared.push_back({uiWideToUtf8(t.name), real.generic_u8string(), static_cast<int64_t>(n)});
-                if (move && n > 0) { std::error_code ec; fs::remove_all(real, ec); }
+                const PhoneXfer up = uploadLocalPathToPhone(real, ip, uiWideToUtf8(toDir));
+                if (!up.ok) {
+                    // W4: the real cause, not a generic refusal. Over Bluetooth this is the sentence
+                    // that says whether the phone refused, the radio napped, or the key was wrong.
+                    if (fail.empty()) fail = uiUtf8ToWide(up.problem);
+                    if (fail.empty()) fail = L"Upload refused for " + t.name;
+                }
+                done += up.bytes;
+                if (up.ok) shared.push_back({uiWideToUtf8(t.name), real.generic_u8string(), static_cast<int64_t>(up.bytes)});
+                if (move && up.ok) { std::error_code ec; fs::remove_all(real, ec); }
             } else {
                 // phone -> PC
                 const std::string ip = uiCurrentPhoneIp();
@@ -5774,17 +6244,21 @@ static void uiOpTransfer(int fromPane, bool move) {
                 const fs::path destDir = uiRealPcPath(toDir);
                 std::error_code ec;
                 fs::create_directories(destDir, ec);
-                const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
-                if (n == 0) {
+                const PhoneXfer dn = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
+                if (!dn.ok) {
+                    // An empty file used to read as a failure here (n == 0), and a real failure read
+                    // as a vague "integrity gate or link loss". Now the helper's own sentence is used,
+                    // and the link problem is only the fallback when it has nothing to say.
+                    if (fail.empty()) fail = uiUtf8ToWide(dn.problem);
                     if (fail.empty()) {
                         std::lock_guard<std::mutex> lk(gState.mtx);
                         fail = uiUtf8ToWide(gState.phoneLinkProblem);
                     }
-                    if (fail.empty()) fail = L"Transfer failed for " + t.name + L" (integrity gate or link loss)";
+                    if (fail.empty()) fail = L"Transfer failed for " + t.name;
                 } else {
-                    done += n;
+                    done += dn.bytes;
                     shared.push_back({uiWideToUtf8(t.name), (destDir / fs::u8path(uiWideToUtf8(t.path)).filename()).generic_u8string(),
-                                      static_cast<int64_t>(n)});
+                                      static_cast<int64_t>(dn.bytes)});
                     if (move) {
                         std::ostringstream b;
                         b << "{\"paths\":[\"" << jsonEscape(uiWideToUtf8(t.path)) << "\"]}";
@@ -5844,16 +6318,19 @@ static void uiOpOpen(int pane, int idx) {
         const fs::path dir = fs::path(chainItTempDir()) / L"ChainIt-Open";
         std::error_code ec;
         fs::create_directories(dir, ec);
-        const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(it.path), dir);
-        if (n == 0) {
-            std::wstring why;
-            { std::lock_guard<std::mutex> lk(gState.mtx); why = uiUtf8ToWide(gState.phoneLinkProblem); }
+        const PhoneXfer dn = downloadPhonePathToLocal(ip, uiWideToUtf8(it.path), dir);
+        if (!dn.ok) {
+            std::wstring why = uiUtf8ToWide(dn.problem);
+            if (why.empty()) { std::lock_guard<std::mutex> lk(gState.mtx); why = uiUtf8ToWide(gState.phoneLinkProblem); }
             uiToast(why.empty() ? (L"Could not fetch " + it.name) : why, 7000);
             return;
         }
         const fs::path local = dir / fs::u8path(uiWideToUtf8(it.name));
         ShellExecuteW(gMainHwnd, L"open", local.c_str(), nullptr, dir.c_str(), SW_SHOWNORMAL);
-        uiToast(L"Opened " + it.name + L" (" + uiFormatBytes(n) + L", SHA-256 verified)");
+        // "SHA-256 verified" is a claim, so it is made only when a hash was actually compared. A
+        // phone that publishes no hash still delivers a correct file - it just is not a verified one.
+        uiToast(L"Opened " + it.name + L" (" + uiFormatBytes(dn.bytes) +
+                (dn.verified ? L", SHA-256 verified)" : L")"));
     }).detach();
 }
 
@@ -5870,9 +6347,27 @@ static void uiOpDownloadToPc(int pane) {
         GetEnvironmentVariableW(L"USERPROFILE", prof, MAX_PATH * 2 - 1);
         const fs::path dir = fs::path(prof) / L"Downloads";
         uint64_t total = 0;
-        for (const auto& t : targets) total += downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), dir);
-        uiToast(total > 0 ? (L"Saved " + uiFormatBytes(total) + L" to Downloads")
-                          : L"Download failed - see the link status", 7000);
+        size_t landed = 0;
+        std::wstring firstProblem;
+        for (const auto& t : targets) {
+            const PhoneXfer dn = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), dir);
+            total += dn.bytes;
+            if (dn.ok) ++landed;
+            else if (firstProblem.empty()) firstProblem = uiUtf8ToWide(dn.problem);
+        }
+        // A batch that half-worked used to toast a plain success as long as any byte arrived, which
+        // is how three of ten photos go missing without the user ever being told.
+        std::wstring msg;
+        if (landed == targets.size() && firstProblem.empty()) {
+            msg = L"Saved " + uiFormatBytes(total) + L" to Downloads";
+        } else if (landed > 0) {
+            msg = L"Saved " + std::to_wstring(landed) + L" of " + std::to_wstring(targets.size()) +
+                  L" item(s) to Downloads";
+            if (!firstProblem.empty()) msg += L"  \u00B7  " + firstProblem;
+        } else {
+            msg = firstProblem.empty() ? std::wstring(L"Download failed - see the link status") : firstProblem;
+        }
+        uiToast(msg, 7000);
     }).detach();
 }
 
@@ -5907,21 +6402,34 @@ static void uiOpPaste(int pane) {
 
     std::thread([from, pane, targets, toDir, move]() {
         uint64_t done = 0;
+        size_t landed = 0;
+        std::wstring firstProblem;
         const std::string ip = uiCurrentPhoneIp();
         for (const auto& t : targets) {
+            if (ip.empty()) { firstProblem = L"no phone is linked"; break; }
             if (from == PANE_PC) {
-                if (ip.empty()) break;
-                const uint64_t n = uploadLocalPathToPhone(uiRealPcPath(t.path), ip, uiWideToUtf8(toDir));
-                done += n;
-                if (move && n > 0) { std::error_code ec; fs::remove_all(uiRealPcPath(t.path), ec); }
+                const PhoneXfer up = uploadLocalPathToPhone(uiRealPcPath(t.path), ip, uiWideToUtf8(toDir));
+                done += up.bytes;
+                if (!up.ok) {
+                    if (firstProblem.empty()) firstProblem = uiUtf8ToWide(up.problem);
+                    // W8: a cut whose upload was not confirmed keeps its source. Deleting it here
+                    // turned a failed Bluetooth paste into permanent data loss.
+                    continue;
+                }
+                ++landed;
+                if (move) { std::error_code ec; fs::remove_all(uiRealPcPath(t.path), ec); }
             } else {
-                if (ip.empty()) break;
                 const fs::path destDir = uiRealPcPath(toDir);
                 std::error_code ec;
                 fs::create_directories(destDir, ec);
-                const uint64_t n = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
-                done += n;
-                if (move && n > 0) {
+                const PhoneXfer dn = downloadPhonePathToLocal(ip, uiWideToUtf8(t.path), destDir);
+                done += dn.bytes;
+                if (!dn.ok) {
+                    if (firstProblem.empty()) firstProblem = uiUtf8ToWide(dn.problem);
+                    continue;
+                }
+                ++landed;
+                if (move) {
                     std::ostringstream b;
                     b << "{\"paths\":[\"" << jsonEscape(uiWideToUtf8(t.path)) << "\"]}";
                     httpRequestToPhone(ip, PHONE_VFS_PORT, "POST", "/chainit/delete", b.str(),
@@ -5929,9 +6437,24 @@ static void uiOpPaste(int pane) {
                 }
             }
         }
-        uiToast(ip.empty() ? L"No phone linked yet."
-                           : ((move ? L"Moved " : L"Copied ") + std::to_wstring(targets.size()) +
-                              L" item(s), " + uiFormatBytes(done)), 7000);
+        // This toast used to report the number of items *requested* next to the bytes that actually
+        // arrived, so a paste where nothing landed at all still read "Copied 3 item(s), 0 B" - a
+        // success message with a zero in it, which is the same lie in smaller type.
+        std::wstring msg;
+        if (ip.empty()) {
+            msg = L"No phone linked yet.";
+        } else if (landed == targets.size() && firstProblem.empty()) {
+            msg = (move ? L"Moved " : L"Copied ") + std::to_wstring(targets.size()) +
+                  L" item(s), " + uiFormatBytes(done);
+        } else if (landed > 0) {
+            msg = (move ? L"Moved " : L"Copied ") + std::to_wstring(landed) + L" of " +
+                  std::to_wstring(targets.size()) + L" item(s), " + uiFormatBytes(done);
+            if (!firstProblem.empty()) msg += L"  \u00B7  " + firstProblem;
+        } else {
+            msg = firstProblem.empty() ? std::wstring(L"Nothing was transferred - see the Link tab")
+                                       : firstProblem;
+        }
+        uiToast(msg, 7000);
         PostMessageW(gMainHwnd, WM_UI_REFRESH, pane, 0);
         PostMessageW(gMainHwnd, WM_UI_REFRESH, from, 0);
     }).detach();
@@ -6255,7 +6778,9 @@ struct UiLinkInfo {
     std::wstring batterySource;      // ac | usb | wireless | none
     double batteryTempC = 0.0;
     int64_t batteryAgeMs = 0;        // 0 with batteryEver == false means "no phone has reported yet"
-    bool batteryEver = false;
+    bool batteryEver = false;        // true only once a real percentage arrived (W3)
+    bool phoneHeard = false;         // a phone answered, whether or not it named its battery (W3)
+    std::wstring batteryTransport;   // which link carried the last reading (W2)
     bool screenLocked = true;
     bool allowOtherDrives = true;
     std::wstring pcRootLetter;
@@ -6281,7 +6806,12 @@ static UiLinkInfo uiLinkInfo() {
         s.batteryCharging = gState.phoneCharging;
         s.batterySource = uiUtf8ToWide(gState.phoneChargeSource);
         s.batteryTempC = gState.phoneTempC;
-        s.batteryEver = (gState.phoneSeenMs > 0);
+        // W3: gated on a percentage that actually arrived, not on "we heard from a phone". A handset
+        // answering a ping without batteryPct used to flip batteryEver true and draw the invented
+        // default as a real gauge.
+        s.batteryEver = gState.phoneBatteryKnown;
+        s.phoneHeard = (gState.phoneSeenMs > 0);
+        s.batteryTransport = uiUtf8ToWide(gState.phoneTelemetryTransport);
         s.batteryAgeMs = (gState.phoneSeenMs > 0) ? (nowMs() - gState.phoneSeenMs) : 0;
         s.screenLocked = gState.phoneScreenLocked;
         s.allowOtherDrives = gState.allowOtherDrives;
@@ -6598,29 +7128,72 @@ static COLORREF uiBatteryColor(int pct, bool charging) {
 static std::wstring uiBatteryText(const UiLinkInfo& s, bool full, COLORREF& col) {
     if (!s.batteryEver) {
         col = kColFaint;
+        // Two different situations used to collapse into one vague line. Naming the right one is
+        // what makes the card actionable: "no phone has answered yet" means check the link, while
+        // "a phone answered but never named its battery" means the handset is running a ChainIt
+        // build from before battery telemetry existed, and the remedy is to update the APK.
+        if (s.phoneHeard) {
+            return full ? L"the phone answered, but its ChainIt build does not report battery detail"
+                        : L"";
+        }
         return full ? L"awaiting the phone's first report" : L"";
     }
     col = uiBatteryColor(s.batteryPct, s.batteryCharging);
     std::wstring t = std::to_wstring(s.batteryPct) + L"%";
-    if (s.batteryCharging) {
-        const std::wstring how = uiChargeSourceText(s.batterySource);
-        t += full ? (L"  \u00B7  charging from " + (how.empty() ? std::wstring(L"the charger") : how))
-                  : L"  \u00B7  charging";
-    } else if (full) {
-        t += L"  \u00B7  on battery";
-    }
-    if (full && s.batteryTempC > 1.0) {
-        wchar_t b[32]; swprintf(b, 32, L"  \u00B7  %.1f\u00B0C", s.batteryTempC);
-        t += b;
+    if (full) {
+        // The value column here is ~304 px at the default window size and DrawTextW ellipsises the
+        // end, so this row used to read "86%  ·  charging from mains (AC)  ·  3…" - the temperature
+        // and the age, the two things that answer "will this survive the night", were the part that
+        // never fitted. uiDrawBattery already puts a plus sign inside the gauge when the phone is on
+        // charge, so the words "charging from" are redundant: naming the plug directly buys back
+        // exactly the width the temperature, the age and the carrier need.
+        if (s.batteryCharging) {
+            const std::wstring how = uiChargeSourceText(s.batterySource);
+            t += L"  \u00B7  " + (how.empty() ? std::wstring(L"charging") : how);
+        } else {
+            t += L"  \u00B7  on battery";
+        }
+        if (s.batteryTempC > 1.0) {
+            wchar_t b[32]; swprintf(b, 32, L"  \u00B7  %.1f\u00B0C", s.batteryTempC);
+            t += b;
+        }
+        t += L"  \u00B7  " + uiAgoText(s.batteryAgeMs);
+    } else {
+        if (s.batteryCharging) t += L"  \u00B7  charging";
     }
     if (s.batteryAgeMs > 180000) {
-        t += full ? (L"  \u00B7  last reported " + uiAgoText(s.batteryAgeMs))
-                  : (L"  (" + uiAgoText(s.batteryAgeMs) + L")");
+        if (!full) t += L"  (" + uiAgoText(s.batteryAgeMs) + L")";
         col = kColDim;
-    } else if (full) {
-        t += L"  \u00B7  reported " + uiAgoText(s.batteryAgeMs);
     }
     return t;
+}
+
+/**
+ * The short name of the link that carried the last battery reading (W2).
+ *
+ * Deliberately shorter than uiTransportPretty: this goes in the 170 px key column of the Link tab,
+ * where "Battery via Bluetooth RFCOMM" would itself be ellipsised.
+ */
+static std::wstring uiBatteryCarrier(const std::wstring& t) {
+    if (t == L"bluetooth") return L"Bluetooth";
+    if (t == L"wifi_lan") return L"Wi-Fi";
+    if (t == L"local_hotspot") return L"hotspot";
+    if (t == L"usb_rndis") return L"USB";
+    if (t == L"online_p2p") return L"relay";
+    return t;
+}
+
+/**
+ * The label for the battery row.
+ *
+ * Naming the carrier in the *key* rather than appending it to the value is what makes it visible at
+ * all: the value is already full. Over Bluetooth this clause is the point of the row - it is the
+ * difference between "the offline link carries real telemetry" and "this is a Wi-Fi reading from four
+ * minutes ago".
+ */
+static std::wstring uiBatteryKey(const UiLinkInfo& s) {
+    if (s.batteryTransport.empty()) return L"Phone battery";
+    return L"Battery via " + uiBatteryCarrier(s.batteryTransport);
 }
 
 /** Small battery gauge: outline + cap + fill proportional to the charge. */
@@ -7061,7 +7634,7 @@ static void uiPaintLinkTab(HDC dc, const UiLayout& L) {
     {
         COLORREF bcol = kColFaint;
         const std::wstring bt = uiBatteryText(s, true, bcol);
-        uiKv(dc, c1.left + 18, yy, colW - 40, L"Phone battery", bt, bcol);
+        uiKv(dc, c1.left + 18, yy, colW - 40, uiBatteryKey(s), bt, bcol);
         uiDrawBattery(dc, c1.right - 78, yy - 1, s.batteryPct, s.batteryCharging, s.batteryEver);
     }
     yy += 24;

@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import com.chainit.android.service.SiblingDaemonService
 import org.json.JSONArray
@@ -56,10 +58,20 @@ object PcVfsClient {
     private const val BT_READ_MS = 60000
     private const val BT_BODY_READ_MS = 180000
 
+    /**
+     * Ceiling for one whole walk over the paired devices (A2).
+     *
+     * BT_CONNECT_MS bounds a single handset; nothing bounded the loop, so three paired devices and a
+     * PC that is asleep cost 36 s before the honest "no link" answer arrived. The remembered PC is
+     * tried first, so when it is awake this ceiling is never reached - it exists for the case where
+     * it is not.
+     */
+    private const val BT_WALK_BUDGET_MS = 16000
+
     /** Largest response held in memory (list / text / JSON answers are all far smaller). */
     private const val MAX_MEMORY_BODY = 24L * 1024 * 1024
 
-    private const val USER_AGENT = "ChainIt-Android/1.7"
+    private const val USER_AGENT = "ChainIt-Android/1.9"
 
     enum class Transport(val label: String) {
         LAN("Wi-Fi"),
@@ -259,6 +271,54 @@ object PcVfsClient {
         if (!adapter.isEnabled) return false
         val bonded = runCatching { adapter.bondedDevices }.getOrNull() ?: return false
         return bonded.isNotEmpty()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Transport affinity (A1)
+    // ---------------------------------------------------------------------------------------------
+
+    /** Records which link answered, so the next request starts with it instead of rediscovering. */
+    private fun rememberTransport(context: Context, transport: Transport) {
+        runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putString("last_good_transport", transport.name).apply()
+        }
+    }
+
+    private fun rememberedTransport(context: Context): Transport? {
+        val raw = runCatching {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("last_good_transport", null)
+        }.getOrNull() ?: return null
+        if (raw == Transport.BLUETOOTH.name) return Transport.BLUETOOTH
+        if (raw == Transport.LAN.name) return Transport.LAN
+        return null
+    }
+
+    /**
+     * Whether an IP network exists that could possibly reach the PC.
+     *
+     * `resolveTarget` returns a *remembered* IP from preferences, so it stays non-blank long after
+     * Wi-Fi is gone - and `request` used to dial that address first on every single operation,
+     * burning up to LAN_CONNECT_MS (3.5 s) on a socket that cannot exist before Bluetooth was even
+     * attempted. Offline, that toll was paid per listing, per download and per upload, which is most
+     * of what made Bluetooth feel slow when it is the only link. ACCESS_NETWORK_STATE is already
+     * granted, so this costs no new permission.
+     *
+     * Cellular and VPN count: the PC may be reachable through an online_p2p relay rather than a LAN.
+     * When the state cannot be read at all the answer is "yes", which is the old behaviour.
+     */
+    private fun hasIpNetwork(context: Context): Boolean {
+        val cm = runCatching {
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        }.getOrNull() ?: return true
+        return runCatching {
+            val active = cm.activeNetwork ?: return@runCatching false
+            val caps = cm.getNetworkCapabilities(active) ?: return@runCatching false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }.getOrDefault(true)
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -522,20 +582,51 @@ object PcVfsClient {
     ): Reply {
         val key = siblingKey(context)
         var lanProblem: String? = null
+        var btProblem: String? = null
 
-        if (target.ip.isNotBlank()) {
-            val out = lanCall(context, target, method, pathAndQuery, body, bodySource, key, lanReadMs, sink, onUploadProgress, onDownloadProgress)
-            // A 4xx/5xx is an answer, not a transport failure — never re-ask over Bluetooth.
-            if (out.status > 0) return Reply(out.status, out.body, Transport.LAN, out.rttMs, out.problem)
-            lanProblem = out.problem
+        // A1: Wi-Fi stays first by default because it is the faster link *when it is there* - but
+        // `target.ip` is a remembered address that outlives the network behind it, so dialling it
+        // offline cost up to LAN_CONNECT_MS on every operation before Bluetooth was even attempted.
+        // Bluetooth goes first when it was the link that answered last time, and the LAN attempt is
+        // skipped entirely when this phone has no IP network at all.
+        val lanWorthTrying = target.ip.isNotBlank() && hasIpNetwork(context)
+        val btFirst = rememberedTransport(context) == Transport.BLUETOOTH
+        val attempts = ArrayList<String>()
+        if (btFirst) {
+            attempts.add("bt")
+            if (lanWorthTrying) attempts.add("lan")
+        } else {
+            if (lanWorthTrying) attempts.add("lan")
+            attempts.add("bt")
         }
 
-        val bt = btCall(context, method, pathAndQuery, body, bodySource, key, btReadMs, sink, onUploadProgress, onDownloadProgress)
-        if (bt.status > 0) return Reply(bt.status, bt.body, Transport.BLUETOOTH, bt.rttMs, bt.problem)
+        for (which in attempts) {
+            if (which == "lan") {
+                val out = lanCall(context, target, method, pathAndQuery, body, bodySource, key, lanReadMs, sink, onUploadProgress, onDownloadProgress)
+                // A 4xx/5xx is an answer, not a transport failure — never re-ask over Bluetooth.
+                if (out.status > 0) {
+                    rememberTransport(context, Transport.LAN)
+                    return Reply(out.status, out.body, Transport.LAN, out.rttMs, out.problem)
+                }
+                lanProblem = out.problem
+            } else {
+                val bt = btCall(context, method, pathAndQuery, body, bodySource, key, btReadMs, sink, onUploadProgress, onDownloadProgress)
+                if (bt.status > 0) {
+                    rememberTransport(context, Transport.BLUETOOTH)
+                    return Reply(bt.status, bt.body, Transport.BLUETOOTH, bt.rttMs, bt.problem)
+                }
+                btProblem = bt.problem
+            }
+        }
 
+        // Saying which link was never tried is part of the answer: an offline user who is told only
+        // "Bluetooth: no PC is paired yet" cannot tell that Wi-Fi was skipped for a good reason.
+        val lanSkipped = target.ip.isNotBlank() && !lanWorthTrying
         val why = when {
-            lanProblem != null && bt.problem != null -> "$lanProblem  •  Bluetooth: ${bt.problem}"
-            bt.problem != null -> "Bluetooth: ${bt.problem}"
+            lanProblem != null && btProblem != null -> "$lanProblem  •  Bluetooth: $btProblem"
+            btProblem != null && lanSkipped ->
+                "this phone has no IP network, so only Bluetooth was tried  •  Bluetooth: $btProblem"
+            btProblem != null -> "Bluetooth: $btProblem"
             lanProblem != null -> lanProblem
             else -> "No link to the PC."
         }
@@ -714,8 +805,19 @@ object PcVfsClient {
             val addr = runCatching { device.address }.getOrNull()?.uppercase()
             if (knownPc != null && addr == knownPc) ordered.add(0, device) else ordered.add(device)
         }
+        val walkStarted = System.currentTimeMillis()
         for (device in ordered) {
-            val outcome = btCallDevice(device, method, pathAndQuery, body, bodySource, key, readMs, sink, onUploadProgress, onDownloadProgress)
+            // A2: bound the whole walk, not just each handset. The remembered PC goes first, so when
+            // it is awake this ceiling never bites; when it is not, the user gets an honest answer in
+            // seconds instead of after one BT_CONNECT_MS connect per paired device.
+            val left = BT_WALK_BUDGET_MS - (System.currentTimeMillis() - walkStarted).toInt()
+            if (left < 1500) {
+                lastProblem = "gave up after ${BT_WALK_BUDGET_MS / 1000} s across " +
+                    "${ordered.size} paired device(s): $lastProblem"
+                break
+            }
+            val budget = if (left < BT_CONNECT_MS) left else BT_CONNECT_MS
+            val outcome = btCallDevice(device, method, pathAndQuery, body, bodySource, key, readMs, sink, onUploadProgress, onDownloadProgress, budget)
             if (outcome.status > 0) {
                 // It answered: dial this one first from now on.
                 runCatching { device.address }.getOrNull()?.let { BluetoothRfcommTransport.rememberPcAddress(context, it) }
@@ -737,7 +839,8 @@ object PcVfsClient {
         readMs: Int,
         sink: BodySink?,
         onUploadProgress: ((Long, Long) -> Unit)?,
-        onDownloadProgress: ((Long) -> Unit)?
+        onDownloadProgress: ((Long) -> Unit)?,
+        connectBudgetMs: Int = BT_CONNECT_MS
     ): Outcome {
         val started = System.currentTimeMillis()
         var sock: BluetoothSocket? = null
@@ -752,7 +855,7 @@ object PcVfsClient {
             val dialer = Thread {
                 val attempts = ArrayList<String>()
                 for (entry in BluetoothRfcommTransport.rfcommStrategies(device)) {
-                    if (System.currentTimeMillis() - started > BT_CONNECT_MS) break
+                    if (System.currentTimeMillis() - started > connectBudgetMs) break
                     val candidate = entry.second()
                     if (candidate == null) {
                         attempts.add("${entry.first}: no socket")
@@ -772,10 +875,10 @@ object PcVfsClient {
             dialer.isDaemon = true
             dialer.name = "ChainItBtDial"
             dialer.start()
-            dialer.join(BT_CONNECT_MS.toLong())
+            dialer.join(connectBudgetMs.toLong())
             if (dialer.isAlive) {
                 runCatching { connected.get()?.close() }
-                return Outcome(problem = "${deviceLabel(device)} did not accept the Bluetooth link within ${BT_CONNECT_MS / 1000} s")
+                return Outcome(problem = "${deviceLabel(device)} did not accept the Bluetooth link within ${connectBudgetMs / 1000} s")
             }
             sock = connected.get()
             if (sock == null) {

@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { SystemSnapshot } from '../../shared/types';
 import { APP_VERSION } from '../App';
+import { batteryKnown, batteryTooltip, chargeLabel, telemetryCarrierLabel } from '../utils/format';
 
 interface Props {
   snapshot: SystemSnapshot;
@@ -41,6 +42,16 @@ export const AboutView: React.FC<Props> = ({ snapshot }) => {
       label: 'Active transport',
       value: snapshot.activeTransportId ?? 'none',
       hint: snapshot.sibling.connected ? 'linked' : 'not linked',
+    },
+    {
+      label: 'Phone battery',
+      // v1.9.0: the reading names the link that carried it. Over Bluetooth that is the parity proof
+      // the offline transport has to offer - it carries the same telemetry as Wi-Fi, not just file
+      // bytes. And a percentage nobody reported is shown as absent rather than as a plausible number.
+      value: batteryKnown(snapshot.environment)
+        ? `${snapshot.environment.phoneBatteryPct}% · ${chargeLabel(snapshot.environment)}`
+        : 'not reported',
+      hint: telemetryCarrierLabel(snapshot.environment) || batteryTooltip(snapshot.environment),
     },
     {
       label: 'Bluetooth RFCOMM',

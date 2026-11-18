@@ -305,9 +305,13 @@ file, and to make every refusal visible instead of failing quietly.
 
 ---
 
-## 7. Bluetooth as a First-Class Drive Transport (v1.4.0, rebuilt in v1.8.0)
+## 7. Bluetooth as a First-Class Drive Transport (v1.4.0, rebuilt in v1.8.0, made equivalent in v1.9.0)
 
 Before v1.4.0 the RFCOMM link came up and then appeared to do nothing. Three independent causes, all fixed.
+
+v1.9.0 is the third pass, and it is about **equivalence** rather than connectivity: the offline link has to carry
+the same information and refuse as honestly as Wi-Fi does, because it is the transport that has to work when
+nothing else does. That pass found eleven defects and is documented in §7.13.
 
 v1.8.0 is the second pass, and it started from a user report rather than a design review: *"improve the bluetooth
 connectivity, it still didn't connect — the offline one specifically, it must work smoothly and fast."* Reading the
@@ -511,7 +515,75 @@ only moves when a phone-volume request is actually served while the link is up.)
 Two negative tests prove the assertions bite: deleting the cache read fails with `'sdp' !== 'cached'`, and
 disabling the sweep fails on the rescue assertion. Both were run; both were reverted.
 
-### 7.12 Attribution
+### 7.13 Parity: the offline link must carry information, not just bytes (v1.9.0)
+
+v1.8.0 made the link come up. v1.9.0 started from the next two user reports: *"the battery status isn't in android
+phone i want it to be display on the windows app"*, and then *"it must work same smooth fast and functionality as
+the system works under wifi … the main concern is to access both drives like the pc in my phone and phone in my
+pc."*
+
+Reading the code against that complaint found the wire protocol was already symmetric: `BluetoothRfcommTransport`
+hands every accepted RFCOMM socket to `handleStreamSession(viaBluetooth = true)`, and that flag does nothing but
+tag a log string, so `/chainit/ping` answers over Bluetooth with exactly the payload it answers with over Wi-Fi —
+battery percentage, plug, temperature, capacity and all. Every phone$\rightarrow$PC operation likewise funnels
+through one `PcVfsClient.request()` that falls back to Bluetooth.
+
+What was broken was the layer above, and it was the same shape as v1.8.0's dead cache: **the offline path was
+allowed to claim success it had no evidence for.** A user with no internet saw a working-looking link, no battery,
+and files that never arrived.
+
+| # | Defect | Where | Fix |
+| :-- | :-- | :-- | :-- |
+| **W1** | The *automatic* dial got 3 s while the *manual* Connect button got 12 s. A cold dial is SDP + ACL page + connect drawn from one shared deadline, so 3 s does not make it faster — it makes it fail, and the failure feeds a backoff out to 30 s. The channel cache only fills on success, so the cold path could fail forever. | `bluetoothDiscoveryLoop`, the beacon arm | `btProbeBudgetMs(endpoint)`: 3 s when the channel is known (endpoint spells it, or a dial cached it), 12 s when cold. Probers run concurrently, so one cold cycle costs 12 s *once*. |
+| **W2** | Battery telemetry had **exactly one writer** — the IP ping. The UDP beacon carries the same fields and Windows discarded all but the Bluetooth address, so freshness was hostage to one probe path: the one with the tightest budget. | `probePhoneIp` | One fold, `applyPhoneTelemetry(payload, transport)`, called by both the ping and the beacon, and it records *which link carried the reading*. |
+| **W3** | `jsonExtractInt(rep.body, "batteryPct", 88)` — a handset that answered *without* the field was drawn as a healthy 88 % gauge. The comment three lines below said inventing telemetry "would be a lie about hardware we cannot see". | `probePhoneIp` | `phoneBatteryPct` defaults to 0 with a `phoneBatteryKnown` gate; the UI distinguishes "awaiting the first report" from "this build reports no battery detail — update the APK". |
+| **W4** | A **failed** PC$\rightarrow$phone upload returned the length of the buffer it had tried to send. Only 409 was treated as failure; status 0 (dial failed), 401 and 500 all counted as success. The download half was honest, so the two directions disagreed about what success means. | `uploadLocalPathToPhone` | Both helpers now return `PhoneXfer { bytes, ok, verified, problem }`, where `bytes` is only ever what the far end confirmed — preferring the phone's own reported count over the length sent. |
+| **W5** | `/api/vfs/transfer` **always** answered `{"status":"completed"}` and logged "Completed over bluetooth at N MB/s", even when every file returned 0 bytes. | transfer handler | `completed` / `partial` / `failed` with `problems[]`, `movedBytes` and `itemsLanded`; a total failure is a **502**. Failed files are no longer recorded in history (they had a destination path, so the old `bytes <= 0 && localPath.empty()` test let them in as 0-byte rows). |
+| **W6** | With no live phone, the Phone pane served `<profile>\.chainit\sibling-staging` — a folder **on this PC**, pre-populated with `DCIM\Camera`, `Download` and `Documents` — as though it were the handset. Combined with W5, a "copy to phone" with the radio off landed locally and was reported as a completed Bluetooth transfer. | VFS handler, transfer handler | Browsing it still works but every response carries `simulated: true`, `phoneReachable: false` and a `notice` naming the folder. Anything that would change or hand over a file is refused with **503** and the real cause, including the last Bluetooth dial error. |
+| **W7** | Two more invented numbers: `totalBytes` defaulted to a literal 1024 for phone$\rightarrow$phone, and the local branch used 4096 for anything that was not a regular file. | transfer handler | An unreported size is absent, not 1 KiB. A folder is the sum of its files. |
+| **W8** | A **move** deleted the source unconditionally after an upload the phone never confirmed — so a failed Bluetooth move destroyed the only copy of the file. The API's phone$\rightarrow$PC move also deleted every phone-side source regardless of what arrived. | transfer handler, clipboard paste | The source is removed only on a confirmed transfer; the phone-side delete lists only paths that actually landed, and a delete that then fails is reported as a duplication rather than swallowed. |
+| **W9** | The battery temperature arrived as a flat `36` for a real `36.5`: `jsonExtractInt` uses `strtoll`, which stops at the decimal point, and Android reports tenths of a degree. | `probePhoneIp` | `jsonExtractDouble`, used for the one field that carries a fraction — the number a user reads to judge whether the handset is getting too hot during a long transfer. |
+| **W10** | `sendJsonStr` answered every non-200 as "Bad Request", so the new honest refusals went out as `HTTP/1.1 503 Bad Request` — a code and a phrase contradicting each other in the response whose job is to explain what went wrong. | `sendJsonStr` | `httpReasonPhrase(status)`. |
+| **A1** | Every phone$\rightarrow$PC operation paid a **dead LAN connect first**. `request()` always tried the LAN when `target.ip` was non-blank, and `resolveTarget` returns a *remembered* IP from preferences that outlives the network — so offline, each listing, download and upload burned up to `LAN_CONNECT_MS = 3500` before Bluetooth was attempted. | `PcVfsClient.request` | Transport affinity: the link that answered last is tried first, and the LAN attempt is skipped entirely when `ConnectivityManager` says there is no IP network (`ACCESS_NETWORK_STATE` was already granted). The refusal message says which link was never tried, and why. |
+| **A2** | The paired-device walk was unbounded: `BT_CONNECT_MS` per handset, so three paired devices and a sleeping PC cost 36 s before an honest answer. | `PcVfsClient.btCall` | `BT_WALK_BUDGET_MS = 16000` bounds the whole walk; the remaining budget is passed into `btCallDevice` as `connectBudgetMs`. The remembered PC still goes first, so when it is awake the ceiling never bites. |
+
+#### The battery card now says where the reading came from
+
+`uiBatteryKey` names the carrier in the row's **label** — `Battery via Bluetooth` — and `uiBatteryText` carries the
+reading: `86% · mains (AC) · 31.5°C · just now`. Over Bluetooth that clause is the whole point of the card: it is the
+difference between "the offline link carries real telemetry" and "this is a Wi-Fi report from four minutes ago".
+
+Putting the carrier in the label rather than appending it to the value is what makes both visible. The Link tab's value
+column is `colW - 40 - 176` ≈ 304 px at the default window size, and `uiText` draws with `DT_SINGLELINE |
+DT_END_ELLIPSIS`; the old row read `86% · charging from mains (AC) · 3…` — the temperature and the age, the two
+numbers that answer "is this handset getting too hot" and "is this reading stale", were exactly the part that never
+fitted. `uiDrawBattery` already draws a plus sign inside the gauge when the phone is on charge, so the words
+"charging from" were redundant: naming the plug directly buys back the width the rest needs, and `uiAgoText`'s
+"just now" costs less than "reported 2 s ago". The state JSON gained
+`phoneBatteryKnown` and `phoneTelemetryTransport`, and the web client gates the number on the first and renders
+the second (`batteryKnown`, `batteryLabel`, `telemetryCarrierLabel` in `app/client/utils/format.ts`), so no surface
+draws a percentage nobody measured or colours a gauge it knows nothing about.
+
+#### 7.13.1 Contract test §9, and the two negative tests that prove it bites
+
+`selftest.ts` §9 pins the parity property rather than a shape. With Wi-Fi, hotspot, USB and the relay all off:
+
+- `POST /api/transport/connect-ip` with a `bt://` endpoint is accepted, `activeTransportId` is `bluetooth`, and the
+  state carries `phoneTelemetryLive: true`, `phoneBatteryKnown: true` and `phoneTelemetryTransport: 'bluetooth'`;
+- the percentage is the one reported (41), never the engine's old literal 88 or the preview's 86;
+- with the radio then switched off, a phone-targeted transfer is **not** a 200, states a cause, and adds **no**
+  history row — nothing that did not move is recorded as having moved;
+- `GET /api/vfs/phone/list` answers **503** with an actionable reason rather than serving a folder on this PC.
+
+Both negative tests were run and reverted: removing `markPhoneTelemetry('bluetooth')` fails with
+`actual: 'wifi_lan', expected: 'bluetooth'`, and removing the transfer refusal fails on
+*"a transfer to an unreachable phone is not a success"* with `actual: 200`.
+
+**What this environment cannot prove:** there is no Bluetooth radio here. W1, W4–W10, A1 and A2 are verified by
+compilation, by review against the line each one names, and by the policy-level contract test above — never by an
+RFCOMM session with a real handset.
+
+### 7.14 Attribution
 
 **Built by Qmer** - the Windows About tab, the native hub window header and footer, the Android app footer,
 and the `VERSIONINFO` of both exes (`CompanyName = Qmer`, `LegalCopyright = "Built by Qmer"`).

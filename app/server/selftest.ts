@@ -436,6 +436,113 @@ async function run() {
   }
   console.log('✓ Bluetooth RFCOMM dial policy verified (cache-first, SDP fallback, verified sweep, honest failure)');
 
+  // ---------------------------------------------------------------------------------------
+  // 9. Bluetooth parity: the offline link must carry the same *information* as Wi-Fi, and must
+  //    never claim a transfer it did not make.
+  //
+  //    "It must work same smooth fast and functionality as the system works under wifi, like it
+  //    must show the battery" - so these assertions are about what the link tells the user, not
+  //    only about bytes moving. On the native engine the battery reading used to have exactly one
+  //    writer (the IP ping), so a Bluetooth-only session had no battery at all, and a failed
+  //    phone-targeted transfer was reported as `completed` with a measured speed.
+  //      a. with Bluetooth as the only link, telemetry is live and names Bluetooth as its carrier;
+  //      b. the percentage is the phone's own, never a default the engine filled in;
+  //      c. a transfer to an unreachable phone is refused and records no history row;
+  //      d. the phone pane is not served from a folder on this PC wearing the phone's name.
+  // ---------------------------------------------------------------------------------------
+  {
+    const HANDSET = 'C4:A1:B1:70:00:0E';
+    const env = (patch: Record<string, unknown>) =>
+      fetch(`${BASE}/api/environment/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+    const state = async () => (await fetch(`${BASE}/api/state`)).json();
+    const historyCount = async () =>
+      ((await (await fetch(`${BASE}/api/history?limit=60`)).json()).items || []).length;
+
+    // (a) Bluetooth alone: no Wi-Fi, no hotspot, no USB, no relay.
+    await env({
+      usbPlugged: false,
+      sharedWifiAvailable: false,
+      localHotspotActive: false,
+      onlineP2pEnabled: false,
+      bluetoothEnabled: true,
+      btListenerOpen: true,
+      btSdpVisible: true,
+      btRfcommChannel: 7,
+      phoneBatteryPct: 41,
+    });
+    const linked = await fetch(`${BASE}/api/transport/connect-ip`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phoneIp: `bt://${HANDSET}` }),
+    });
+    assert.equal(linked.status, 200, 'a Bluetooth-only link is accepted with no other transport up');
+
+    const btOnly = await state();
+    assert.equal(btOnly.activeTransportId, 'bluetooth', 'Bluetooth is the active transport');
+    assert.equal(btOnly.environment.phoneTelemetryLive, true, 'and its telemetry is live');
+    assert.equal(btOnly.environment.phoneBatteryKnown, true, 'a real percentage was reported');
+    assert.equal(
+      btOnly.environment.phoneTelemetryTransport,
+      'bluetooth',
+      'the reading names the link that carried it - the offline one, not a stale Wi-Fi report'
+    );
+
+    // (b) 41 was reported, so 41 must come back. The engine's old default was a literal 88 and the
+    // preview's is 86; either one showing up here would mean a number nobody measured.
+    assert.equal(btOnly.environment.phoneBatteryPct, 41, "the percentage is the phone's own");
+
+    // (c) take the radio away: a phone-targeted transfer must be refused, not reported complete.
+    await env({ bluetoothEnabled: false, btListenerOpen: false });
+    const before = await historyCount();
+    const refused = await fetch(`${BASE}/api/vfs/transfer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        op: 'copy',
+        fromTarget: 'pc',
+        fromPaths: ['/Documents/Sprint_Tasks.txt'],
+        toTarget: 'phone',
+        toDir: '/Download',
+      }),
+    });
+    assert.notEqual(refused.status, 200, 'a transfer to an unreachable phone is not a success');
+    const refusedBody = await refused.json();
+    assert.ok(
+      typeof refusedBody.error === 'string' && refusedBody.error.length > 10,
+      'and it states why, instead of quietly doing something local'
+    );
+    assert.equal(
+      await historyCount(),
+      before,
+      'nothing that did not move was recorded as having moved'
+    );
+
+    // (d) the phone pane must not be a folder on this PC wearing the phone's name.
+    const pane = await fetch(`${BASE}/api/vfs/phone/list?path=/`);
+    assert.equal(pane.status, 503, 'listing the phone with no phone linked is refused');
+    const paneBody = await pane.json();
+    assert.ok(
+      typeof paneBody.error === 'string' && paneBody.error.length > 10,
+      'with a reason a user can act on'
+    );
+
+    // Leave the preview the way the rest of the suite expects it.
+    await env({
+      bluetoothEnabled: true,
+      btListenerOpen: true,
+      btSdpVisible: true,
+      sharedWifiAvailable: true,
+      phoneBatteryPct: 86,
+    });
+  }
+  console.log(
+    '✓ Bluetooth parity verified (offline telemetry carrier, no invented percentage, honest refusal)'
+  );
+
   // Clean up test copy & restore clean default preview state
   await fetch(`${BASE}/api/vfs/phone/delete`, {
     method: 'POST',
